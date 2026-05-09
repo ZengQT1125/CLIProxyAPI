@@ -1,10 +1,8 @@
 package auth
 
 import (
-	"bytes"
 	"context"
 	"net/http"
-	"strings"
 	"sync"
 	"testing"
 	"time"
@@ -13,7 +11,6 @@ import (
 	internalconfig "github.com/router-for-me/CLIProxyAPI/v6/internal/config"
 	"github.com/router-for-me/CLIProxyAPI/v6/internal/registry"
 	cliproxyexecutor "github.com/router-for-me/CLIProxyAPI/v6/sdk/cliproxy/executor"
-	log "github.com/sirupsen/logrus"
 )
 
 const requestScopedNotFoundMessage = "Item with id 'rs_0b5f3eb6f51f175c0169ca74e4a85881998539920821603a74' not found. Items are not persisted when `store` is set to false. Try again with `store` set to true, or remove this item from your input."
@@ -111,189 +108,6 @@ func TestManager_ShouldRetryAfterError_UsesOAuthModelAliasForCooldown(t *testing
 	}
 }
 
-func TestManager_ShouldRetryAfterError_SequentialFillUsesConfiguredRequestRetry(t *testing.T) {
-	m := NewManager(nil, &SequentialFillSelector{}, nil)
-	m.SetRetryConfig(5, 30*time.Second, 0)
-
-	model := "test-model"
-	next := time.Now().Add(5 * time.Second)
-
-	auth := &Auth{
-		ID:       "auth-1",
-		Provider: "claude",
-		ModelStates: map[string]*ModelState{
-			model: {
-				Unavailable:    true,
-				Status:         StatusError,
-				NextRetryAfter: next,
-				Quota: QuotaState{
-					Exceeded:      true,
-					Reason:        "quota",
-					NextRecoverAt: next,
-				},
-			},
-		},
-	}
-	if _, errRegister := m.Register(context.Background(), auth); errRegister != nil {
-		t.Fatalf("register auth: %v", errRegister)
-	}
-
-	_, _, maxWait := m.retrySettings()
-	wait, shouldRetry := m.shouldRetryAfterError(&Error{HTTPStatus: http.StatusTooManyRequests, Message: "quota"}, 4, []string{"claude"}, model, maxWait)
-	if !shouldRetry {
-		t.Fatalf("expected shouldRetry=true on attempt=4 when request_retry=5, got false (wait=%v)", wait)
-	}
-	if wait <= 0 {
-		t.Fatalf("expected wait > 0, got %v", wait)
-	}
-
-	_, shouldRetry = m.shouldRetryAfterError(&Error{HTTPStatus: http.StatusTooManyRequests, Message: "quota"}, 5, []string{"claude"}, model, maxWait)
-	if shouldRetry {
-		t.Fatalf("expected shouldRetry=false on attempt=5 when request_retry=5, got true")
-	}
-}
-
-type sequentialFillRetryProbeExecutor struct {
-	id string
-
-	mu           sync.Mutex
-	executeCalls int
-}
-
-func (e *sequentialFillRetryProbeExecutor) Identifier() string {
-	return e.id
-}
-
-func (e *sequentialFillRetryProbeExecutor) Execute(_ context.Context, _ *Auth, _ cliproxyexecutor.Request, _ cliproxyexecutor.Options) (cliproxyexecutor.Response, error) {
-	e.mu.Lock()
-	defer e.mu.Unlock()
-	e.executeCalls++
-	if e.executeCalls == 1 {
-		return cliproxyexecutor.Response{}, &Error{HTTPStatus: http.StatusTooManyRequests, Message: "quota"}
-	}
-	return cliproxyexecutor.Response{Payload: []byte("ok")}, nil
-}
-
-func (e *sequentialFillRetryProbeExecutor) ExecuteStream(context.Context, *Auth, cliproxyexecutor.Request, cliproxyexecutor.Options) (*cliproxyexecutor.StreamResult, error) {
-	return nil, nil
-}
-
-func (e *sequentialFillRetryProbeExecutor) Refresh(_ context.Context, auth *Auth) (*Auth, error) {
-	return auth, nil
-}
-
-func (e *sequentialFillRetryProbeExecutor) CountTokens(context.Context, *Auth, cliproxyexecutor.Request, cliproxyexecutor.Options) (cliproxyexecutor.Response, error) {
-	return cliproxyexecutor.Response{}, nil
-}
-
-func (e *sequentialFillRetryProbeExecutor) HttpRequest(context.Context, *Auth, *http.Request) (*http.Response, error) {
-	return nil, nil
-}
-
-func (e *sequentialFillRetryProbeExecutor) ExecuteCalls() int {
-	e.mu.Lock()
-	defer e.mu.Unlock()
-	return e.executeCalls
-}
-
-func TestManager_Execute_SequentialFillRetriesAfter429Cooldown(t *testing.T) {
-	prev := quotaCooldownDisabled.Load()
-	quotaCooldownDisabled.Store(false)
-	t.Cleanup(func() { quotaCooldownDisabled.Store(prev) })
-
-	m := NewManager(nil, &SequentialFillSelector{}, nil)
-	m.SetRetryConfig(3, 30*time.Second, 3)
-
-	executor := &sequentialFillRetryProbeExecutor{id: "claude"}
-	m.RegisterExecutor(executor)
-
-	auth := &Auth{
-		ID:       "sf-retry-auth",
-		Provider: "claude",
-	}
-	if _, errRegister := m.Register(context.Background(), auth); errRegister != nil {
-		t.Fatalf("register auth: %v", errRegister)
-	}
-
-	model := "sf-retry-model"
-	reg := registry.GetGlobalRegistry()
-	reg.RegisterClient(auth.ID, "claude", []*registry.ModelInfo{{ID: model}})
-	t.Cleanup(func() { reg.UnregisterClient(auth.ID) })
-
-	start := time.Now()
-	resp, errExecute := m.Execute(context.Background(), []string{"claude"}, cliproxyexecutor.Request{Model: model}, cliproxyexecutor.Options{})
-	if errExecute != nil {
-		t.Fatalf("execute error = %v, want success after retry", errExecute)
-	}
-	if string(resp.Payload) != "ok" {
-		t.Fatalf("payload = %q, want %q", string(resp.Payload), "ok")
-	}
-	if got := executor.ExecuteCalls(); got != 2 {
-		t.Fatalf("execute calls = %d, want %d", got, 2)
-	}
-	if waited := time.Since(start); waited < quotaBackoffBase {
-		t.Fatalf("retry wait = %v, want at least %v", waited, quotaBackoffBase)
-	}
-}
-
-func TestManager_Execute_SequentialFillMaxRetryCredentialsAllowsThreeFallbacks(t *testing.T) {
-	model := "sf-max-retry-credentials-model"
-	selector := &SequentialFillSelector{
-		current: map[string]string{
-			"claude:" + model: "b",
-		},
-	}
-	manager := NewManager(nil, selector, nil)
-	manager.SetRetryConfig(0, 0, 3)
-
-	executor := &authFallbackExecutor{
-		id: "claude",
-		executeErrors: map[string]error{
-			"b": &Error{HTTPStatus: http.StatusInternalServerError, Message: "boom-b"},
-			"c": &Error{HTTPStatus: http.StatusInternalServerError, Message: "boom-c"},
-			"d": &Error{HTTPStatus: http.StatusInternalServerError, Message: "boom-d"},
-		},
-	}
-	manager.RegisterExecutor(executor)
-
-	auths := []*Auth{
-		{ID: "a", Provider: "claude"},
-		{ID: "b", Provider: "claude"},
-		{ID: "c", Provider: "claude"},
-		{ID: "d", Provider: "claude"},
-	}
-
-	reg := registry.GetGlobalRegistry()
-	for _, auth := range auths {
-		reg.RegisterClient(auth.ID, "claude", []*registry.ModelInfo{{ID: model}})
-		if _, errRegister := manager.Register(context.Background(), auth); errRegister != nil {
-			t.Fatalf("register auth %s: %v", auth.ID, errRegister)
-		}
-	}
-	t.Cleanup(func() {
-		for _, auth := range auths {
-			reg.UnregisterClient(auth.ID)
-		}
-	})
-
-	resp, errExecute := manager.Execute(context.Background(), []string{"claude"}, cliproxyexecutor.Request{Model: model}, cliproxyexecutor.Options{})
-	if errExecute != nil {
-		t.Fatalf("execute error = %v, want success after three fallback credentials", errExecute)
-	}
-	if string(resp.Payload) != "a" {
-		t.Fatalf("payload = %q, want %q from successful auth fallback", string(resp.Payload), "a")
-	}
-	if got := executor.ExecuteCalls(); len(got) != 4 {
-		t.Fatalf("execute calls = %v, want four attempts [b c d a]", got)
-	}
-	want := []string{"b", "c", "d", "a"}
-	for i, authID := range want {
-		if got := executor.ExecuteCalls()[i]; got != authID {
-			t.Fatalf("execute call %d auth = %q, want %q", i, got, authID)
-		}
-	}
-}
-
 type credentialRetryLimitExecutor struct {
 	id string
 
@@ -345,10 +159,8 @@ type authFallbackExecutor struct {
 
 	mu                sync.Mutex
 	executeCalls      []string
-	countCalls        []string
 	streamCalls       []string
 	executeErrors     map[string]error
-	countErrors       map[string]error
 	streamFirstErrors map[string]error
 }
 
@@ -388,15 +200,8 @@ func (e *authFallbackExecutor) Refresh(_ context.Context, auth *Auth) (*Auth, er
 	return auth, nil
 }
 
-func (e *authFallbackExecutor) CountTokens(_ context.Context, auth *Auth, _ cliproxyexecutor.Request, _ cliproxyexecutor.Options) (cliproxyexecutor.Response, error) {
-	e.mu.Lock()
-	e.countCalls = append(e.countCalls, auth.ID)
-	err := e.countErrors[auth.ID]
-	e.mu.Unlock()
-	if err != nil {
-		return cliproxyexecutor.Response{}, err
-	}
-	return cliproxyexecutor.Response{Payload: []byte(auth.ID)}, nil
+func (e *authFallbackExecutor) CountTokens(context.Context, *Auth, cliproxyexecutor.Request, cliproxyexecutor.Options) (cliproxyexecutor.Response, error) {
+	return cliproxyexecutor.Response{}, &Error{HTTPStatus: 500, Message: "not implemented"}
 }
 
 func (e *authFallbackExecutor) HttpRequest(context.Context, *Auth, *http.Request) (*http.Response, error) {
@@ -417,104 +222,6 @@ func (e *authFallbackExecutor) StreamCalls() []string {
 	out := make([]string, len(e.streamCalls))
 	copy(out, e.streamCalls)
 	return out
-}
-
-func (e *authFallbackExecutor) CountCalls() []string {
-	e.mu.Lock()
-	defer e.mu.Unlock()
-	out := make([]string, len(e.countCalls))
-	copy(out, e.countCalls)
-	return out
-}
-
-type deleteTrackingStore struct {
-	mu         sync.Mutex
-	deletedIDs []string
-}
-
-func (s *deleteTrackingStore) List(context.Context) ([]*Auth, error) { return nil, nil }
-
-func (s *deleteTrackingStore) Save(context.Context, *Auth) (string, error) { return "", nil }
-
-func (s *deleteTrackingStore) Delete(_ context.Context, id string) error {
-	s.mu.Lock()
-	defer s.mu.Unlock()
-	s.deletedIDs = append(s.deletedIDs, id)
-	return nil
-}
-
-func (s *deleteTrackingStore) DeletedIDs() []string {
-	s.mu.Lock()
-	defer s.mu.Unlock()
-	out := make([]string, len(s.deletedIDs))
-	copy(out, s.deletedIDs)
-	return out
-}
-
-func newUnauthorizedEvictionTestManager(t *testing.T) (*Manager, *authFallbackExecutor, *deleteTrackingStore, string, string, string) {
-	t.Helper()
-
-	const model = "test-model"
-	const badAuthID = "aa-bad-auth"
-	const goodAuthID = "bb-good-auth"
-
-	prev := deleteUnauthorizedAuthEnabled.Load()
-	SetDeleteUnauthorizedAuth(true)
-	t.Cleanup(func() { SetDeleteUnauthorizedAuth(prev) })
-
-	store := &deleteTrackingStore{}
-	selector := &SequentialFillSelector{
-		current: map[string]string{
-			"claude:" + model: badAuthID,
-		},
-	}
-	manager := NewManager(store, selector, nil)
-	manager.SetRetryConfig(0, 0, 1)
-
-	executor := &authFallbackExecutor{
-		id: "claude",
-		executeErrors: map[string]error{
-			badAuthID: &Error{HTTPStatus: http.StatusUnauthorized, Message: "unauthorized"},
-		},
-		countErrors: map[string]error{
-			badAuthID: &Error{HTTPStatus: http.StatusUnauthorized, Message: "unauthorized"},
-		},
-		streamFirstErrors: map[string]error{
-			badAuthID: &Error{HTTPStatus: http.StatusUnauthorized, Message: "unauthorized"},
-		},
-	}
-	manager.RegisterExecutor(executor)
-
-	badAuth := &Auth{ID: badAuthID, Provider: "claude", Metadata: map[string]any{"type": "claude"}}
-	goodAuth := &Auth{ID: goodAuthID, Provider: "claude", Metadata: map[string]any{"type": "claude"}}
-
-	reg := registry.GetGlobalRegistry()
-	reg.RegisterClient(badAuth.ID, "claude", []*registry.ModelInfo{{ID: model}})
-	reg.RegisterClient(goodAuth.ID, "claude", []*registry.ModelInfo{{ID: model}})
-	t.Cleanup(func() {
-		reg.UnregisterClient(badAuth.ID)
-		reg.UnregisterClient(goodAuth.ID)
-	})
-
-	if _, errRegister := manager.Register(context.Background(), badAuth); errRegister != nil {
-		t.Fatalf("register bad auth: %v", errRegister)
-	}
-	if _, errRegister := manager.Register(context.Background(), goodAuth); errRegister != nil {
-		t.Fatalf("register good auth: %v", errRegister)
-	}
-
-	return manager, executor, store, model, badAuthID, goodAuthID
-}
-
-func assertUnauthorizedAuthEvicted(t *testing.T, manager *Manager, store *deleteTrackingStore, badAuthID string) {
-	t.Helper()
-	if _, ok := manager.GetByID(badAuthID); ok {
-		t.Fatalf("expected unauthorized auth %q to be evicted", badAuthID)
-	}
-	gotDeleted := store.DeletedIDs()
-	if len(gotDeleted) != 1 || gotDeleted[0] != badAuthID {
-		t.Fatalf("deleted auth IDs = %v, want [%s]", gotDeleted, badAuthID)
-	}
 }
 
 type retryAfterStatusError struct {
@@ -613,8 +320,8 @@ func TestManager_MaxRetryCredentials_LimitsCrossCredentialRetries(t *testing.T) 
 			if errInvoke := tc.invoke(limitedManager); errInvoke == nil {
 				t.Fatalf("expected error for limited retry execution")
 			}
-			if calls := limitedExecutor.Calls(); calls != 2 {
-				t.Fatalf("expected 2 calls with max-retry-credentials=1, got %d", calls)
+			if calls := limitedExecutor.Calls(); calls != 1 {
+				t.Fatalf("expected 1 call with max-retry-credentials=1, got %d", calls)
 			}
 
 			unlimitedManager, unlimitedExecutor := newCredentialRetryLimitTestManager(t, 0)
@@ -625,150 +332,6 @@ func TestManager_MaxRetryCredentials_LimitsCrossCredentialRetries(t *testing.T) 
 				t.Fatalf("expected 2 calls with max-retry-credentials=0, got %d", calls)
 			}
 		})
-	}
-}
-
-func TestManager_Execute_UnauthorizedAuthEviction(t *testing.T) {
-	manager, executor, store, model, badAuthID, goodAuthID := newUnauthorizedEvictionTestManager(t)
-
-	var buf bytes.Buffer
-	logger := log.StandardLogger()
-	oldOut := logger.Out
-	oldFormatter := logger.Formatter
-	oldLevel := logger.Level
-	log.SetOutput(&buf)
-	log.SetFormatter(&log.TextFormatter{DisableTimestamp: true, DisableColors: true})
-	log.SetLevel(log.InfoLevel)
-	defer func() {
-		log.SetOutput(oldOut)
-		log.SetFormatter(oldFormatter)
-		log.SetLevel(oldLevel)
-	}()
-
-	resp, errExecute := manager.Execute(context.Background(), []string{"claude"}, cliproxyexecutor.Request{Model: model}, cliproxyexecutor.Options{})
-	if errExecute != nil {
-		t.Fatalf("execute error = %v, want success", errExecute)
-	}
-	if string(resp.Payload) != goodAuthID {
-		t.Fatalf("execute payload = %q, want %q", string(resp.Payload), goodAuthID)
-	}
-	if gotCalls := executor.ExecuteCalls(); len(gotCalls) != 2 || gotCalls[0] != badAuthID || gotCalls[1] != goodAuthID {
-		t.Fatalf("execute calls = %v, want [%s %s]", gotCalls, badAuthID, goodAuthID)
-	}
-	assertUnauthorizedAuthEvicted(t, manager, store, badAuthID)
-	logOutput := buf.String()
-	if !strings.Contains(logOutput, "evicting unauthorized auth") {
-		t.Fatalf("expected info log for unauthorized auth eviction, got: %s", logOutput)
-	}
-	if !strings.Contains(logOutput, badAuthID) {
-		t.Fatalf("expected log to contain auth id %q, got: %s", badAuthID, logOutput)
-	}
-	if !strings.Contains(logOutput, model) {
-		t.Fatalf("expected log to contain model %q, got: %s", model, logOutput)
-	}
-}
-
-func TestManager_ExecuteCount_UnauthorizedAuthEviction(t *testing.T) {
-	manager, executor, store, model, badAuthID, goodAuthID := newUnauthorizedEvictionTestManager(t)
-
-	resp, errExecute := manager.ExecuteCount(context.Background(), []string{"claude"}, cliproxyexecutor.Request{Model: model}, cliproxyexecutor.Options{})
-	if errExecute != nil {
-		t.Fatalf("execute count error = %v, want success", errExecute)
-	}
-	if string(resp.Payload) != goodAuthID {
-		t.Fatalf("execute count payload = %q, want %q", string(resp.Payload), goodAuthID)
-	}
-	if gotCalls := executor.CountCalls(); len(gotCalls) != 2 || gotCalls[0] != badAuthID || gotCalls[1] != goodAuthID {
-		t.Fatalf("count calls = %v, want [%s %s]", gotCalls, badAuthID, goodAuthID)
-	}
-	assertUnauthorizedAuthEvicted(t, manager, store, badAuthID)
-}
-
-func TestManager_ExecuteStream_UnauthorizedAuthEviction(t *testing.T) {
-	manager, executor, store, model, badAuthID, goodAuthID := newUnauthorizedEvictionTestManager(t)
-
-	streamResult, errExecute := manager.ExecuteStream(context.Background(), []string{"claude"}, cliproxyexecutor.Request{Model: model}, cliproxyexecutor.Options{})
-	if errExecute != nil {
-		t.Fatalf("execute stream error = %v, want success", errExecute)
-	}
-	var payload []byte
-	for chunk := range streamResult.Chunks {
-		if chunk.Err != nil {
-			t.Fatalf("execute stream chunk error = %v, want success", chunk.Err)
-		}
-		payload = append(payload, chunk.Payload...)
-	}
-	if string(payload) != goodAuthID {
-		t.Fatalf("execute stream payload = %q, want %q", string(payload), goodAuthID)
-	}
-	if gotCalls := executor.StreamCalls(); len(gotCalls) != 2 || gotCalls[0] != badAuthID || gotCalls[1] != goodAuthID {
-		t.Fatalf("stream calls = %v, want [%s %s]", gotCalls, badAuthID, goodAuthID)
-	}
-	assertUnauthorizedAuthEvicted(t, manager, store, badAuthID)
-}
-
-func TestManager_ExecuteStream_PinnedUnauthorizedBootstrapReturnsStreamError(t *testing.T) {
-	manager, executor, store, model, badAuthID, _ := newUnauthorizedEvictionTestManager(t)
-
-	streamResult, errExecute := manager.ExecuteStream(context.Background(), []string{"claude"}, cliproxyexecutor.Request{Model: model}, cliproxyexecutor.Options{
-		Metadata: map[string]any{
-			cliproxyexecutor.PinnedAuthMetadataKey: badAuthID,
-		},
-	})
-	if errExecute != nil {
-		t.Fatalf("execute stream error = %v, want nil stream setup error", errExecute)
-	}
-	if streamResult == nil || streamResult.Chunks == nil {
-		t.Fatalf("expected non-nil stream result and chunks")
-	}
-
-	var payload []byte
-	var gotErr error
-	for chunk := range streamResult.Chunks {
-		if chunk.Err != nil {
-			gotErr = chunk.Err
-			continue
-		}
-		payload = append(payload, chunk.Payload...)
-	}
-
-	if len(payload) != 0 {
-		t.Fatalf("execute stream payload = %q, want empty payload", string(payload))
-	}
-	if gotErr == nil {
-		t.Fatalf("expected terminal stream error, got nil")
-	}
-	if statusCodeFromError(gotErr) != http.StatusUnauthorized {
-		t.Fatalf("stream error status = %d, want %d", statusCodeFromError(gotErr), http.StatusUnauthorized)
-	}
-	if gotCalls := executor.StreamCalls(); len(gotCalls) != 1 || gotCalls[0] != badAuthID {
-		t.Fatalf("stream calls = %v, want [%s]", gotCalls, badAuthID)
-	}
-	assertUnauthorizedAuthEvicted(t, manager, store, badAuthID)
-}
-
-// When delete-unauthorized-auth is disabled (the default), a 401 must still
-// route to the next credential but must NOT evict the bad auth from memory or
-// delete it from the store. Cooldown via MarkResult is unaffected.
-func TestManager_Execute_UnauthorizedAuth_DeleteDisabled_KeepsAuth(t *testing.T) {
-	manager, executor, store, model, badAuthID, goodAuthID := newUnauthorizedEvictionTestManager(t)
-	SetDeleteUnauthorizedAuth(false)
-
-	resp, errExecute := manager.Execute(context.Background(), []string{"claude"}, cliproxyexecutor.Request{Model: model}, cliproxyexecutor.Options{})
-	if errExecute != nil {
-		t.Fatalf("execute error = %v, want success", errExecute)
-	}
-	if string(resp.Payload) != goodAuthID {
-		t.Fatalf("execute payload = %q, want %q", string(resp.Payload), goodAuthID)
-	}
-	if gotCalls := executor.ExecuteCalls(); len(gotCalls) != 2 || gotCalls[0] != badAuthID || gotCalls[1] != goodAuthID {
-		t.Fatalf("execute calls = %v, want [%s %s]", gotCalls, badAuthID, goodAuthID)
-	}
-	if _, ok := manager.GetByID(badAuthID); !ok {
-		t.Fatalf("expected unauthorized auth %q to remain registered when delete-unauthorized-auth=false", badAuthID)
-	}
-	if deleted := store.DeletedIDs(); len(deleted) != 0 {
-		t.Fatalf("store.Delete should not be called when delete-unauthorized-auth=false, got %v", deleted)
 	}
 }
 

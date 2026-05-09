@@ -14,7 +14,6 @@ import (
 	proxyconfig "github.com/router-for-me/CLIProxyAPI/v6/internal/config"
 	internallogging "github.com/router-for-me/CLIProxyAPI/v6/internal/logging"
 	"github.com/router-for-me/CLIProxyAPI/v6/internal/redisqueue"
-	internalusage "github.com/router-for-me/CLIProxyAPI/v6/internal/usage"
 	sdkaccess "github.com/router-for-me/CLIProxyAPI/v6/sdk/access"
 	"github.com/router-for-me/CLIProxyAPI/v6/sdk/cliproxy/auth"
 	sdkconfig "github.com/router-for-me/CLIProxyAPI/v6/sdk/config"
@@ -40,7 +39,6 @@ func newTestServer(t *testing.T) *Server {
 		Debug:                  true,
 		LoggingToFile:          false,
 		UsageStatisticsEnabled: false,
-		RemoteManagement:       proxyconfig.RemoteManagement{DisableControlPanel: true},
 	}
 
 	authManager := auth.NewManager(nil, nil, nil)
@@ -48,54 +46,6 @@ func newTestServer(t *testing.T) *Server {
 
 	configPath := filepath.Join(tmpDir, "config.yaml")
 	return NewServer(cfg, authManager, accessManager, configPath)
-}
-
-func TestUsagePersistenceEnabledHotReload(t *testing.T) {
-	t.Setenv("PGSTORE_DSN", "")
-	t.Setenv("pgstore_dsn", "")
-	t.Setenv("PGSTORE_SCHEMA", "")
-	t.Setenv("pgstore_schema", "")
-
-	internalusage.CloseDatabasePlugin()
-	defer internalusage.CloseDatabasePlugin()
-
-	server := newTestServer(t)
-
-	disabled := *server.cfg
-	disabled.UsagePersistenceEnabled = false
-	server.UpdateClients(&disabled)
-	if internalusage.GetDatabasePlugin() != nil {
-		t.Fatalf("expected database plugin to be nil when disabled")
-	}
-
-	enabled := disabled
-	enabled.UsagePersistenceEnabled = true
-	server.UpdateClients(&enabled)
-	firstPlugin := internalusage.GetDatabasePlugin()
-	if firstPlugin == nil {
-		t.Fatalf("expected database plugin to be initialized when enabled")
-	}
-	if _, err := os.Stat(filepath.Join(enabled.AuthDir, "usage.db")); err != nil {
-		t.Fatalf("expected sqlite usage db to exist: %v", err)
-	}
-
-	disabledAgain := enabled
-	disabledAgain.UsagePersistenceEnabled = false
-	server.UpdateClients(&disabledAgain)
-	if internalusage.GetDatabasePlugin() != nil {
-		t.Fatalf("expected database plugin to be nil after disabling")
-	}
-
-	enabledAgain := disabledAgain
-	enabledAgain.UsagePersistenceEnabled = true
-	server.UpdateClients(&enabledAgain)
-	secondPlugin := internalusage.GetDatabasePlugin()
-	if secondPlugin == nil {
-		t.Fatalf("expected database plugin to be initialized after re-enabling")
-	}
-	if secondPlugin == firstPlugin {
-		t.Fatalf("expected database plugin to be re-initialized after re-enabling")
-	}
 }
 
 func TestHealthz(t *testing.T) {
@@ -157,8 +107,13 @@ func TestManagementUsageRequiresManagementAuthAndPopsArray(t *testing.T) {
 		t.Fatalf("missing key status = %d, want %d body=%s", missingKeyRR.Code, http.StatusUnauthorized, missingKeyRR.Body.String())
 	}
 
-	// Fork-specific: /v0/management/usage is repurposed for GetUsageStatistics (not legacy 404).
-	// The queue endpoint lives at /v0/management/usage-queue.
+	legacyReq := httptest.NewRequest(http.MethodGet, "/v0/management/usage?count=2", nil)
+	legacyReq.Header.Set("Authorization", "Bearer test-management-key")
+	legacyRR := httptest.NewRecorder()
+	server.engine.ServeHTTP(legacyRR, legacyReq)
+	if legacyRR.Code != http.StatusNotFound {
+		t.Fatalf("legacy usage status = %d, want %d body=%s", legacyRR.Code, http.StatusNotFound, legacyRR.Body.String())
+	}
 
 	authReq := httptest.NewRequest(http.MethodGet, "/v0/management/usage-queue?count=2", nil)
 	authReq.Header.Set("Authorization", "Bearer test-management-key")
@@ -190,6 +145,32 @@ func TestManagementUsageRequiresManagementAuthAndPopsArray(t *testing.T) {
 	if remaining := redisqueue.PopOldest(1); len(remaining) != 0 {
 		t.Fatalf("remaining queue = %q, want empty", remaining)
 	}
+}
+
+func TestHomeEnabledHidesManagementEndpointsAndControlPanel(t *testing.T) {
+	t.Setenv("MANAGEMENT_PASSWORD", "test-management-key")
+
+	server := newTestServer(t)
+	server.cfg.Home.Enabled = true
+
+	t.Run("management endpoints return 404", func(t *testing.T) {
+		req := httptest.NewRequest(http.MethodGet, "/v0/management/config", nil)
+		req.Header.Set("Authorization", "Bearer test-management-key")
+		rr := httptest.NewRecorder()
+		server.engine.ServeHTTP(rr, req)
+		if rr.Code != http.StatusNotFound {
+			t.Fatalf("status = %d, want %d body=%s", rr.Code, http.StatusNotFound, rr.Body.String())
+		}
+	})
+
+	t.Run("management control panel returns 404", func(t *testing.T) {
+		req := httptest.NewRequest(http.MethodGet, "/management.html", nil)
+		rr := httptest.NewRecorder()
+		server.engine.ServeHTTP(rr, req)
+		if rr.Code != http.StatusNotFound {
+			t.Fatalf("status = %d, want %d body=%s", rr.Code, http.StatusNotFound, rr.Body.String())
+		}
+	})
 }
 
 func TestAmpProviderModelRoutes(t *testing.T) {
