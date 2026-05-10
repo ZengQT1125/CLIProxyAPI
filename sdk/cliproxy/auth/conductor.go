@@ -16,14 +16,14 @@ import (
 	"time"
 
 	"github.com/google/uuid"
-	internalconfig "github.com/router-for-me/CLIProxyAPI/v6/internal/config"
-	"github.com/router-for-me/CLIProxyAPI/v6/internal/home"
-	"github.com/router-for-me/CLIProxyAPI/v6/internal/logging"
-	"github.com/router-for-me/CLIProxyAPI/v6/internal/registry"
-	"github.com/router-for-me/CLIProxyAPI/v6/internal/thinking"
-	"github.com/router-for-me/CLIProxyAPI/v6/internal/util"
-	cliproxyexecutor "github.com/router-for-me/CLIProxyAPI/v6/sdk/cliproxy/executor"
-	coreusage "github.com/router-for-me/CLIProxyAPI/v6/sdk/cliproxy/usage"
+	internalconfig "github.com/router-for-me/CLIProxyAPI/v7/internal/config"
+	"github.com/router-for-me/CLIProxyAPI/v7/internal/home"
+	"github.com/router-for-me/CLIProxyAPI/v7/internal/logging"
+	"github.com/router-for-me/CLIProxyAPI/v7/internal/registry"
+	"github.com/router-for-me/CLIProxyAPI/v7/internal/thinking"
+	"github.com/router-for-me/CLIProxyAPI/v7/internal/util"
+	cliproxyexecutor "github.com/router-for-me/CLIProxyAPI/v7/sdk/cliproxy/executor"
+	coreusage "github.com/router-for-me/CLIProxyAPI/v7/sdk/cliproxy/usage"
 	log "github.com/sirupsen/logrus"
 )
 
@@ -77,10 +77,16 @@ const (
 )
 
 var quotaCooldownDisabled atomic.Bool
+var deleteUnauthorizedAuth atomic.Bool
 
 // SetQuotaCooldownDisabled toggles quota cooldown scheduling globally.
 func SetQuotaCooldownDisabled(disable bool) {
 	quotaCooldownDisabled.Store(disable)
+}
+
+// SetDeleteUnauthorizedAuth toggles credential deletion on upstream 401 responses.
+func SetDeleteUnauthorizedAuth(enable bool) {
+	deleteUnauthorizedAuth.Store(enable)
 }
 
 func quotaCooldownDisabledForAuth(auth *Auth) bool {
@@ -2135,9 +2141,12 @@ func (m *Manager) MarkResult(ctx context.Context, result Result) {
 
 	shouldResumeModel := false
 	shouldSuspendModel := false
+	shouldDeleteAuth := false
 	suspendReason := ""
 	clearModelQuota := false
 	setModelQuota := false
+	deleteAuthID := ""
+	var deleteStore Store
 	var authSnapshot *Auth
 
 	m.mu.Lock()
@@ -2150,7 +2159,12 @@ func (m *Manager) MarkResult(ctx context.Context, result Result) {
 			auth.Failed++
 		}
 
-		if result.Success {
+		if shouldDeleteUnauthorizedAuth(result) {
+			deleteAuthID = auth.ID
+			deleteStore = m.store
+			delete(m.auths, auth.ID)
+			shouldDeleteAuth = true
+		} else if result.Success {
 			if result.Model != "" {
 				state := ensureModelState(auth, result.Model)
 				resetModelState(state, now)
@@ -2263,10 +2277,17 @@ func (m *Manager) MarkResult(ctx context.Context, result Result) {
 			}
 		}
 
-		_ = m.persist(ctx, auth)
-		authSnapshot = auth.Clone()
+		if !shouldDeleteAuth {
+			_ = m.persist(ctx, auth)
+			authSnapshot = auth.Clone()
+		}
 	}
 	m.mu.Unlock()
+	if shouldDeleteAuth {
+		m.removeDeletedAuth(ctx, deleteAuthID, deleteStore)
+		m.hook.OnResult(ctx, result)
+		return
+	}
 	if m.scheduler != nil && authSnapshot != nil {
 		m.scheduler.upsertAuth(authSnapshot)
 	}
@@ -2284,6 +2305,31 @@ func (m *Manager) MarkResult(ctx context.Context, result Result) {
 	}
 
 	m.hook.OnResult(ctx, result)
+}
+
+func shouldDeleteUnauthorizedAuth(result Result) bool {
+	return !result.Success && deleteUnauthorizedAuth.Load() && statusCodeFromResult(result.Error) == http.StatusUnauthorized
+}
+
+func (m *Manager) removeDeletedAuth(ctx context.Context, authID string, store Store) {
+	if authID == "" {
+		return
+	}
+	if store != nil {
+		if err := store.Delete(ctx, authID); err != nil {
+			logEntryWithRequestID(ctx).WithField("auth_id", authID).Warnf("failed to delete unauthorized auth: %v", err)
+		}
+	}
+	if m.scheduler != nil {
+		m.scheduler.removeAuth(authID)
+	}
+	m.mu.RLock()
+	loop := m.refreshLoop
+	m.mu.RUnlock()
+	if loop != nil {
+		loop.remove(authID)
+	}
+	registry.GetGlobalRegistry().UnregisterClient(authID)
 }
 
 func ensureModelState(auth *Auth, model string) *ModelState {

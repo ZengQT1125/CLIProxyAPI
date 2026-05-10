@@ -14,14 +14,15 @@ import (
 	"time"
 
 	"github.com/gin-gonic/gin"
-	"github.com/router-for-me/CLIProxyAPI/v6/internal/interfaces"
-	"github.com/router-for-me/CLIProxyAPI/v6/internal/logging"
-	"github.com/router-for-me/CLIProxyAPI/v6/internal/thinking"
-	"github.com/router-for-me/CLIProxyAPI/v6/internal/util"
-	coreauth "github.com/router-for-me/CLIProxyAPI/v6/sdk/cliproxy/auth"
-	coreexecutor "github.com/router-for-me/CLIProxyAPI/v6/sdk/cliproxy/executor"
-	"github.com/router-for-me/CLIProxyAPI/v6/sdk/config"
-	sdktranslator "github.com/router-for-me/CLIProxyAPI/v6/sdk/translator"
+	"github.com/router-for-me/CLIProxyAPI/v7/internal/interfaces"
+	"github.com/router-for-me/CLIProxyAPI/v7/internal/logging"
+	"github.com/router-for-me/CLIProxyAPI/v7/internal/thinking"
+	"github.com/router-for-me/CLIProxyAPI/v7/internal/util"
+	coreauth "github.com/router-for-me/CLIProxyAPI/v7/sdk/cliproxy/auth"
+	coreexecutor "github.com/router-for-me/CLIProxyAPI/v7/sdk/cliproxy/executor"
+	"github.com/router-for-me/CLIProxyAPI/v7/sdk/config"
+	sdktranslator "github.com/router-for-me/CLIProxyAPI/v7/sdk/translator"
+	"github.com/tidwall/gjson"
 	"golang.org/x/net/context"
 )
 
@@ -538,6 +539,10 @@ func (h *BaseAPIHandler) ExecuteWithAuthManager(ctx context.Context, handlerType
 	if errMsg != nil {
 		return nil, nil, errMsg
 	}
+	providers = filterProvidersByToolCompatibility(providers, rawJSON)
+	if len(providers) == 0 {
+		return nil, nil, &interfaces.ErrorMessage{StatusCode: http.StatusBadRequest, Error: fmt.Errorf("mixed search and non-search tools are not supported by available providers for model %s", modelName)}
+	}
 	reqMeta := requestExecutionMetadata(ctx)
 	reqMeta[coreexecutor.RequestedModelMetadataKey] = modelName
 	payload := rawJSON
@@ -585,6 +590,10 @@ func (h *BaseAPIHandler) ExecuteCountWithAuthManager(ctx context.Context, handle
 	providers, normalizedModel, errMsg := h.getRequestDetails(modelName)
 	if errMsg != nil {
 		return nil, nil, errMsg
+	}
+	providers = filterProvidersByToolCompatibility(providers, rawJSON)
+	if len(providers) == 0 {
+		return nil, nil, &interfaces.ErrorMessage{StatusCode: http.StatusBadRequest, Error: fmt.Errorf("mixed search and non-search tools are not supported by available providers for model %s", modelName)}
 	}
 	reqMeta := requestExecutionMetadata(ctx)
 	reqMeta[coreexecutor.RequestedModelMetadataKey] = modelName
@@ -635,6 +644,13 @@ func (h *BaseAPIHandler) ExecuteStreamWithAuthManager(ctx context.Context, handl
 	if errMsg != nil {
 		errChan := make(chan *interfaces.ErrorMessage, 1)
 		errChan <- errMsg
+		close(errChan)
+		return nil, nil, errChan
+	}
+	providers = filterProvidersByToolCompatibility(providers, rawJSON)
+	if len(providers) == 0 {
+		errChan := make(chan *interfaces.ErrorMessage, 1)
+		errChan <- &interfaces.ErrorMessage{StatusCode: http.StatusBadRequest, Error: fmt.Errorf("mixed search and non-search tools are not supported by available providers for model %s", modelName)}
 		close(errChan)
 		return nil, nil, errChan
 	}
@@ -899,6 +915,45 @@ func (h *BaseAPIHandler) getRequestDetails(modelName string) (providers []string
 	// The thinking suffix is preserved in the model name itself, so no
 	// metadata-based configuration passing is needed.
 	return providers, resolvedModelName, nil
+}
+
+func filterProvidersByToolCompatibility(providers []string, rawJSON []byte) []string {
+	if len(providers) == 0 {
+		return nil
+	}
+	if len(rawJSON) == 0 {
+		return providers
+	}
+
+	tools := gjson.GetBytes(rawJSON, "tools")
+	if !tools.IsArray() || len(tools.Array()) == 0 {
+		return providers
+	}
+
+	hasSearchTool := false
+	hasNonSearchTool := false
+	for _, tool := range tools.Array() {
+		if tool.Get("google_search").Exists() || tool.Get("type").String() == "web_search" {
+			hasSearchTool = true
+			continue
+		}
+		if tool.Get("type").String() == "function" || tool.Get("code_execution").Exists() || tool.Get("url_context").Exists() {
+			hasNonSearchTool = true
+		}
+	}
+
+	if !(hasSearchTool && hasNonSearchTool) {
+		return providers
+	}
+
+	filtered := make([]string, 0, len(providers))
+	for _, provider := range providers {
+		if strings.EqualFold(strings.TrimSpace(provider), "antigravity") {
+			continue
+		}
+		filtered = append(filtered, provider)
+	}
+	return filtered
 }
 
 func cloneBytes(src []byte) []byte {
