@@ -858,13 +858,13 @@ func (s *GitTokenStore) commitAndPushLocked(message string, relPaths ...string) 
 	} else if errRewrite := s.rewriteHeadAsSingleCommit(repo, headRef.Name(), commitHash, message, signature); errRewrite != nil {
 		return errRewrite
 	}
-	s.maybeRunGC(repo)
 	if err = s.pushWithRecover(repo); err != nil {
 		if errors.Is(err, git.NoErrAlreadyUpToDate) {
 			return nil
 		}
 		return fmt.Errorf("git token store: push: %w", err)
 	}
+	s.maybeRunGC(repo)
 	return nil
 }
 
