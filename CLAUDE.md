@@ -13,7 +13,6 @@ AI 工作指南。优先级：**Fork-Specific 部分必须读完**——合并�
 
 - `internal/translator/` 是 PR 受保护路径——上游 CI 自动拒绝该目录的 PR。修改需走 issue。
 - `fork/v*` tag 触发 docker-image 工作流，构建多架构镜像推送到 `ghcr.io`（非 DockerHub）。
-- `CLAUDE.md` 本地文件，已在 `.gitignore`，不入仓。
 - 构建参数: `CGO_ENABLED=0`，静态链接，`-trimpath`，版本通过 ldflags 注入。
 - 合并上游前必读「Fork-Specific Modifications」清单；任何 fork-only 文件被删/覆盖即为合并错误。
 
@@ -24,7 +23,7 @@ AI 工作指南。优先级：**Fork-Specific 部分必须读完**——合并�
 | `cmd/server/main.go` | 入口；CLI flags（含 `-tui`）；token store 初始化；`internal/cmd.StartService` / `StartServiceBackground` |
 | `sdk/cliproxy/` | 可嵌入 SDK：`service.go` `builder.go` `auth/` `executor/`（含 `Pinned/Selected/ExecutionSessionMetadataKey`） |
 | `internal/api/` | Gin HTTP server；`handlers/management/`；`modules/amp/` |
-| `internal/runtime/executor/` | Provider executor: Gemini / Gemini-CLI / Gemini-Vertex / Claude / Codex / Codex-WebSocket / Qwen / iFlow / Antigravity / Kimi / AIStudio / OpenAI-compat / xAI |
+| `internal/runtime/executor/` | Provider executor: Gemini / Gemini-CLI / Gemini-Vertex / Claude / Codex / Codex-WebSocket / Antigravity / Kimi / AIStudio / OpenAI-compat / xAI |
 | `internal/translator/` | 请求/响应跨格式转换（受 PR 守卫保护） |
 | `internal/thinking/provider/` | 扩展思考/推理 |
 | `internal/watcher/` | config & auth 文件热重载 |
@@ -63,8 +62,8 @@ go test ./...
 docker build -t cliproxyapi .
 
 ./cli-proxy-api [-config path] [-tui [-standalone]] [-vertex-import key.json]
-# OAuth: -login -codex-login -claude-login -qwen-login -iflow-login
-#        -iflow-cookie -antigravity-login -kimi-login -xai-login
+# OAuth: -login -codex-login -codex-device-login -claude-login
+#        -antigravity-login -kimi-login -xai-login
 # Login flags: -oauth-callback-port PORT, -no-browser
 ```
 
@@ -164,7 +163,7 @@ Fork deletions (删除上游文件):
 - `.github/workflows/release.yaml` — Removed (upstream goreleaser, replaced by Docker workflow)
 
 Other:
-- `.gitignore` — Added `usage.*` to ignore usage database files; also ignores `CLAUDE.md`
+- `.gitignore` — Added `usage.*` to ignore usage database files
 - `go.mod` / `go.sum` — Added `golang.org/x/exp`, `charmbracelet/bubbletea`, `charmbracelet/bubbles`, `charmbracelet/lipgloss` dependencies
 
 ### 8. Management Panel Auto-Updater
