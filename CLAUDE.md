@@ -161,6 +161,7 @@ Fork modifications (修改):
 
 Fork deletions (删除上游文件):
 - `.github/workflows/pr-test-build.yml` — Removed (upstream PR build check, not needed for fork)
+- `.github/workflows/auto-retarget-main-pr-to-dev.yml` — Removed (upstream PR retargeting bot; fork uses single-branch flow)
 
 Other:
 - `.gitignore` — Added `usage.*` to ignore usage database files
