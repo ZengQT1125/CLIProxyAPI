@@ -157,10 +157,10 @@ Fork modifications (修改):
 Fork modifications (修改):
 - `Dockerfile` — Cross-compilation (native `GOARCH`) instead of QEMU emulation
 - `.github/workflows/docker-image.yml` — Complete rewrite: DockerHub→GHCR, matrix strategy, GHA caching, `fork/v*` tag trigger, `workflow_dispatch` support
+- `.github/workflows/release.yaml` — Rewritten as `Build and Release`: triggers on `fork/v*` tags (not all tags), adds `workflow_dispatch` with tag input, builds release artifacts alongside `docker-image.yml`
 
 Fork deletions (删除上游文件):
 - `.github/workflows/pr-test-build.yml` — Removed (upstream PR build check, not needed for fork)
-- `.github/workflows/release.yaml` — Removed (upstream goreleaser, replaced by Docker workflow)
 
 Other:
 - `.gitignore` — Added `usage.*` to ignore usage database files
