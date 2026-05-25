@@ -195,7 +195,7 @@ func ensureAccessToken(ctx context.Context, store *sdkauth.FileTokenStore, auth 
 	}
 
 	svc := codexauth.NewCodexAuthWithProxyURL(nil, auth.ProxyURL)
-	tokenData, errRefresh := svc.RefreshTokensWithRetry(ctx, refreshToken, 3)
+	tokenData, errRefresh := svc.RefreshTokensWithRetry(ctx, refreshToken, codexAuthSourceLabel(auth), 3)
 	if errRefresh != nil {
 		return "", false, errRefresh
 	}
@@ -226,6 +226,27 @@ func ensureAccessToken(ctx context.Context, store *sdkauth.FileTokenStore, auth 
 	}
 
 	return tokenData.AccessToken, true, nil
+}
+
+func codexAuthSourceLabel(auth *coreauth.Auth) string {
+	if auth == nil {
+		return ""
+	}
+	if auth.Metadata != nil {
+		if email, ok := auth.Metadata["email"].(string); ok {
+			email = strings.TrimSpace(email)
+			if email != "" {
+				return email
+			}
+		}
+	}
+	if label := strings.TrimSpace(auth.Label); label != "" {
+		return label
+	}
+	if fileName := strings.TrimSpace(auth.FileName); fileName != "" {
+		return filepath.Base(fileName)
+	}
+	return strings.TrimSpace(auth.ID)
 }
 
 func fetchModels(ctx context.Context, auth *coreauth.Auth, accessToken, clientVersion string) ([]byte, int, error) {
