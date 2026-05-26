@@ -1,6 +1,7 @@
 package management
 
 import (
+	"archive/zip"
 	"bytes"
 	"context"
 	"crypto/sha256"
@@ -630,8 +631,82 @@ func isUnsafeAuthFileName(name string) bool {
 	return false
 }
 
+func queryRequestsAll(value string) bool {
+	switch strings.TrimSpace(strings.ToLower(value)) {
+	case "1", "true", "*":
+		return true
+	default:
+		return false
+	}
+}
+
+func authJSONFileNames(authDir string) ([]string, error) {
+	entries, err := os.ReadDir(authDir)
+	if err != nil {
+		return nil, err
+	}
+	names := make([]string, 0, len(entries))
+	for _, entry := range entries {
+		if entry.IsDir() {
+			continue
+		}
+		name := entry.Name()
+		if !strings.HasSuffix(strings.ToLower(name), ".json") {
+			continue
+		}
+		names = append(names, name)
+	}
+	sort.Strings(names)
+	return names, nil
+}
+
+func (h *Handler) downloadAllAuthFiles(c *gin.Context) {
+	names, err := authJSONFileNames(h.cfg.AuthDir)
+	if err != nil {
+		c.JSON(http.StatusInternalServerError, gin.H{"error": fmt.Sprintf("failed to read auth dir: %v", err)})
+		return
+	}
+
+	var buf bytes.Buffer
+	archive := zip.NewWriter(&buf)
+	for _, name := range names {
+		data, errRead := os.ReadFile(filepath.Join(h.cfg.AuthDir, name))
+		if errRead != nil {
+			_ = archive.Close()
+			if os.IsNotExist(errRead) {
+				c.JSON(http.StatusNotFound, gin.H{"error": fmt.Sprintf("file not found during archive build: %s", name)})
+				return
+			}
+			c.JSON(http.StatusInternalServerError, gin.H{"error": fmt.Sprintf("failed to read file %s: %v", name, errRead)})
+			return
+		}
+		writer, errCreate := archive.Create(name)
+		if errCreate != nil {
+			_ = archive.Close()
+			c.JSON(http.StatusInternalServerError, gin.H{"error": fmt.Sprintf("failed to add file %s to archive: %v", name, errCreate)})
+			return
+		}
+		if _, errWrite := writer.Write(data); errWrite != nil {
+			_ = archive.Close()
+			c.JSON(http.StatusInternalServerError, gin.H{"error": fmt.Sprintf("failed to write file %s to archive: %v", name, errWrite)})
+			return
+		}
+	}
+	if err = archive.Close(); err != nil {
+		c.JSON(http.StatusInternalServerError, gin.H{"error": fmt.Sprintf("failed to finalize archive: %v", err)})
+		return
+	}
+
+	c.Header("Content-Disposition", `attachment; filename="auth-files.zip"`)
+	c.Data(http.StatusOK, "application/zip", buf.Bytes())
+}
+
 // Download single auth file by name
 func (h *Handler) DownloadAuthFile(c *gin.Context) {
+	if queryRequestsAll(c.Query("all")) {
+		h.downloadAllAuthFiles(c)
+		return
+	}
 	name := strings.TrimSpace(c.Query("name"))
 	if isUnsafeAuthFileName(name) {
 		c.JSON(400, gin.H{"error": "invalid name"})
@@ -743,7 +818,7 @@ func (h *Handler) DeleteAuthFile(c *gin.Context) {
 		return
 	}
 	ctx := c.Request.Context()
-	if all := c.Query("all"); all == "true" || all == "1" || all == "*" {
+	if queryRequestsAll(c.Query("all")) {
 		entries, err := os.ReadDir(h.cfg.AuthDir)
 		if err != nil {
 			c.JSON(500, gin.H{"error": fmt.Sprintf("failed to read auth dir: %v", err)})
