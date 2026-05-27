@@ -30,6 +30,7 @@ import (
 	"time"
 
 	codexauth "github.com/router-for-me/CLIProxyAPI/v7/internal/auth/codex"
+	"github.com/router-for-me/CLIProxyAPI/v7/internal/codexapi"
 	"github.com/router-for-me/CLIProxyAPI/v7/internal/config"
 	"github.com/router-for-me/CLIProxyAPI/v7/internal/logging"
 	"github.com/router-for-me/CLIProxyAPI/v7/internal/util"
@@ -40,7 +41,6 @@ import (
 )
 
 const (
-	codexModelsBaseURL       = "https://chatgpt.com/backend-api/codex"
 	codexModelsPath          = "/models"
 	defaultClientVersion     = "0.133.0"
 	defaultCodexUserAgent    = "codex_cli_rs/0.133.0 (Mac OS 26.3.1; arm64) iTerm.app/3.6.9"
@@ -303,7 +303,7 @@ func fetchModels(ctx context.Context, auth *coreauth.Auth, accessToken, clientVe
 }
 
 func codexModelsURL(clientVersion string) (string, error) {
-	u, err := url.Parse(codexModelsBaseURL + codexModelsPath)
+	u, err := url.Parse(strings.TrimSuffix(codexapi.BaseURLFromEnv(), "/") + codexModelsPath)
 	if err != nil {
 		return "", err
 	}
