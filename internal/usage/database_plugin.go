@@ -252,6 +252,8 @@ func (p *DatabasePlugin) HandleUsage(ctx context.Context, record coreusage.Recor
 		ReasoningTokens: record.Detail.ReasoningTokens,
 		CachedTokens:    record.Detail.CachedTokens,
 		TotalTokens:     record.Detail.TotalTokens,
+		LatencyMs:       normaliseLatency(record.Latency),
+		TTFTMs:          normaliseLatency(record.TTFT),
 		Method:          method,
 		Path:            path,
 	}
@@ -308,6 +310,8 @@ func (p *DatabasePlugin) ImportRecords(snapshot StatisticsSnapshot) (added, skip
 					ReasoningTokens: detail.Tokens.ReasoningTokens,
 					CachedTokens:    detail.Tokens.CachedTokens,
 					TotalTokens:     detail.Tokens.TotalTokens,
+					LatencyMs:       detail.LatencyMs,
+					TTFTMs:          detail.TTFTMs,
 				})
 			}
 		}

@@ -91,6 +91,7 @@ type modelStats struct {
 type RequestDetail struct {
 	Timestamp time.Time  `json:"timestamp"`
 	LatencyMs int64      `json:"latency_ms"`
+	TTFTMs    int64      `json:"ttft_ms"`
 	Source    string     `json:"source"`
 	AuthIndex string     `json:"auth_index"`
 	Tokens    TokenStats `json:"tokens"`
@@ -200,6 +201,7 @@ func (s *RequestStatistics) Record(ctx context.Context, record coreusage.Record)
 	s.updateAPIStats(stats, modelName, RequestDetail{
 		Timestamp: timestamp,
 		LatencyMs: normaliseLatency(record.Latency),
+		TTFTMs:    normaliseLatency(record.TTFT),
 		Source:    record.Source,
 		AuthIndex: record.AuthIndex,
 		Tokens:    detail,

@@ -33,6 +33,8 @@ type monitorRecord struct {
 	ReasoningTokens int64
 	CachedTokens    int64
 	TotalTokens     int64
+	LatencyMs       int64
+	TTFTMs          int64
 }
 
 type monitorRecordFilter struct {
@@ -67,6 +69,8 @@ type monitorRequestLogItem struct {
 	ReasoningTokens int64                  `json:"reasoning_tokens"`
 	CachedTokens    int64                  `json:"cached_tokens"`
 	TotalTokens     int64                  `json:"total_tokens"`
+	LatencyMs       int64                  `json:"latency_ms"`
+	TTFTMs          int64                  `json:"ttft_ms"`
 	RequestCount    int64                  `json:"request_count"`
 	SuccessRate     float64                `json:"success_rate"`
 	RecentRequests  []monitorRecentRequest `json:"recent_requests"`
@@ -193,6 +197,8 @@ func (h *Handler) GetMonitorRequestLogs(c *gin.Context) {
 					ReasoningTokens: row.ReasoningTokens,
 					CachedTokens:    row.CachedTokens,
 					TotalTokens:     row.TotalTokens,
+					LatencyMs:       row.LatencyMs,
+					TTFTMs:          row.TTFTMs,
 					RequestCount:    groupStats.Total,
 					SuccessRate:     calcRate(groupStats.Success, groupStats.Total),
 					RecentRequests:  fromUsageRecentRequests(groupStats.Recent),
@@ -251,6 +257,8 @@ func (h *Handler) GetMonitorRequestLogs(c *gin.Context) {
 			ReasoningTokens: record.ReasoningTokens,
 			CachedTokens:    record.CachedTokens,
 			TotalTokens:     record.TotalTokens,
+			LatencyMs:       record.LatencyMs,
+			TTFTMs:          record.TTFTMs,
 		})
 	})
 
@@ -698,6 +706,8 @@ func visitSnapshotRecords(snapshot usage.StatisticsSnapshot, visit func(record m
 					ReasoningTokens: detail.Tokens.ReasoningTokens,
 					CachedTokens:    detail.Tokens.CachedTokens,
 					TotalTokens:     detail.Tokens.TotalTokens,
+					LatencyMs:       detail.LatencyMs,
+					TTFTMs:          detail.TTFTMs,
 				})
 			}
 		}

@@ -56,6 +56,8 @@ type MonitorRequestLog struct {
 	ReasoningTokens int64
 	CachedTokens    int64
 	TotalTokens     int64
+	LatencyMs       int64
+	TTFTMs          int64
 }
 
 // MonitorRequestGroupStats represents per-channel+model counters for request logs.
@@ -458,7 +460,7 @@ func (s *sqliteUsageStore) QueryMonitorRequestLogs(ctx context.Context, filter M
 	query := fmt.Sprintf(`
 		SELECT api_key, model, COALESCE(NULLIF(source, ''), 'unknown'), auth_index,
 			failed, requested_at, input_tokens, output_tokens, reasoning_tokens,
-			cached_tokens, total_tokens
+			cached_tokens, total_tokens, latency_ms, ttft_ms
 		FROM usage_records
 		WHERE %s
 		ORDER BY requested_at DESC, id DESC
@@ -493,6 +495,8 @@ func (s *sqliteUsageStore) QueryMonitorRequestLogs(ctx context.Context, filter M
 			&item.ReasoningTokens,
 			&item.CachedTokens,
 			&item.TotalTokens,
+			&item.LatencyMs,
+			&item.TTFTMs,
 		); err != nil {
 			return MonitorRequestLogsResult{}, fmt.Errorf("usage store: scan monitor request logs: %w", err)
 		}
