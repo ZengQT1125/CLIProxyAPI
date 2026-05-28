@@ -17,6 +17,7 @@ import (
 	"math/rand"
 	"net/http"
 	"net/url"
+	"path/filepath"
 	"strconv"
 	"strings"
 	"sync"
@@ -1800,10 +1801,43 @@ func (e *AntigravityExecutor) refreshToken(ctx context.Context, auth *cliproxyau
 	auth.Metadata["expired"] = now.Add(time.Duration(tokenResp.ExpiresIn) * time.Second).Format(time.RFC3339)
 	auth.Metadata["type"] = antigravityAuthType
 	if errProject := e.ensureAntigravityProjectID(ctx, auth, tokenResp.AccessToken); errProject != nil {
-		log.Warnf("antigravity executor: ensure project id failed: %v", errProject)
+		log.Warnf("antigravity executor: ensure project id failed: credential=%s: %v", antigravityCredentialName(auth), errProject)
 	}
 	e.updateAntigravityCreditsBalance(ctx, auth, tokenResp.AccessToken)
 	return auth, nil
+}
+
+func antigravityCredentialName(auth *cliproxyauth.Auth) string {
+	if auth == nil {
+		return "<unknown>"
+	}
+	if fileName := strings.TrimSpace(auth.FileName); fileName != "" {
+		return filepath.Base(fileName)
+	}
+	if auth.Attributes != nil {
+		if path := strings.TrimSpace(auth.Attributes["path"]); path != "" {
+			return filepath.Base(path)
+		}
+	}
+	if label := strings.TrimSpace(auth.Label); label != "" {
+		return label
+	}
+	if auth.Metadata != nil {
+		if email, ok := auth.Metadata["email"].(string); ok {
+			if email = strings.TrimSpace(email); email != "" {
+				return email
+			}
+		}
+	}
+	if kind, value := auth.AccountInfo(); kind == "oauth" {
+		if value = strings.TrimSpace(value); value != "" {
+			return value
+		}
+	}
+	if id := strings.TrimSpace(auth.ID); id != "" {
+		return filepath.Base(id)
+	}
+	return "<unknown>"
 }
 
 func (e *AntigravityExecutor) ensureAntigravityProjectID(ctx context.Context, auth *cliproxyauth.Auth, accessToken string) error {

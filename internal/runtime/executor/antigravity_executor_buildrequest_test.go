@@ -10,6 +10,7 @@ import (
 	"time"
 
 	cliproxyauth "github.com/router-for-me/CLIProxyAPI/v7/sdk/cliproxy/auth"
+	log "github.com/sirupsen/logrus"
 )
 
 func TestAntigravityBuildRequest_SanitizesGeminiToolSchema(t *testing.T) {
@@ -152,6 +153,70 @@ func TestAntigravityPrepareRequestAuth_FetchesMissingProjectID(t *testing.T) {
 	}
 }
 
+func TestAntigravityRefreshToken_LogsCredentialNameWhenProjectIDFetchFails(t *testing.T) {
+	logger := log.StandardLogger()
+	oldLevel := logger.GetLevel()
+	oldHooks := logger.ReplaceHooks(make(log.LevelHooks))
+	hook := &captureAntigravityLogHook{}
+	logger.SetLevel(log.WarnLevel)
+	logger.AddHook(hook)
+	t.Cleanup(func() {
+		logger.SetLevel(oldLevel)
+		logger.ReplaceHooks(oldHooks)
+	})
+
+	executor := &AntigravityExecutor{}
+	auth := &cliproxyauth.Auth{
+		FileName: "sadadiyaparmar484@gmail.com.json",
+		Metadata: map[string]any{
+			"refresh_token": "refresh-token",
+		},
+	}
+	ctx := context.WithValue(context.Background(), "cliproxy.roundtripper", roundTripperFunc(func(req *http.Request) (*http.Response, error) {
+		switch req.URL.String() {
+		case "https://oauth2.googleapis.com/token":
+			return &http.Response{
+				StatusCode: http.StatusOK,
+				Header:     make(http.Header),
+				Body:       io.NopCloser(strings.NewReader(`{"access_token":"new-access-token","expires_in":3600,"token_type":"Bearer"}`)),
+			}, nil
+		case "https://cloudcode-pa.googleapis.com/v1internal:loadCodeAssist":
+			return &http.Response{
+				StatusCode: http.StatusOK,
+				Header:     make(http.Header),
+				Body:       io.NopCloser(strings.NewReader(`{"allowedTiers":[{"id":"standard-tier"}]}`)),
+			}, nil
+		case "https://daily-cloudcode-pa.googleapis.com/v1internal:onboardUser":
+			return &http.Response{
+				StatusCode: http.StatusOK,
+				Header:     make(http.Header),
+				Body:       io.NopCloser(strings.NewReader(`{"done":true,"response":{}}`)),
+			}, nil
+		default:
+			t.Fatalf("unexpected request: %s", req.URL.String())
+			return nil, nil
+		}
+	}))
+
+	if _, err := executor.refreshToken(ctx, auth); err != nil {
+		t.Fatalf("refreshToken error: %v", err)
+	}
+
+	var projectLog string
+	for _, message := range hook.messages {
+		if strings.Contains(message, "ensure project id failed") {
+			projectLog = message
+			break
+		}
+	}
+	if projectLog == "" {
+		t.Fatalf("missing ensure project id failure log, messages=%v", hook.messages)
+	}
+	if !strings.Contains(projectLog, "credential=sadadiyaparmar484@gmail.com.json") {
+		t.Fatalf("project id failure log missing credential name: %q", projectLog)
+	}
+}
+
 func TestAntigravityBuildRequest_RejectsMissingProjectID(t *testing.T) {
 	executor := &AntigravityExecutor{}
 	auth := &cliproxyauth.Auth{Metadata: map[string]any{}}
@@ -167,6 +232,19 @@ func TestAntigravityBuildRequest_RejectsMissingProjectID(t *testing.T) {
 	if got := status.StatusCode(); got != http.StatusBadRequest {
 		t.Fatalf("status code = %d, want %d", got, http.StatusBadRequest)
 	}
+}
+
+type captureAntigravityLogHook struct {
+	messages []string
+}
+
+func (h *captureAntigravityLogHook) Levels() []log.Level {
+	return log.AllLevels
+}
+
+func (h *captureAntigravityLogHook) Fire(entry *log.Entry) error {
+	h.messages = append(h.messages, entry.Message)
+	return nil
 }
 
 func assertNonSchemaRequestPreserved(t *testing.T, body map[string]any) {
