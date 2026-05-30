@@ -121,14 +121,14 @@ Fork modifications (修改):
 - `internal/api/handlers/management/usage.go` — Enhanced usage export/import
 - `internal/api/server.go` — Added `/custom/monitor/*` (10 endpoints) and `/custom/codex-cleanup` route registrations
 
-### 3. Sequential-Fill (SF) Selector & RetryLimiter
+### 3. Sequential-Fill (SF) Selector
 
 Fork-only files (新增):
 - `sdk/cliproxy/auth/selector.go` — `SequentialFillSelector` implementation with sticky behavior
 - Parts of `sdk/cliproxy/auth/selector_test.go` — SF-specific tests
 
 Fork modifications (修改):
-- `sdk/cliproxy/auth/conductor.go` — SF integration, `RetryLimiter` interface, two-level provider rotation
+- `sdk/cliproxy/auth/conductor.go` — SF integration, two-level provider rotation (SF honors configured `request-retry`/`max-retry-credentials`, no selector-level retry override)
 
 ### 4. Antigravity Web Search & Fixes
 
