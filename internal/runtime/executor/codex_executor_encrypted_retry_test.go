@@ -46,6 +46,7 @@ func TestCodexExecutorExecuteStreamRetriesOnInvalidEncryptedContent(t *testing.T
 		Model: "gpt-5.4",
 		Payload: []byte(`{"model":"gpt-5.4","stream":true,"input":[` +
 			`{"role":"user","content":"hello"},` +
+			`{"type":"compaction","encrypted_content":"keep-compaction"},` +
 			`{"id":"rs_good","type":"reasoning","encrypted_content":"` + validEncryptedContent + `","summary":[]}` +
 			`]}`),
 	}, cliproxyexecutor.Options{
@@ -62,12 +63,15 @@ func TestCodexExecutorExecuteStreamRetriesOnInvalidEncryptedContent(t *testing.T
 		t.Fatalf("expected exactly 2 upstream calls (original + retry), got %d", got)
 	}
 	// First attempt must still carry the (valid-shaped) encrypted reasoning that upstream rejected.
-	if !gjson.GetBytes(firstBody, "input.1.encrypted_content").Exists() {
+	if !gjson.GetBytes(firstBody, "input.2.encrypted_content").Exists() {
 		t.Fatalf("first request should carry encrypted reasoning; body=%s", firstBody)
 	}
-	// Retry must drop the whole reasoning item and any encrypted_content from input.
-	if strings.Contains(gjson.GetBytes(retryBody, "input").Raw, "encrypted_content") {
-		t.Fatalf("retry request input must not contain encrypted_content; body=%s", retryBody)
+	// Retry must drop the whole reasoning item while preserving non-reasoning encrypted_content.
+	if got := gjson.GetBytes(retryBody, "input.1.encrypted_content").String(); got != "keep-compaction" {
+		t.Fatalf("retry request must preserve compaction encrypted_content, got %q; body=%s", got, retryBody)
+	}
+	if strings.Contains(gjson.GetBytes(retryBody, `input.#(type=="reasoning")`).Raw, "encrypted_content") {
+		t.Fatalf("retry request reasoning input must not contain encrypted_content; body=%s", retryBody)
 	}
 	if gjson.GetBytes(retryBody, `input.#(type=="reasoning")`).Exists() {
 		t.Fatalf("retry request must not contain reasoning items; body=%s", retryBody)

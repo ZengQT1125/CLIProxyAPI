@@ -39,9 +39,9 @@ func isInvalidResponsesEncryptedContentError(statusCode int, body []byte) bool {
 	return false
 }
 
-// stripInvalidEncryptedContentFromResponsesBody removes reasoning items carrying
-// encrypted_content (and any nested encrypted_content fields) from a /responses
-// request body so it can be retried without the rejected encrypted reasoning context.
+// stripInvalidEncryptedContentFromResponsesBody removes reasoning items from a
+// /responses request body so it can be retried without the rejected encrypted
+// reasoning context.
 func stripInvalidEncryptedContentFromResponsesBody(body []byte) ([]byte, bool) {
 	var root map[string]any
 	if err := json.Unmarshal(body, &root); err != nil || root == nil {
@@ -87,16 +87,7 @@ func stripInvalidEncryptedContentValue(value any, arrayItem bool) (any, bool, bo
 	case map[string]any:
 		changed := false
 		if strings.TrimSpace(firstNonEmptyAnyString(v["type"])) == "reasoning" {
-			if _, hasEncrypted := v["encrypted_content"]; hasEncrypted {
-				if arrayItem {
-					return nil, true, false
-				}
-				delete(v, "encrypted_content")
-				changed = true
-			}
-		} else if _, hasEncrypted := v["encrypted_content"]; hasEncrypted {
-			delete(v, "encrypted_content")
-			changed = true
+			return nil, true, false
 		}
 		for key, child := range v {
 			stripped, childChanged, keep := stripInvalidEncryptedContentValue(child, false)

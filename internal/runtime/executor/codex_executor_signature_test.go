@@ -31,7 +31,7 @@ func newCodexSignatureTestAuth(serverURL string) *cliproxyauth.Auth {
 	}}
 }
 
-func TestCodexExecutorDropsInvalidReasoningEncryptedContentFromFinalRequest(t *testing.T) {
+func TestCodexExecutorDropsInvalidReasoningItemsFromFinalRequest(t *testing.T) {
 	validEncryptedContent := validCodexReasoningEncryptedContentForTest()
 	var gotBody []byte
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
@@ -62,16 +62,17 @@ func TestCodexExecutorDropsInvalidReasoningEncryptedContentFromFinalRequest(t *t
 		t.Fatalf("Execute error: %v", err)
 	}
 
-	if gjson.GetBytes(gotBody, "input.0.encrypted_content").Exists() {
-		t.Fatalf("invalid reasoning encrypted_content exists, want removed; body=%s", string(gotBody))
+	items := gjson.GetBytes(gotBody, "input").Array()
+	if len(items) != 2 {
+		t.Fatalf("invalid reasoning items should be removed, got %d items; body=%s", len(items), string(gotBody))
 	}
-	if gjson.GetBytes(gotBody, "input.1.encrypted_content").Exists() {
-		t.Fatalf("non-string reasoning encrypted_content exists, want removed; body=%s", string(gotBody))
+	if got := gjson.GetBytes(gotBody, "input.0.id").String(); got != "rs_good" {
+		t.Fatalf("first remaining item = %q, want valid reasoning item; body=%s", got, string(gotBody))
 	}
-	if got := gjson.GetBytes(gotBody, "input.2.encrypted_content").String(); got != validEncryptedContent {
+	if got := gjson.GetBytes(gotBody, "input.0.encrypted_content").String(); got != validEncryptedContent {
 		t.Fatalf("valid reasoning encrypted_content = %q, want preserved", got)
 	}
-	if got := gjson.GetBytes(gotBody, "input.3.encrypted_content").String(); got != "leave-message-alone" {
+	if got := gjson.GetBytes(gotBody, "input.1.encrypted_content").String(); got != "leave-message-alone" {
 		t.Fatalf("non-reasoning encrypted_content = %q, want untouched", got)
 	}
 }
@@ -102,8 +103,8 @@ func TestCodexExecutorExecuteStreamDropsInvalidReasoningEncryptedContentFromFina
 	}
 	for range result.Chunks {
 	}
-	if gjson.GetBytes(gotBody, "input.0.encrypted_content").Exists() {
-		t.Fatalf("invalid stream reasoning encrypted_content exists, want removed; body=%s", string(gotBody))
+	if gjson.GetBytes(gotBody, `input.#(type=="reasoning")`).Exists() {
+		t.Fatalf("invalid stream reasoning item exists, want removed; body=%s", string(gotBody))
 	}
 }
 
@@ -132,7 +133,7 @@ func TestCodexExecutorCompactDropsInvalidReasoningEncryptedContentFromFinalReque
 	if err != nil {
 		t.Fatalf("Execute compact error: %v", err)
 	}
-	if gjson.GetBytes(gotBody, "input.0.encrypted_content").Exists() {
-		t.Fatalf("invalid compact reasoning encrypted_content exists, want removed; body=%s", string(gotBody))
+	if gjson.GetBytes(gotBody, `input.#(type=="reasoning")`).Exists() {
+		t.Fatalf("invalid compact reasoning item exists, want removed; body=%s", string(gotBody))
 	}
 }
