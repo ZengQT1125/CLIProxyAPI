@@ -3,6 +3,8 @@ package management
 import (
 	"context"
 	"net/http"
+	"os"
+	"path/filepath"
 	"testing"
 
 	"github.com/router-for-me/CLIProxyAPI/v7/internal/config"
@@ -26,6 +28,44 @@ func TestAPICallTransportDirectBypassesGlobalProxy(t *testing.T) {
 	}
 	if httpTransport.Proxy != nil {
 		t.Fatal("expected direct transport to disable proxy function")
+	}
+}
+
+func TestRemoveCodexAuthRemovesRuntimeAuth(t *testing.T) {
+	t.Parallel()
+
+	authDir := t.TempDir()
+	fileName := "cleanup-user.json"
+	filePath := filepath.Join(authDir, fileName)
+	if err := os.WriteFile(filePath, []byte(`{"type":"codex"}`), 0o600); err != nil {
+		t.Fatalf("write auth file: %v", err)
+	}
+
+	manager := coreauth.NewManager(nil, nil, nil)
+	auth := &coreauth.Auth{
+		ID:       "cleanup-runtime-auth",
+		FileName: fileName,
+		Provider: "codex",
+		Status:   coreauth.StatusActive,
+		Attributes: map[string]string{
+			"path": filePath,
+		},
+	}
+	if _, err := manager.Register(context.Background(), auth); err != nil {
+		t.Fatalf("register auth: %v", err)
+	}
+
+	h := NewHandlerWithoutConfigFilePath(&config.Config{AuthDir: authDir}, manager)
+	h.tokenStore = &memoryAuthStore{}
+
+	if err := h.removeCodexAuth(context.Background(), auth); err != nil {
+		t.Fatalf("removeCodexAuth returned error: %v", err)
+	}
+	if _, err := os.Stat(filePath); !os.IsNotExist(err) {
+		t.Fatalf("expected auth file to be removed, stat err: %v", err)
+	}
+	if _, ok := manager.GetByID(auth.ID); ok {
+		t.Fatalf("expected runtime auth %q to be removed", auth.ID)
 	}
 }
 

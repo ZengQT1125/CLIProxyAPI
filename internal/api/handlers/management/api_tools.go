@@ -965,7 +965,11 @@ func (h *Handler) removeCodexAuth(ctx context.Context, auth *coreauth.Auth) erro
 	if err := h.deleteTokenRecord(ctx, path); err != nil {
 		return fmt.Errorf("failed to delete token record: %w", err)
 	}
-	h.disableAuth(ctx, path)
+	id := strings.TrimSpace(auth.ID)
+	if id == "" {
+		id = path
+	}
+	h.removeAuth(ctx, id)
 	return nil
 }
 
