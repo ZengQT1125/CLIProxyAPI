@@ -2544,6 +2544,7 @@ func (m *Manager) MarkResult(ctx context.Context, result Result) {
 	}
 
 	m.hook.OnResult(ctx, result)
+	m.publishErrorEvent(result, authSnapshot)
 }
 
 func shouldDeleteUnauthorizedAuth(result Result) bool {
