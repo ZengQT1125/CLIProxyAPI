@@ -1612,6 +1612,24 @@ func (s *Service) Shutdown(ctx context.Context) error {
 			}
 		}
 
+		if s.pluginHost != nil {
+			sdktranslator.SetPluginHooks(nil)
+			sdkAuth.RegisterPluginAuthParser(nil)
+			if s.watcher != nil {
+				s.watcher.SetPluginAuthParser(nil)
+			}
+			s.pluginHost.ApplyConfig(ctx, &config.Config{})
+			s.pluginHost.RegisterModels(ctx, registry.GetGlobalRegistry())
+			if s.coreManager != nil {
+				s.pluginHost.RegisterExecutors(s.coreManager, registry.GetGlobalRegistry())
+			}
+			s.pluginHost.RegisterFrontendAuthProviders()
+			s.pluginHost.ShutdownAll()
+			if s.accessManager != nil {
+				s.accessManager.SetProviders(sdkaccess.RegisteredProviders())
+			}
+		}
+
 		internalusage.CloseDatabasePlugin()
 		usage.StopDefault()
 	})
