@@ -103,6 +103,8 @@ Fork-only files (新增):
 - `internal/usage/database_plugin_test.go`
 - `internal/usage/monitor_queries.go` — Aggregation query APIs for dashboard
 - `internal/usage/monitor_queries_test.go`
+- `internal/usage/logger_plugin.go` — Usage statistics logger plugin
+- `internal/usage/logger_plugin_test.go`
 
 Fork modifications (修改):
 - `internal/config/config.go` — Added `usage-persistence-enabled` config field
@@ -124,10 +126,12 @@ Fork modifications (修改):
 ### 3. Sequential-Fill (SF) Selector
 
 Fork-only files (新增):
-- `sdk/cliproxy/auth/selector.go` — `SequentialFillSelector` implementation with sticky behavior
-- Parts of `sdk/cliproxy/auth/selector_test.go` — SF-specific tests
+- `sdk/cliproxy/auth/routing_strategy.go` — SF routing strategy constants and `NormalizeRoutingStrategy`
+- `sdk/cliproxy/auth/routing_strategy_test.go`
 
 Fork modifications (修改):
+- `sdk/cliproxy/auth/selector.go` — Added `SequentialFillSelector` implementation with sticky behavior (file exists upstream; SF code is fork addition)
+- `sdk/cliproxy/auth/selector_test.go` — Added SF-specific tests
 - `sdk/cliproxy/auth/conductor.go` — SF integration, two-level provider rotation (SF honors configured `request-retry`/`max-retry-credentials`, no selector-level retry override)
 
 ### 4. Antigravity Web Search & Fixes
@@ -139,9 +143,19 @@ Fork modifications (修改):
 - `internal/translator/antigravity/gemini/antigravity_gemini_request.go` — Search grounding in Gemini format
 - `internal/translator/antigravity/openai/chat-completions/antigravity_openai_request.go` — Search grounding in OpenAI format
 - `internal/translator/antigravity/openai/chat-completions/antigravity_openai_request_test.go`
-- `internal/translator/antigravity/openai/responses/antigravity_openai-responses_request.go` — Search grounding in Responses format
 
-### 5. Request Handler Fixes
+### 5. Request Handler Fixes & Codex Enhancements
+
+Fork-only files (新增):
+- `cmd/server/config_bootstrap.go` — Git-backed config bootstrap
+- `cmd/server/config_bootstrap_test.go`
+- `cmd/server/local_model.go` — Local model directory support
+- `cmd/server/local_model_test.go`
+- `internal/codexapi/base_url.go` — Codex API base URL resolution
+- `internal/runtime/executor/codex_base_url.go` — Codex executor base URL parsing
+- `internal/runtime/executor/codex_base_url_test.go`
+- `internal/runtime/executor/responses_encrypted_retry.go` — Encrypted retry logic for Responses API
+- `internal/runtime/executor/responses_encrypted_retry_test.go`
 
 Fork modifications (修改):
 - `sdk/api/handlers/handlers.go` — Expose cached tokens in Codex chat completions; route mixed search/function tool calls to compatible providers
