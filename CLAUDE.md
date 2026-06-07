@@ -167,16 +167,7 @@ Other:
 - `.gitignore` — Added `usage.*` to ignore usage database files
 - `go.mod` / `go.sum` — Added `golang.org/x/exp`, `charmbracelet/bubbletea`, `charmbracelet/bubbles`, `charmbracelet/lipgloss` dependencies
 
-### 8. Management Panel Auto-Updater
-
-Fork-only files (新增):
-- `internal/managementasset/updater.go` — Auto-downloads management panel HTML from GitHub releases, SHA256 verification, atomic writes, fallback static page
-
-Fork modifications (修改):
-- `cmd/server/main.go` — Integrates `managementasset.StartAutoUpdater()` on startup
-- `internal/api/server.go` — Serves management panel from `MANAGEMENT_STATIC_PATH` directory
-
-### 9. Documentation
+### 8. Documentation
 
 Fork modifications (修改):
 - `README.md` / `README_CN.md` — Added Fork Features section, Management Center description
