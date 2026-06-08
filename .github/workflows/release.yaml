@@ -134,20 +134,6 @@ jobs:
             tar -C "$archive_dir" -czf "dist/$archive_name" "$binary_name" LICENSE README.md README_CN.md config.example.yaml
           fi
 
-      - name: Create asset checksum
-        run: |
-          set -euo pipefail
-          shopt -s nullglob
-          archives=(dist/CLIProxyAPI_*.tar.gz dist/CLIProxyAPI_*.zip)
-          if [ "${#archives[@]}" -ne 1 ]; then
-            printf 'expected one archive, found %s\n' "${#archives[@]}" >&2
-            printf '%s\n' "${archives[@]}" >&2
-            exit 1
-          fi
-          archive="${archives[0]}"
-          archive_name="$(basename "$archive")"
-          sha256sum "$archive" | awk -v name="$archive_name" '{print $1 "  " name}' > "$archive.sha256"
-
       - name: Upload artifact
         uses: actions/upload-artifact@v4
         with:
@@ -155,8 +141,6 @@ jobs:
           path: |
             dist/CLIProxyAPI_*.tar.gz
             dist/CLIProxyAPI_*.zip
-            dist/CLIProxyAPI_*.tar.gz.sha256
-            dist/CLIProxyAPI_*.zip.sha256
           if-no-files-found: error
           retention-days: 1
 
