@@ -27,23 +27,23 @@ jobs:
           - target: darwin-amd64
             goos: darwin
             goarch: amd64
-            archive_format: tar.gz
+            output: cli-proxy-api-darwin-amd64
           - target: darwin-arm64
             goos: darwin
             goarch: arm64
-            archive_format: tar.gz
+            output: cli-proxy-api-darwin-arm64
           - target: linux-amd64
             goos: linux
             goarch: amd64
-            archive_format: tar.gz
+            output: cli-proxy-api-linux-amd64
           - target: linux-arm64
             goos: linux
             goarch: arm64
-            archive_format: tar.gz
+            output: cli-proxy-api-linux-arm64
           - target: windows-amd64
             goos: windows
             goarch: amd64
-            archive_format: zip
+            output: cli-proxy-api-windows-amd64.exe
 
     steps:
       - name: Checkout code
@@ -72,13 +72,6 @@ jobs:
           go-version: ${{ env.GO_VERSION }}
           cache: true
 
-      - name: Install zip
-        if: ${{ matrix.archive_format == 'zip' }}
-        run: |
-          set -euo pipefail
-          sudo apt-get update
-          sudo apt-get install -y zip
-
       - name: Generate build metadata
         id: metadata
         env:
@@ -101,46 +94,30 @@ jobs:
             echo "build_date=$(date -u +%Y-%m-%dT%H:%M:%SZ)"
           } >> "$GITHUB_OUTPUT"
 
-      - name: Build archive
+      - name: Build binary
         env:
           GOOS: ${{ matrix.goos }}
           GOARCH: ${{ matrix.goarch }}
-          ARCHIVE_FORMAT: ${{ matrix.archive_format }}
+          OUTPUT: ${{ matrix.output }}
           RELEASE_VERSION: ${{ steps.metadata.outputs.version }}
           COMMIT: ${{ steps.metadata.outputs.commit }}
           BUILD_DATE: ${{ steps.metadata.outputs.build_date }}
         run: |
           set -euo pipefail
-          binary_name="cli-proxy-api"
-          if [ "$GOOS" = "windows" ]; then
-            binary_name="cli-proxy-api.exe"
-          fi
-
-          archive_dir="dist/${GOOS}-${GOARCH}/archive"
-          archive_name="CLIProxyAPI_${RELEASE_VERSION}_${GOOS}_${GOARCH}.${ARCHIVE_FORMAT}"
           rm -rf "dist/${GOOS}-${GOARCH}"
-          mkdir -p "$archive_dir"
+          mkdir -p dist
 
           CGO_ENABLED=0 GOOS="$GOOS" GOARCH="$GOARCH" go build \
             -buildvcs=false \
             -trimpath \
             -ldflags="-s -w -X main.Version=${RELEASE_VERSION} -X main.Commit=${COMMIT} -X main.BuildDate=${BUILD_DATE}" \
-            -o "$archive_dir/$binary_name" ./cmd/server/
-
-          cp LICENSE README.md README_CN.md config.example.yaml "$archive_dir/"
-          if [ "$ARCHIVE_FORMAT" = "zip" ]; then
-            (cd "$archive_dir" && zip -q -r "../../$archive_name" .)
-          else
-            tar -C "$archive_dir" -czf "dist/$archive_name" "$binary_name" LICENSE README.md README_CN.md config.example.yaml
-          fi
+            -o "dist/$OUTPUT" ./cmd/server/
 
       - name: Upload artifact
         uses: actions/upload-artifact@v4
         with:
           name: ${{ matrix.target }}
-          path: |
-            dist/CLIProxyAPI_*.tar.gz
-            dist/CLIProxyAPI_*.zip
+          path: dist/${{ matrix.output }}
           if-no-files-found: error
           retention-days: 1
 
@@ -190,12 +167,12 @@ jobs:
         run: |
           set -euo pipefail
           shopt -s nullglob
-          archives=(CLIProxyAPI_*.tar.gz CLIProxyAPI_*.zip)
-          if [ "${#archives[@]}" -eq 0 ]; then
-            echo "No release archives found" >&2
+          files=(cli-proxy-api-*)
+          if [ "${#files[@]}" -eq 0 ]; then
+            echo "No release binaries found" >&2
             exit 1
           fi
-          sha256sum "${archives[@]}" | sort -k2 > checksums.txt
+          sha256sum "${files[@]}" | sort -k2 > checksums.txt
           cat checksums.txt
 
       - name: Generate release notes
@@ -261,11 +238,11 @@ jobs:
 
           | Platform | Arch | File |
           |----------|------|------|
-          | macOS | Intel | `CLIProxyAPI_<version>_darwin_amd64.tar.gz` |
-          | macOS | Apple Silicon | `CLIProxyAPI_<version>_darwin_arm64.tar.gz` |
-          | Linux | x86_64 | `CLIProxyAPI_<version>_linux_amd64.tar.gz` |
-          | Linux | ARM64 | `CLIProxyAPI_<version>_linux_arm64.tar.gz` |
-          | Windows | x86_64 | `CLIProxyAPI_<version>_windows_amd64.zip` |
+          | macOS | Intel | `cli-proxy-api-darwin-amd64` |
+          | macOS | Apple Silicon | `cli-proxy-api-darwin-arm64` |
+          | Linux | x86_64 | `cli-proxy-api-linux-amd64` |
+          | Linux | ARM64 | `cli-proxy-api-linux-arm64` |
+          | Windows | x86_64 | `cli-proxy-api-windows-amd64.exe` |
 
           **Checksum**: See `checksums.txt` in release assets.
 
