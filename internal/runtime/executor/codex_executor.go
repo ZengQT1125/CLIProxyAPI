@@ -138,15 +138,26 @@ func codexTerminalStreamErr(eventData []byte) (statusErr, []byte, bool) {
 	if !codexTerminalStreamErrShouldHandle(body) {
 		return statusErr{}, nil, false
 	}
-	return newCodexStatusErr(http.StatusBadRequest, body), body, true
+	statusCode := http.StatusBadRequest
+	if codexTerminalErrorIsUsageLimitReached(body) {
+		statusCode = http.StatusTooManyRequests
+	}
+	return newCodexStatusErr(statusCode, body), body, true
 }
 
 func codexTerminalStreamErrShouldHandle(body []byte) bool {
 	if codexTerminalErrorIsContextLength(body) {
 		return true
 	}
+	if codexTerminalErrorIsUsageLimitReached(body) {
+		return true
+	}
 	code, _, ok := codexStatusErrorClassification(http.StatusBadRequest, body)
 	return ok && code == "thinking_signature_invalid"
+}
+
+func codexTerminalErrorIsUsageLimitReached(body []byte) bool {
+	return strings.TrimSpace(gjson.GetBytes(body, "error.type").String()) == "usage_limit_reached"
 }
 
 func codexTerminalErrorBody(eventData []byte, path string) []byte {

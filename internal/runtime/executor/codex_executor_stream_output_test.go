@@ -7,6 +7,7 @@ import (
 	"net/http/httptest"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/router-for-me/CLIProxyAPI/v7/internal/config"
 	_ "github.com/router-for-me/CLIProxyAPI/v7/internal/translator"
@@ -163,6 +164,22 @@ func TestCodexTerminalStreamErrIgnoresRateLimitTerminalErrors(t *testing.T) {
 	_, _, ok := codexTerminalStreamErr([]byte(`{"type":"error","error":{"type":"rate_limit_error","code":"rate_limit_exceeded","message":"Rate limit reached."}}`))
 	if ok {
 		t.Fatal("rate limit terminal error should not be handled by replay terminal error path")
+	}
+}
+
+func TestCodexTerminalStreamErrHandlesUsageLimitReached(t *testing.T) {
+	err, _, ok := codexTerminalStreamErr([]byte(`{"type":"response.failed","response":{"status":"failed","error":{"type":"usage_limit_reached","message":"usage limit reached","resets_in_seconds":7}}}`))
+	if !ok {
+		t.Fatal("expected usage_limit_reached terminal error")
+	}
+	if got := statusCodeFromTestError(t, err); got != http.StatusTooManyRequests {
+		t.Fatalf("status code = %d, want %d; err=%v", got, http.StatusTooManyRequests, err)
+	}
+	if err.RetryAfter() == nil {
+		t.Fatalf("expected retryAfter on usage limit terminal error")
+	}
+	if got := *err.RetryAfter(); got != 7*time.Second {
+		t.Fatalf("retryAfter = %v, want %v", got, 7*time.Second)
 	}
 }
 

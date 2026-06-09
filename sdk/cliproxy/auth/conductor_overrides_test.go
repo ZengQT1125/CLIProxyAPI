@@ -224,6 +224,50 @@ func (e *authFallbackExecutor) StreamCalls() []string {
 	return out
 }
 
+func TestManager_WrapStreamResult_PreservesRetryAfterOnChunkError(t *testing.T) {
+	prev := quotaCooldownDisabled.Load()
+	quotaCooldownDisabled.Store(false)
+	t.Cleanup(func() { quotaCooldownDisabled.Store(prev) })
+
+	m := NewManager(nil, &FillFirstSelector{}, nil)
+	model := "test-model-stream-retryafter"
+	auth := &Auth{ID: "auth-stream-retryafter", Provider: "codex"}
+	if _, errRegister := m.Register(context.Background(), auth); errRegister != nil {
+		t.Fatalf("register auth: %v", errRegister)
+	}
+
+	reg := registry.GetGlobalRegistry()
+	reg.RegisterClient(auth.ID, "codex", []*registry.ModelInfo{{ID: model}})
+	t.Cleanup(func() { reg.UnregisterClient(auth.ID) })
+
+	retryAfter := 5 * time.Minute
+	streamErr := &retryAfterStatusError{
+		status:     http.StatusTooManyRequests,
+		message:    "quota exhausted",
+		retryAfter: retryAfter,
+	}
+	remaining := make(chan cliproxyexecutor.StreamChunk, 1)
+	remaining <- cliproxyexecutor.StreamChunk{Err: streamErr}
+	close(remaining)
+
+	before := time.Now()
+	result := m.wrapStreamResult(context.Background(), auth, "codex", model, nil, nil, remaining)
+	for range result.Chunks {
+	}
+
+	updated, ok := m.GetByID(auth.ID)
+	if !ok || updated == nil {
+		t.Fatalf("expected auth to be present")
+	}
+	state := updated.ModelStates[model]
+	if state == nil {
+		t.Fatalf("expected model state to be present")
+	}
+	if state.Quota.NextRecoverAt.Before(before.Add(retryAfter - time.Second)) {
+		t.Fatalf("quota next recover = %v, want retryAfter-derived cooldown near %v", state.Quota.NextRecoverAt, retryAfter)
+	}
+}
+
 type retryAfterStatusError struct {
 	status     int
 	message    string
