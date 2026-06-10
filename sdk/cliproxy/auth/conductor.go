@@ -2628,6 +2628,10 @@ func (m *Manager) MarkResult(ctx context.Context, result Result) {
 	if result.AuthID == "" {
 		return
 	}
+	// Quota/cooldown state is tracked per upstream model: strip any thinking
+	// suffix ("model(high)") so the key matches the scheduler shard and the
+	// registry model ID, which are both canonical.
+	result.Model = canonicalModelKey(result.Model)
 
 	shouldResumeModel := false
 	shouldSuspendModel := false
