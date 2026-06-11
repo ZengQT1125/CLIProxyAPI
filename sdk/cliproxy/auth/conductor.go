@@ -382,6 +382,9 @@ func (m *Manager) ReconcileRegistryModelStates(ctx context.Context, authID strin
 			if modelStateIsClean(state) {
 				continue
 			}
+			if modelStateHasActiveQuotaCooldown(state, now) {
+				continue
+			}
 			resetModelState(state, now)
 			changed = true
 		}
@@ -2982,6 +2985,22 @@ func modelStateIsClean(state *ModelState) bool {
 		return false
 	}
 	return true
+}
+
+func modelStateHasActiveQuotaCooldown(state *ModelState, now time.Time) bool {
+	if state == nil {
+		return false
+	}
+	if !state.Quota.Exceeded {
+		return false
+	}
+	if !state.Quota.NextRecoverAt.IsZero() && state.Quota.NextRecoverAt.After(now) {
+		return true
+	}
+	if !state.NextRetryAfter.IsZero() && state.NextRetryAfter.After(now) {
+		return true
+	}
+	return false
 }
 
 func updateAggregatedAvailability(auth *Auth, now time.Time) {
