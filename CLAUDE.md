@@ -7,7 +7,17 @@ AI 工作指南。优先级：**Fork-Specific 部分必须读完**——合并�
 - Module: `github.com/router-for-me/CLIProxyAPI/v7`
 - Go: 1.26.0
 - 上游: `router-for-me/CLIProxyAPI` (远程 `upstream`)
-- Fork 增量: Antigravity web search · SF routing · usage 持久化 · 管理中心 · TUI · 管理面板自动更新
+- 当前版本: 基于上游 v7.1.74
+- Fork 增量: SF routing · usage 持久化 · 管理中心 · TUI · 管理面板自动更新
+
+## Recent Upstream Adoptions
+
+**v7.1.74 (2026-06-13) - Antigravity Native Web Search**
+- 上游已实现完整的 Claude WebSearch → Antigravity googleSearch 桥接（PR #3824）
+- Fork 的简易 web_search 检测逻辑已删除，完全采用上游实现
+- 新增模块：`internal/translator/antigravity/claude/web_search.go` (502 行)
+- 支持 typed tool (`web_search_20250305`/`20260209`)、citations、grounding metadata、streaming
+- Fork 保留：OpenAI translator 对 `type: "web_search"` 工具的解析支持
 
 ## Hard Constraints
 
@@ -134,15 +144,13 @@ Fork modifications (修改):
 - `sdk/cliproxy/auth/selector_test.go` — Added SF-specific tests
 - `sdk/cliproxy/auth/conductor.go` — SF integration, two-level provider rotation (SF honors configured `request-retry`/`max-retry-credentials`, no selector-level retry override)
 
-### 4. Antigravity Web Search & Fixes
+### 4. Antigravity Enhancements
+
+> **Note**: Antigravity Web Search 已在上游 v7.1.74 (PR #3824) 实现原生支持，fork 的简易实现已删除。
 
 Fork modifications (修改):
-- `internal/runtime/executor/antigravity_executor.go` — Web search via Gemini, stable fallback project ID, 404 base URL fallback, reduced refresh skew, `disable-cooling` for 404
-- `internal/translator/antigravity/claude/antigravity_claude_request.go` — Search grounding in Claude format
-- `internal/translator/antigravity/claude/antigravity_claude_response.go` — Search result translation
-- `internal/translator/antigravity/gemini/antigravity_gemini_request.go` — Search grounding in Gemini format
-- `internal/translator/antigravity/openai/chat-completions/antigravity_openai_request.go` — Search grounding in OpenAI format
-- `internal/translator/antigravity/openai/chat-completions/antigravity_openai_request_test.go`
+- `internal/runtime/executor/antigravity_executor.go` — Stable fallback project ID, 404 base URL fallback, reduced refresh skew, `disable-cooling` for 404
+- `internal/translator/antigravity/openai/chat-completions/antigravity_openai_request.go` — Support OpenAI `type: "web_search"` tool (upstream only supports `google_search`)
 
 ### 5. Request Handler Fixes & Codex Enhancements
 
