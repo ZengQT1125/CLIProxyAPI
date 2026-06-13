@@ -2568,33 +2568,20 @@ func resolveCustomAntigravityBaseURL(auth *cliproxyauth.Auth) string {
 }
 
 func geminiToAntigravity(modelName string, payload []byte, projectID string) []byte {
-	isImageModel := strings.Contains(modelName, "image")
-
-	// Fork: web_search requestType detection with hasGoogleSearchTool
-	requestType := gjson.GetBytes(payload, "requestType").String()
-	if strings.TrimSpace(requestType) == "" {
-		if isImageModel {
-			requestType = "image_gen"
-		} else if hasGoogleSearchTool(payload) {
-			requestType = "web_search"
-		} else {
-			requestType = "agent"
-		}
-	}
-
-	// Fork: web_search uses route modelName, fallback to gemini-2.5-flash if empty
-	resolvedModel := modelName
-	if resolvedModel == "" {
-		resolvedModel = strings.TrimSpace(gjson.GetBytes(payload, "model").String())
-	}
-	if requestType == "web_search" && resolvedModel == "" {
-		resolvedModel = "gemini-2.5-flash"
-	}
-
 	template := payload
-	template, _ = sjson.SetBytes(template, "model", resolvedModel)
+	template, _ = sjson.SetBytes(template, "model", modelName)
 	template, _ = sjson.SetBytes(template, "userAgent", "antigravity")
-	template, _ = sjson.SetBytes(template, "requestType", requestType)
+
+	isImageModel := strings.Contains(modelName, "image")
+	reqType := strings.TrimSpace(gjson.GetBytes(template, "requestType").String())
+	if reqType == "" {
+		if isImageModel {
+			reqType = "image_gen"
+		} else {
+			reqType = "agent"
+		}
+		template, _ = sjson.SetBytes(template, "requestType", reqType)
+	}
 
 	if projectID != "" {
 		template, _ = sjson.SetBytes(template, "project", projectID)
@@ -2604,7 +2591,7 @@ func geminiToAntigravity(modelName string, payload []byte, projectID string) []b
 
 	if isImageModel {
 		template, _ = sjson.SetBytes(template, "requestId", generateImageGenRequestID())
-	} else if requestType != "web_search" {
+	} else if reqType != "web_search" {
 		template, _ = sjson.SetBytes(template, "requestId", generateRequestID())
 		template, _ = sjson.SetBytes(template, "request.sessionId", generateStableSessionID(payload))
 	}
@@ -2615,19 +2602,6 @@ func geminiToAntigravity(modelName string, payload []byte, projectID string) []b
 		template, _ = sjson.DeleteBytes(template, "toolConfig")
 	}
 	return template
-}
-
-func hasGoogleSearchTool(payload []byte) bool {
-	tools := gjson.GetBytes(payload, "request.tools")
-	if !tools.IsArray() {
-		return false
-	}
-	for _, tool := range tools.Array() {
-		if tool.Get("googleSearch").Exists() {
-			return true
-		}
-	}
-	return false
 }
 
 func generateRequestID() string {
