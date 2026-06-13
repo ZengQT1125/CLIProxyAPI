@@ -7,10 +7,16 @@ AI 工作指南。优先级：**Fork-Specific 部分必须读完**——合并�
 - Module: `github.com/router-for-me/CLIProxyAPI/v7`
 - Go: 1.26.0
 - 上游: `router-for-me/CLIProxyAPI` (远程 `upstream`)
-- 当前版本: 基于上游 v7.1.74
+- 当前版本: 基于上游 v7.1.75
 - Fork 增量: SF routing · usage 持久化 · 管理中心 · TUI · 管理面板自动更新
 
 ## Recent Upstream Adoptions
+
+**v7.1.75 (2026-06-14) - Plugin Delete API & System Message Consolidation**
+- 新增插件删除管理端点：`DELETE /v0/management/plugins/:id`
+- translator 增强：将 mid-conversation system messages 合并到初始 system content（OpenAI → Claude 转换器）
+- 优化插件安装超时处理逻辑
+- 简化 `.dockerignore` 模式
 
 **v7.1.74 (2026-06-13) - Antigravity Native Web Search**
 - 上游已实现完整的 Claude WebSearch → Antigravity googleSearch 桥接（PR #3824）
