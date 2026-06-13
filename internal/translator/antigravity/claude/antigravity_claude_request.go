@@ -256,7 +256,9 @@ func logDroppedAntigravityToolUseSignature(modelName string, messageIndex, conte
 func ConvertClaudeRequestToAntigravity(modelName string, inputRawJSON []byte, _ bool) []byte {
 	enableThoughtTranslate := true
 	rawJSON := inputRawJSON
-	hasWebSearchTool := false
+	if shouldBuildAntigravityWebSearchRequest(modelName, rawJSON) {
+		return buildAntigravityWebSearchRequest(modelName, rawJSON)
+	}
 
 	// system instruction
 	var systemInstructionJSON []byte
@@ -596,12 +598,11 @@ func ConvertClaudeRequestToAntigravity(modelName string, inputRawJSON []byte, _ 
 	allowedToolKeys := []string{"name", "description", "behavior", "parameters", "parametersJsonSchema", "response", "responseJsonSchema"}
 	toolsResult := gjson.GetBytes(rawJSON, "tools")
 	if toolsResult.IsArray() {
-		toolsJSON = []byte(`[{"functionDeclarations":[]}]`)
+		functionToolNode := []byte(`{"functionDeclarations":[]}`)
 		toolsResults := toolsResult.Array()
 		for i := 0; i < len(toolsResults); i++ {
 			toolResult := toolsResults[i]
-			if toolResult.Get("type").String() == "web_search" || toolResult.Get("name").String() == "web_search" {
-				hasWebSearchTool = true
+			if isClaudeTypedWebSearchToolType(toolResult.Get("type").String()) {
 				continue
 			}
 			inputSchemaResult := toolResult.Get("input_schema")
@@ -617,16 +618,13 @@ func ConvertClaudeRequestToAntigravity(modelName string, inputRawJSON []byte, _ 
 					}
 					tool, _ = sjson.DeleteBytes(tool, toolKey)
 				}
-				toolsJSON, _ = sjson.SetRawBytes(toolsJSON, "0.functionDeclarations.-1", tool)
+				functionToolNode, _ = sjson.SetRawBytes(functionToolNode, "functionDeclarations.-1", tool)
 				toolDeclCount++
 			}
 		}
-	}
-	if hasWebSearchTool {
-		if len(toolsJSON) == 0 {
-			toolsJSON = []byte(`[{"googleSearch":{}}]`)
-		} else {
-			toolsJSON, _ = sjson.SetRawBytes(toolsJSON, "0.googleSearch", []byte(`{}`))
+		if toolDeclCount > 0 {
+			toolsJSON = []byte(`[]`)
+			toolsJSON, _ = sjson.SetRawBytes(toolsJSON, "-1", functionToolNode)
 		}
 	}
 
@@ -666,9 +664,6 @@ func ConvertClaudeRequestToAntigravity(modelName string, inputRawJSON []byte, _ 
 		out, _ = sjson.SetRawBytes(out, "request.contents", contentsJSON)
 	}
 	if toolDeclCount > 0 {
-		out, _ = sjson.SetRawBytes(out, "request.tools", toolsJSON)
-	}
-	if hasWebSearchTool && toolDeclCount == 0 {
 		out, _ = sjson.SetRawBytes(out, "request.tools", toolsJSON)
 	}
 
@@ -736,11 +731,6 @@ func ConvertClaudeRequestToAntigravity(modelName string, inputRawJSON []byte, _ 
 	}
 	if v := gjson.GetBytes(rawJSON, "max_tokens"); v.Exists() && v.Type == gjson.Number {
 		out, _ = sjson.SetBytes(out, "request.generationConfig.maxOutputTokens", v.Num)
-	}
-	if hasWebSearchTool {
-		out, _ = sjson.SetBytes(out, "model", "gemini-2.5-flash")
-		out, _ = sjson.SetBytes(out, "request.generationConfig.candidateCount", 1)
-		out, _ = sjson.SetBytes(out, "requestType", "web_search")
 	}
 
 	out = common.AttachDefaultSafetySettings(out, "request.safetySettings")
