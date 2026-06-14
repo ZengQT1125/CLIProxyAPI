@@ -6,7 +6,7 @@ AI 工作指南。**必读 Fork-Specific 部分**——合并上游或重构时�
 
 - Module: `github.com/router-for-me/CLIProxyAPI/v7`
 - Go 1.26.0
-- 上游 `router-for-me/CLIProxyAPI`（远程 `upstream`），当前基于 v7.1.75
+- 上游 `router-for-me/CLIProxyAPI`（远程 `upstream`），当前基于 v7.2.2
 - Fork 增量: SF routing · usage 持久化 · 管理中心 · TUI · 管理面板自动更新
 
 ## Hard Constraints
@@ -22,7 +22,7 @@ AI 工作指南。**必读 Fork-Specific 部分**——合并上游或重构时�
 |---|---|
 | `cmd/server/main.go` | 入口；CLI flags（含 `-tui`）；token store 初始化；`internal/cmd.StartService` / `StartServiceBackground` |
 | `sdk/cliproxy/` | 可嵌入 SDK：`service.go` `builder.go` `auth/` `executor/`（含 `Pinned/Selected/ExecutionSessionMetadataKey`） |
-| `internal/api/` | Gin HTTP server；`handlers/management/`；`modules/amp/` |
+| `internal/api/` | Gin HTTP server；`handlers/management/` |
 | `internal/runtime/executor/` | Provider executor: Gemini / Gemini-CLI / Gemini-Vertex / Claude / Codex / Codex-WebSocket / Antigravity / Kimi / AIStudio / OpenAI-compat / xAI |
 | `internal/translator/` | 请求/响应跨格式转换（受 PR 守卫保护） |
 | `internal/thinking/provider/` | 扩展思考/推理 |
@@ -70,7 +70,7 @@ docker build -t cliproxyapi .
 ## Config
 
 - `config.yaml`（template: `config.example.yaml`）；`auths/*.json`；`.env`
-- 主要 sections: `tls` `remote-management` `routing` `proxy-url` `request-retry` `quota-exceeded` `payload` `oauth-model-alias` `oauth-excluded-models` `ampcode` `ws-auth` `usage-persistence-enabled` `delete-unauthorized-auth` `claude-header-defaults` `cloak` `passthrough-headers` `streaming` `home`
+- 主要 sections: `tls` `remote-management` `routing` `proxy-url` `request-retry` `quota-exceeded` `payload` `oauth-model-alias` `oauth-excluded-models` `ws-auth` `usage-persistence-enabled` `delete-unauthorized-auth` `claude-header-defaults` `cloak` `passthrough-headers` `streaming` `home`
 - Token store env: 默认本地 file；`PGSTORE_*` / `GITSTORE_*` / `OBJECTSTORE_*`
 - `MANAGEMENT_STATIC_PATH`: 覆盖管理面板 HTML 目录（默认临时目录）
 - Routing 策略: `round-robin`（default）· `fill-first`/`ff` · `sequential-fill`/`sf`（**fork**）
@@ -86,7 +86,7 @@ docker build -t cliproxyapi .
 | `/v0/management/*` | 管理 API；`auth-files/*` CRUD；`plugins/:id` DELETE |
 | `/v0/management/custom/monitor/*` | **fork** 10 个监控端点 |
 | `/v0/management/custom/codex-cleanup` | **fork** Codex 认证清理 |
-| `/xai/callback`, `/v1/ws`, `/api/provider/{provider}/v1/*` | xAI OAuth 回调 / WS / Amp |
+| `/xai/callback`, `/v1/ws` | xAI OAuth 回调 / WS |
 
 ---
 
