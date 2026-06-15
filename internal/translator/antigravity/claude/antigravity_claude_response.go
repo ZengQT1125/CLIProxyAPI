@@ -76,6 +76,8 @@ type Params struct {
 
 	// Signature caching support
 	CurrentThinkingText strings.Builder // Accumulates thinking text for signature caching
+	PseudoThinkingOpen  bool
+	PseudoThinkingTail  string
 
 	// Web search support
 	WebSearchQuery   string
@@ -89,6 +91,68 @@ type Params struct {
 
 // toolUseIDCounter provides a process-wide unique counter for tool use identifiers.
 var toolUseIDCounter uint64
+
+const (
+	pseudoThinkingOpenTag  = "<thinking>"
+	pseudoThinkingCloseTag = "</thinking>"
+)
+
+type pseudoThinkingSegment struct {
+	thinking bool
+	text     string
+}
+
+func consumePseudoThinkingSegments(params *Params, text string, final bool) []pseudoThinkingSegment {
+	if params == nil {
+		if text == "" {
+			return nil
+		}
+		return []pseudoThinkingSegment{{text: text}}
+	}
+
+	params.PseudoThinkingTail += text
+	segments := make([]pseudoThinkingSegment, 0, 2)
+	for params.PseudoThinkingTail != "" {
+		tag := pseudoThinkingOpenTag
+		if params.PseudoThinkingOpen {
+			tag = pseudoThinkingCloseTag
+		}
+
+		idx := strings.Index(params.PseudoThinkingTail, tag)
+		if idx >= 0 {
+			if prefix := params.PseudoThinkingTail[:idx]; prefix != "" {
+				segments = append(segments, pseudoThinkingSegment{thinking: params.PseudoThinkingOpen, text: prefix})
+			}
+			params.PseudoThinkingOpen = !params.PseudoThinkingOpen
+			params.PseudoThinkingTail = params.PseudoThinkingTail[idx+len(tag):]
+			continue
+		}
+
+		keep := 0
+		if !final {
+			keep = pseudoThinkingPartialSuffixLen(params.PseudoThinkingTail, tag)
+		}
+		if emit := params.PseudoThinkingTail[:len(params.PseudoThinkingTail)-keep]; emit != "" {
+			segments = append(segments, pseudoThinkingSegment{thinking: params.PseudoThinkingOpen, text: emit})
+		}
+		params.PseudoThinkingTail = params.PseudoThinkingTail[len(params.PseudoThinkingTail)-keep:]
+		break
+	}
+	return segments
+}
+
+func pseudoThinkingPartialSuffixLen(text, tag string) int {
+	maxLen := len(tag) - 1
+	if len(text) < maxLen {
+		maxLen = len(text)
+	}
+	for n := maxLen; n > 0; n-- {
+		if strings.HasPrefix(tag, text[len(text)-n:]) {
+			return n
+		}
+	}
+	return 0
+}
 
 // ConvertAntigravityResponseToClaude performs sophisticated streaming response format conversion.
 // This function implements a complex state machine that translates backend client responses
@@ -119,8 +183,56 @@ func ConvertAntigravityResponseToClaude(ctx context.Context, _ string, originalR
 
 	params := (*param).(*Params)
 
+	output := make([]byte, 0, 1024)
+	appendEvent := func(event, payload string) {
+		output = translatorcommon.AppendSSEEventString(output, event, payload, 3)
+	}
+	appendThinkingText := func(text string) {
+		if text == "" {
+			return
+		}
+		if params.ResponseType != 2 {
+			if params.ResponseType != 0 {
+				appendEvent("content_block_stop", fmt.Sprintf(`{"type":"content_block_stop","index":%d}`, params.ResponseIndex))
+				params.ResponseIndex++
+			}
+			appendEvent("content_block_start", fmt.Sprintf(`{"type":"content_block_start","index":%d,"content_block":{"type":"thinking","thinking":""}}`, params.ResponseIndex))
+			params.ResponseType = 2
+			params.CurrentThinkingText.Reset()
+		}
+		params.CurrentThinkingText.WriteString(text)
+		data, _ := sjson.SetBytes([]byte(fmt.Sprintf(`{"type":"content_block_delta","index":%d,"delta":{"type":"thinking_delta","thinking":""}}`, params.ResponseIndex)), "delta.thinking", text)
+		appendEvent("content_block_delta", string(data))
+		params.HasContent = true
+	}
+	appendText := func(text string) {
+		if text == "" {
+			return
+		}
+		if params.ResponseType != 1 {
+			if params.ResponseType != 0 {
+				appendEvent("content_block_stop", fmt.Sprintf(`{"type":"content_block_stop","index":%d}`, params.ResponseIndex))
+				params.ResponseIndex++
+			}
+			appendEvent("content_block_start", fmt.Sprintf(`{"type":"content_block_start","index":%d,"content_block":{"type":"text","text":""}}`, params.ResponseIndex))
+			params.ResponseType = 1
+		}
+		data, _ := sjson.SetBytes([]byte(fmt.Sprintf(`{"type":"content_block_delta","index":%d,"delta":{"type":"text_delta","text":""}}`, params.ResponseIndex)), "delta.text", text)
+		appendEvent("content_block_delta", string(data))
+		params.HasContent = true
+	}
+	appendPseudoThinkingSegments := func(text string, final bool) {
+		for _, segment := range consumePseudoThinkingSegments(params, text, final) {
+			if segment.thinking {
+				appendThinkingText(segment.text)
+				continue
+			}
+			appendText(segment.text)
+		}
+	}
+
 	if bytes.Equal(rawJSON, []byte("[DONE]")) {
-		output := make([]byte, 0, 256)
+		appendPseudoThinkingSegments("", true)
 		// Only send final events if we have actually output content
 		if params.HasContent {
 			appendFinalEvents(params, &output, true)
@@ -130,10 +242,6 @@ func ConvertAntigravityResponseToClaude(ctx context.Context, _ string, originalR
 		return [][]byte{}
 	}
 
-	output := make([]byte, 0, 1024)
-	appendEvent := func(event, payload string) {
-		output = translatorcommon.AppendSSEEventString(output, event, payload, 3)
-	}
 	webSearchStreamMode := shouldTranslateWebSearchGrounding(originalRequestRawJSON, requestRawJSON)
 	appendThinkingSignature := func(signature string) {
 		if signature == "" || params.ResponseType != 2 {
@@ -225,79 +333,17 @@ func ConvertAntigravityResponseToClaude(ctx context.Context, _ string, originalR
 
 						// Flush co-located text before emitting the signature
 						if partText := partTextResult.String(); partText != "" {
-							if params.ResponseType != 2 {
-								if params.ResponseType != 0 {
-									appendEvent("content_block_stop", fmt.Sprintf(`{"type":"content_block_stop","index":%d}`, params.ResponseIndex))
-									params.ResponseIndex++
-								}
-								appendEvent("content_block_start", fmt.Sprintf(`{"type":"content_block_start","index":%d,"content_block":{"type":"thinking","thinking":""}}`, params.ResponseIndex))
-								params.ResponseType = 2
-								params.CurrentThinkingText.Reset()
-							}
-							params.CurrentThinkingText.WriteString(partText)
-							data, _ := sjson.SetBytes([]byte(fmt.Sprintf(`{"type":"content_block_delta","index":%d,"delta":{"type":"thinking_delta","thinking":""}}`, params.ResponseIndex)), "delta.thinking", partText)
-							appendEvent("content_block_delta", string(data))
+							appendThinkingText(partText)
 						}
 
 						appendThinkingSignature(thoughtSignatureResult.String())
-					} else if params.ResponseType == 2 { // Continue existing thinking block if already in thinking state
-						params.CurrentThinkingText.WriteString(partTextResult.String())
-						data, _ := sjson.SetBytes([]byte(fmt.Sprintf(`{"type":"content_block_delta","index":%d,"delta":{"type":"thinking_delta","thinking":""}}`, params.ResponseIndex)), "delta.thinking", partTextResult.String())
-						appendEvent("content_block_delta", string(data))
-						params.HasContent = true
 					} else {
-						// Transition from another state to thinking
-						// First, close any existing content block
-						if params.ResponseType != 0 {
-							if params.ResponseType == 2 {
-								// output = output + "event: content_block_delta\n"
-								// output = output + fmt.Sprintf(`data: {"type":"content_block_delta","index":%d,"delta":{"type":"signature_delta","signature":null}}`, params.ResponseIndex)
-								// output = output + "\n\n\n"
-							}
-							appendEvent("content_block_stop", fmt.Sprintf(`{"type":"content_block_stop","index":%d}`, params.ResponseIndex))
-							params.ResponseIndex++
-						}
-
-						// Start a new thinking content block
-						appendEvent("content_block_start", fmt.Sprintf(`{"type":"content_block_start","index":%d,"content_block":{"type":"thinking","thinking":""}}`, params.ResponseIndex))
-						data, _ := sjson.SetBytes([]byte(fmt.Sprintf(`{"type":"content_block_delta","index":%d,"delta":{"type":"thinking_delta","thinking":""}}`, params.ResponseIndex)), "delta.thinking", partTextResult.String())
-						appendEvent("content_block_delta", string(data))
-						params.ResponseType = 2 // Set state to thinking
-						params.HasContent = true
-						// Start accumulating thinking text for signature caching
-						params.CurrentThinkingText.Reset()
-						params.CurrentThinkingText.WriteString(partTextResult.String())
+						appendThinkingText(partTextResult.String())
 					}
 				} else {
 					finishReasonResult := gjson.GetBytes(rawJSON, "response.candidates.0.finishReason")
 					if partTextResult.String() != "" || !finishReasonResult.Exists() {
-						// Process regular text content (user-visible output)
-						// Continue existing text block if already in content state
-						if params.ResponseType == 1 {
-							data, _ := sjson.SetBytes([]byte(fmt.Sprintf(`{"type":"content_block_delta","index":%d,"delta":{"type":"text_delta","text":""}}`, params.ResponseIndex)), "delta.text", partTextResult.String())
-							appendEvent("content_block_delta", string(data))
-							params.HasContent = true
-						} else {
-							// Transition from another state to text content
-							// First, close any existing content block
-							if params.ResponseType != 0 {
-								if params.ResponseType == 2 {
-									// output = output + "event: content_block_delta\n"
-									// output = output + fmt.Sprintf(`data: {"type":"content_block_delta","index":%d,"delta":{"type":"signature_delta","signature":null}}`, params.ResponseIndex)
-									// output = output + "\n\n\n"
-								}
-								appendEvent("content_block_stop", fmt.Sprintf(`{"type":"content_block_stop","index":%d}`, params.ResponseIndex))
-								params.ResponseIndex++
-							}
-							if partTextResult.String() != "" {
-								// Start a new text content block
-								appendEvent("content_block_start", fmt.Sprintf(`{"type":"content_block_start","index":%d,"content_block":{"type":"text","text":""}}`, params.ResponseIndex))
-								data, _ := sjson.SetBytes([]byte(fmt.Sprintf(`{"type":"content_block_delta","index":%d,"delta":{"type":"text_delta","text":""}}`, params.ResponseIndex)), "delta.text", partTextResult.String())
-								appendEvent("content_block_delta", string(data))
-								params.ResponseType = 1 // Set state to content
-								params.HasContent = true
-							}
-						}
+						appendPseudoThinkingSegments(partTextResult.String(), false)
 					}
 				}
 			} else if functionCallResult.Exists() {
@@ -376,6 +422,10 @@ func ConvertAntigravityResponseToClaude(ctx context.Context, _ string, originalR
 
 	if webSearchStreamMode && !params.HasWebSearchTool && params.HasFinishReason && params.WebSearchTextBuffer.Len() > 0 {
 		appendBufferedWebSearchTextBlock(params, appendEvent)
+	}
+
+	if params.HasFinishReason {
+		appendPseudoThinkingSegments("", true)
 	}
 
 	if params.HasUsageMetadata && params.HasFinishReason {
@@ -635,6 +685,7 @@ func ConvertAntigravityResponseToClaudeNonStream(_ context.Context, _ string, or
 	textBuilder := strings.Builder{}
 	thinkingBuilder := strings.Builder{}
 	thinkingSignature := ""
+	pseudoParams := &Params{}
 	toolIDCounter := 0
 	hasToolCall := false
 
@@ -664,6 +715,17 @@ func ConvertAntigravityResponseToClaudeNonStream(_ context.Context, _ string, or
 		thinkingBuilder.Reset()
 		thinkingSignature = ""
 	}
+	appendPseudoSegments := func(text string, final bool) {
+		for _, segment := range consumePseudoThinkingSegments(pseudoParams, text, final) {
+			if segment.thinking {
+				flushText()
+				thinkingBuilder.WriteString(segment.text)
+				continue
+			}
+			flushThinking()
+			textBuilder.WriteString(segment.text)
+		}
+	}
 
 	if parts.IsArray() {
 		for _, part := range parts.Array() {
@@ -679,16 +741,17 @@ func ConvertAntigravityResponseToClaudeNonStream(_ context.Context, _ string, or
 
 			if text := part.Get("text"); text.Exists() && text.String() != "" {
 				if isThought {
+					appendPseudoSegments("", true)
 					flushText()
 					thinkingBuilder.WriteString(text.String())
 					continue
 				}
-				flushThinking()
-				textBuilder.WriteString(text.String())
+				appendPseudoSegments(text.String(), false)
 				continue
 			}
 
 			if functionCall := part.Get("functionCall"); functionCall.Exists() {
+				appendPseudoSegments("", true)
 				flushThinking()
 				flushText()
 				hasToolCall = true
@@ -710,6 +773,7 @@ func ConvertAntigravityResponseToClaudeNonStream(_ context.Context, _ string, or
 		}
 	}
 
+	appendPseudoSegments("", true)
 	flushThinking()
 	flushText()
 	if query, results := extractWebSearchFromAntigravity(rawJSON); query != "" || len(results) > 0 {
