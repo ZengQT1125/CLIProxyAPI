@@ -6,7 +6,7 @@ AI 工作指南。**必读 Fork-Specific 部分**——合并上游或重构时�
 
 - Module: `github.com/router-for-me/CLIProxyAPI/v7`
 - Go 1.26.0
-- 上游 `router-for-me/CLIProxyAPI`（远程 `upstream`），当前基于 v7.2.4
+- 上游 `router-for-me/CLIProxyAPI`（远程 `upstream`），当前基于 v7.2.7
 - Fork 增量: SF routing · usage 持久化 · 管理中心 · TUI · 管理面板自动更新
 
 ## Hard Constraints
@@ -84,7 +84,7 @@ docker build -t cliproxyapi .
 | `/v1/videos`, `/v1/videos/{generations,edits,extensions,:request_id}` | xAI Grok 视频 |
 | `/v1/responses` POST/GET | Responses API + WS 升级 |
 | `/v0/management/*` | 管理 API；`auth-files/*` CRUD；`plugins/:id` DELETE |
-| `/v0/management/custom/monitor/*` | **fork** 10 个监控端点 |
+| `/v0/management/custom/monitor/*` | **fork** 11 个监控端点 |
 | `/v0/management/custom/codex-cleanup` | **fork** Codex 认证清理 |
 | `/xai/callback`, `/v1/ws` | xAI OAuth 回调 / WS |
 
@@ -110,12 +110,12 @@ Modified:
 ### 2. Management Center Monitor & Tools
 
 Fork-only:
-- `internal/api/handlers/management/monitor.go`（+`_test.go`）— 10 monitor 端点（含 service-health、key-stats）
+- `internal/api/handlers/management/monitor.go`（+`_test.go`）— 11 monitor 端点（含 service-health、key-stats、request-details）
 
 Modified:
 - `internal/api/handlers/management/api_tools.go` — `CleanupCodexAuth` 端点
 - `internal/api/handlers/management/usage.go` — 增强 usage export/import
-- `internal/api/server.go` — 注册 `/custom/monitor/*`（10 端点）和 `/custom/codex-cleanup`
+- `internal/api/server.go` — 注册 `/custom/monitor/*`（11 端点）和 `/custom/codex-cleanup`
 
 ### 3. Sequential-Fill (SF) Selector
 
