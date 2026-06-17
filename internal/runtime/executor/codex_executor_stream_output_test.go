@@ -167,19 +167,33 @@ func TestCodexTerminalStreamErrIgnoresRateLimitTerminalErrors(t *testing.T) {
 	}
 }
 
-func TestCodexTerminalStreamErrHandlesUsageLimitReached(t *testing.T) {
-	err, _, ok := codexTerminalStreamErr([]byte(`{"type":"response.failed","response":{"status":"failed","error":{"type":"usage_limit_reached","message":"usage limit reached","resets_in_seconds":7}}}`))
+func TestCodexTerminalStreamErrHandlesUsageLimitErrorEvent(t *testing.T) {
+	streamErr, _, ok := codexTerminalStreamErr([]byte(`{"type":"error","error":{"type":"usage_limit_reached","message":"You've hit your usage limit.","resets_in_seconds":300}}`))
 	if !ok {
-		t.Fatal("expected usage_limit_reached terminal error")
+		t.Fatal("expected usage_limit_reached terminal error to be handled")
 	}
-	if got := statusCodeFromTestError(t, err); got != http.StatusTooManyRequests {
-		t.Fatalf("status code = %d, want %d; err=%v", got, http.StatusTooManyRequests, err)
+	if got := statusCodeFromTestError(t, streamErr); got != http.StatusTooManyRequests {
+		t.Fatalf("status code = %d, want %d", got, http.StatusTooManyRequests)
 	}
-	if err.RetryAfter() == nil {
-		t.Fatalf("expected retryAfter on usage limit terminal error")
+	retryAfter := streamErr.RetryAfter()
+	if retryAfter == nil {
+		t.Fatal("expected retryAfter from usage_limit_reached terminal error")
 	}
-	if got := *err.RetryAfter(); got != 7*time.Second {
-		t.Fatalf("retryAfter = %v, want %v", got, 7*time.Second)
+	if *retryAfter != 300*time.Second {
+		t.Fatalf("retryAfter = %v, want %v", *retryAfter, 300*time.Second)
+	}
+}
+
+func TestCodexTerminalStreamErrHandlesUsageLimitResponseFailed(t *testing.T) {
+	streamErr, _, ok := codexTerminalStreamErr([]byte(`{"type":"response.failed","response":{"error":{"type":"usage_limit_reached","message":"usage limit reached","resets_in_seconds":60}}}`))
+	if !ok {
+		t.Fatal("expected usage_limit_reached response.failed terminal error to be handled")
+	}
+	if got := statusCodeFromTestError(t, streamErr); got != http.StatusTooManyRequests {
+		t.Fatalf("status code = %d, want %d", got, http.StatusTooManyRequests)
+	}
+	if streamErr.RetryAfter() == nil {
+		t.Fatal("expected retryAfter from usage_limit_reached response.failed terminal error")
 	}
 }
 
