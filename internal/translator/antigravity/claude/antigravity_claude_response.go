@@ -10,7 +10,6 @@ import (
 	"bytes"
 	"context"
 	"encoding/base64"
-	"encoding/json"
 	"fmt"
 	"strings"
 	"sync/atomic"
@@ -78,11 +77,6 @@ type Params struct {
 	CurrentThinkingText strings.Builder // Accumulates thinking text for signature caching
 	PseudoThinkingOpen  bool
 	PseudoThinkingTail  string
-
-	// Web search support
-	WebSearchQuery   string
-	WebSearchResults []map[string]any
-	WebSearchEmitted bool
 
 	// Reverse map: sanitized Gemini function name → original Claude tool name.
 	// Populated lazily on the first response chunk from the original request JSON.
@@ -391,15 +385,6 @@ func ConvertAntigravityResponseToClaude(ctx context.Context, _ string, originalR
 		}
 	}
 
-	if q, results := extractWebSearchFromAntigravity(rawJSON); q != "" || len(results) > 0 {
-		if q != "" {
-			params.WebSearchQuery = q
-		}
-		if len(results) > 0 {
-			params.WebSearchResults = results
-		}
-	}
-
 	if finishReasonResult := gjson.GetBytes(rawJSON, "response.candidates.0.finishReason"); finishReasonResult.Exists() {
 		params.HasFinishReason = true
 		params.FinishReason = finishReasonResult.String()
@@ -429,7 +414,6 @@ func ConvertAntigravityResponseToClaude(ctx context.Context, _ string, originalR
 	}
 
 	if params.HasUsageMetadata && params.HasFinishReason {
-		appendWebSearchBlocks(params, &output)
 		appendFinalEvents(params, &output, false)
 	}
 
@@ -518,106 +502,6 @@ func resolveStopReason(params *Params) string {
 	}
 
 	return "end_turn"
-}
-
-func buildEncryptedContent(url, title string) string {
-	payload := map[string]string{"url": url, "title": title}
-	encoded, err := json.Marshal(payload)
-	if err != nil {
-		return ""
-	}
-	return base64.StdEncoding.EncodeToString(encoded)
-}
-
-func extractWebSearchFromAntigravity(rawJSON []byte) (string, []map[string]any) {
-	candidate := gjson.GetBytes(rawJSON, "response.candidates.0")
-	if !candidate.Exists() {
-		candidate = gjson.GetBytes(rawJSON, "candidates.0")
-	}
-	if !candidate.Exists() {
-		return "", nil
-	}
-
-	query := candidate.Get("groundingMetadata.webSearchQueries.0").String()
-
-	chunks := candidate.Get("groundingChunks")
-	if !chunks.Exists() {
-		chunks = candidate.Get("groundingMetadata.groundingChunks")
-	}
-	if !chunks.Exists() || !chunks.IsArray() {
-		return query, nil
-	}
-
-	results := make([]map[string]any, 0, len(chunks.Array()))
-	for _, chunk := range chunks.Array() {
-		web := chunk.Get("web")
-		if !web.Exists() {
-			continue
-		}
-		url := web.Get("uri").String()
-		if url == "" {
-			url = web.Get("url").String()
-		}
-		title := web.Get("title").String()
-		if title == "" {
-			title = web.Get("domain").String()
-		}
-		if url == "" && title == "" {
-			continue
-		}
-		item := map[string]any{
-			"type":              "web_search_result",
-			"title":             title,
-			"url":               url,
-			"encrypted_content": buildEncryptedContent(url, title),
-			"page_age":          nil,
-		}
-		results = append(results, item)
-	}
-
-	if len(results) == 0 {
-		return query, nil
-	}
-	return query, results
-}
-
-func appendWebSearchBlocks(params *Params, output *[]byte) {
-	if params.WebSearchEmitted {
-		return
-	}
-	if params.WebSearchQuery == "" && len(params.WebSearchResults) == 0 {
-		return
-	}
-
-	if params.ResponseType != 0 {
-		*output = translatorcommon.AppendSSEEventString(*output, "content_block_stop", fmt.Sprintf(`{"type":"content_block_stop","index":%d}`, params.ResponseIndex), 3)
-		params.ResponseType = 0
-		params.ResponseIndex++
-	}
-
-	toolUseID := fmt.Sprintf("srvtoolu_%d_%d", time.Now().UnixNano(), atomic.AddUint64(&toolUseIDCounter, 1))
-	serverToolBytes := []byte(fmt.Sprintf(`{"type":"content_block_start","index":%d,"content_block":{"type":"server_tool_use","id":"","name":"web_search","input":{}}}`, params.ResponseIndex))
-	serverToolBytes, _ = sjson.SetBytes(serverToolBytes, "content_block.id", toolUseID)
-	if params.WebSearchQuery != "" {
-		serverToolBytes, _ = sjson.SetBytes(serverToolBytes, "content_block.input.query", params.WebSearchQuery)
-	}
-	*output = translatorcommon.AppendSSEEventString(*output, "content_block_start", string(serverToolBytes), 3)
-	*output = translatorcommon.AppendSSEEventString(*output, "content_block_stop", fmt.Sprintf(`{"type":"content_block_stop","index":%d}`, params.ResponseIndex), 3)
-	params.ResponseIndex++
-
-	resultBlockBytes := []byte(fmt.Sprintf(`{"type":"content_block_start","index":%d,"content_block":{"type":"web_search_tool_result","tool_use_id":"","content":[]}}`, params.ResponseIndex))
-	resultBlockBytes, _ = sjson.SetBytes(resultBlockBytes, "content_block.tool_use_id", toolUseID)
-	if len(params.WebSearchResults) > 0 {
-		if raw, err := json.Marshal(params.WebSearchResults); err == nil {
-			resultBlockBytes, _ = sjson.SetRawBytes(resultBlockBytes, "content_block.content", raw)
-		}
-	}
-	*output = translatorcommon.AppendSSEEventString(*output, "content_block_start", string(resultBlockBytes), 3)
-	*output = translatorcommon.AppendSSEEventString(*output, "content_block_stop", fmt.Sprintf(`{"type":"content_block_stop","index":%d}`, params.ResponseIndex), 3)
-	params.ResponseIndex++
-
-	params.HasContent = true
-	params.WebSearchEmitted = true
 }
 
 // ConvertAntigravityResponseToClaudeNonStream converts a non-streaming Antigravity response to a non-streaming Claude response.
@@ -776,25 +660,6 @@ func ConvertAntigravityResponseToClaudeNonStream(_ context.Context, _ string, or
 	appendPseudoSegments("", true)
 	flushThinking()
 	flushText()
-	if query, results := extractWebSearchFromAntigravity(rawJSON); query != "" || len(results) > 0 {
-		ensureContentArray()
-		toolUseID := fmt.Sprintf("srvtoolu_%d", time.Now().UnixNano())
-		serverToolBytes := []byte(`{"type":"server_tool_use","id":"","name":"web_search","input":{}}`)
-		serverToolBytes, _ = sjson.SetBytes(serverToolBytes, "id", toolUseID)
-		if query != "" {
-			serverToolBytes, _ = sjson.SetBytes(serverToolBytes, "input.query", query)
-		}
-		responseJSON, _ = sjson.SetRawBytes(responseJSON, "content.-1", serverToolBytes)
-
-		resultBlockBytes := []byte(`{"type":"web_search_tool_result","tool_use_id":"","content":[]}`)
-		resultBlockBytes, _ = sjson.SetBytes(resultBlockBytes, "tool_use_id", toolUseID)
-		if len(results) > 0 {
-			if raw, err := json.Marshal(results); err == nil {
-				resultBlockBytes, _ = sjson.SetRawBytes(resultBlockBytes, "content", raw)
-			}
-		}
-		responseJSON, _ = sjson.SetRawBytes(responseJSON, "content.-1", resultBlockBytes)
-	}
 
 	stopReason := "end_turn"
 	if hasToolCall {
