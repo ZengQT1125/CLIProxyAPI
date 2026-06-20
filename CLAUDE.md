@@ -6,7 +6,7 @@ AI 工作指南。**必读 Fork-Specific 部分**——合并上游或重构时�
 
 - Module: `github.com/router-for-me/CLIProxyAPI/v7`
 - Go 1.26.0
-- 上游 `router-for-me/CLIProxyAPI`（远程 `upstream`），当前基于 v7.2.21
+- 上游 `router-for-me/CLIProxyAPI`（远程 `upstream`），当前基于 v7.2.22
 - Fork 增量: SF routing · usage 持久化 · 管理中心 · TUI · 管理面板自动更新
 
 ## Hard Constraints
