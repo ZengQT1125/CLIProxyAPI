@@ -2784,7 +2784,7 @@ var antigravityBaseURLFallbackOrder = func(auth *cliproxyauth.Auth) []string {
 	return []string{
 		antigravityBaseURLDaily,
 		antigravityBaseURLProd,
-		// antigravitySandboxBaseURLDaily,
+		antigravitySandboxBaseURLDaily,
 	}
 }
 
