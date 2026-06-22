@@ -65,3 +65,4 @@ usage.*
 # Build/test caches
 .gocache/
 server
+.qoder
