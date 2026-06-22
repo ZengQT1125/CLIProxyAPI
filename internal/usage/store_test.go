@@ -78,6 +78,25 @@ func TestSQLiteUsageStoreReset(t *testing.T) {
 	}
 }
 
+func TestSQLiteUsageStoreDisablesMemoryMappedIO(t *testing.T) {
+	ctx := context.Background()
+	dbPath := filepath.Join(t.TempDir(), "sqlite", "usage.db")
+
+	store, err := newSQLiteUsageStoreAtPath(dbPath)
+	if err != nil {
+		t.Fatalf("newSQLiteUsageStoreAtPath failed: %v", err)
+	}
+	defer store.Close()
+
+	var mmapSize int64
+	if err = store.db.QueryRowContext(ctx, "PRAGMA mmap_size").Scan(&mmapSize); err != nil {
+		t.Fatalf("query mmap_size failed: %v", err)
+	}
+	if mmapSize != 0 {
+		t.Fatalf("sqlite mmap_size should be disabled: got %d want 0", mmapSize)
+	}
+}
+
 func TestSQLiteUsageStoreEnsureSchemaSkipsCoveredSingleIndexes(t *testing.T) {
 	ctx := context.Background()
 	dbPath := filepath.Join(t.TempDir(), "sqlite", "usage.db")

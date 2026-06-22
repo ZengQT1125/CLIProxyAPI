@@ -773,10 +773,10 @@ func newSQLiteUsageStoreAtPath(dbPath string) (*sqliteUsageStore, error) {
 		_ = db.Close()
 		return nil, fmt.Errorf("usage store: enable WAL: %w", err)
 	}
-	// Read performance PRAGMAs: 64MB cache, 256MB mmap, temp tables in memory
+	// Read performance PRAGMAs: 64MB cache, mmap disabled, temp tables in memory.
 	for _, pragma := range []string{
 		"PRAGMA cache_size=-64000",
-		"PRAGMA mmap_size=268435456",
+		"PRAGMA mmap_size=0",
 		"PRAGMA temp_store=MEMORY",
 	} {
 		if _, err = db.Exec(pragma); err != nil {
