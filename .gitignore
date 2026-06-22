@@ -66,3 +66,4 @@ usage.*
 .gocache/
 server
 .qoder
+.playwright-mcp
