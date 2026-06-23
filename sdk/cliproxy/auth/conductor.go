@@ -1013,8 +1013,7 @@ func isAPIKeyAuth(auth *Auth) bool {
 	if auth == nil {
 		return false
 	}
-	kind, _ := auth.AccountInfo()
-	return strings.EqualFold(strings.TrimSpace(kind), "api_key")
+	return auth.AuthKind() == AuthKindAPIKey
 }
 
 func isOpenAICompatAPIKeyAuth(auth *Auth) bool {
@@ -1780,8 +1779,7 @@ func (m *Manager) rebuildAPIKeyModelAliasLocked(cfg *internalconfig.Config) {
 		if strings.TrimSpace(auth.ID) == "" {
 			continue
 		}
-		kind, _ := auth.AccountInfo()
-		if !strings.EqualFold(strings.TrimSpace(kind), "api_key") {
+		if auth.AuthKind() != AuthKindAPIKey {
 			continue
 		}
 
@@ -2877,8 +2875,7 @@ func (m *Manager) applyAPIKeyModelAlias(auth *Auth, requestedModel string) strin
 		return requestedModel
 	}
 
-	kind, _ := auth.AccountInfo()
-	if !strings.EqualFold(strings.TrimSpace(kind), "api_key") {
+	if auth.AuthKind() != AuthKindAPIKey {
 		return requestedModel
 	}
 
