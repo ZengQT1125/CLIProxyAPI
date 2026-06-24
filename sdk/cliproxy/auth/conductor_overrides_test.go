@@ -251,7 +251,7 @@ func TestManager_WrapStreamResult_PreservesRetryAfterOnChunkError(t *testing.T) 
 	close(remaining)
 
 	before := time.Now()
-	result := m.wrapStreamResult(context.Background(), auth, "codex", model, nil, nil, remaining)
+	result := m.wrapStreamResult(context.Background(), auth, "codex", model, nil, nil, remaining, OAuthModelAliasResult{})
 	for range result.Chunks {
 	}
 
