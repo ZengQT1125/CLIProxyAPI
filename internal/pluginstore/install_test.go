@@ -16,7 +16,7 @@ import (
 	"testing"
 )
 
-func TestInstallBlocksLoadedWindowsPlugin(t *testing.T) {
+func TestInstallDoesNotRejectLoadedPluginUntilOverwriteIsKnown(t *testing.T) {
 	t.Parallel()
 
 	tests := []struct {
@@ -25,7 +25,7 @@ func TestInstallBlocksLoadedWindowsPlugin(t *testing.T) {
 		loaded      bool
 		wantBlocked bool
 	}{
-		{name: "windows loaded", goos: "windows", loaded: true, wantBlocked: true},
+		{name: "windows loaded", goos: "windows", loaded: true, wantBlocked: false},
 		{name: "windows not loaded", goos: "windows", loaded: false, wantBlocked: false},
 		{name: "linux loaded", goos: "linux", loaded: true, wantBlocked: false},
 		{name: "darwin loaded", goos: "darwin", loaded: true, wantBlocked: false},
@@ -53,10 +53,19 @@ func TestInstallBlocksLoadedWindowsPlugin(t *testing.T) {
 func TestInstallArchiveBlocksLoadedWindowsPluginBeforeWrite(t *testing.T) {
 	t.Parallel()
 
+	root := t.TempDir()
+	targetDir := filepath.Join(root, "windows", "amd64")
+	if errMkdir := os.MkdirAll(targetDir, 0o755); errMkdir != nil {
+		t.Fatalf("MkdirAll() error = %v", errMkdir)
+	}
+	targetPath := filepath.Join(targetDir, versionedPluginFileName("sample-provider", "0.1.0", "windows"))
+	if errWrite := os.WriteFile(targetPath, []byte("old"), 0o644); errWrite != nil {
+		t.Fatalf("WriteFile() error = %v", errWrite)
+	}
 	_, errInstall := InstallArchive(makeZip(t, map[string]string{
 		"sample-provider.dll": "library-data",
 	}), testPlugin(), InstallOptions{
-		PluginsDir:   t.TempDir(),
+		PluginsDir:   root,
 		GOOS:         "windows",
 		GOARCH:       "amd64",
 		PluginLoaded: func() bool { return true },
@@ -74,7 +83,7 @@ func TestInstallArchivePreparesLoadedWindowsPluginBeforeWrite(t *testing.T) {
 	if errMkdir := os.MkdirAll(targetDir, 0o755); errMkdir != nil {
 		t.Fatalf("MkdirAll() error = %v", errMkdir)
 	}
-	targetPath := filepath.Join(targetDir, "sample-provider.dll")
+	targetPath := filepath.Join(targetDir, versionedPluginFileName("sample-provider", "0.1.0", "windows"))
 	if errWrite := os.WriteFile(targetPath, []byte("old"), 0o644); errWrite != nil {
 		t.Fatalf("WriteFile() error = %v", errWrite)
 	}
@@ -120,7 +129,7 @@ func TestInstallArchiveSkipsIdenticalLoadedWindowsPlugin(t *testing.T) {
 	if errMkdir := os.MkdirAll(targetDir, 0o755); errMkdir != nil {
 		t.Fatalf("MkdirAll() error = %v", errMkdir)
 	}
-	targetPath := filepath.Join(targetDir, "sample-provider.dll")
+	targetPath := filepath.Join(targetDir, versionedPluginFileName("sample-provider", "0.1.0", "windows"))
 	if errWrite := os.WriteFile(targetPath, []byte("same"), 0o644); errWrite != nil {
 		t.Fatalf("WriteFile() error = %v", errWrite)
 	}
@@ -170,7 +179,7 @@ func TestInstallArchiveWritesPlatformPlugin(t *testing.T) {
 	if errInstall != nil {
 		t.Fatalf("InstallArchive() error = %v", errInstall)
 	}
-	wantPath := filepath.Join(root, "darwin", "arm64", "sample-provider.dylib")
+	wantPath := filepath.Join(root, "darwin", "arm64", versionedPluginFileName("sample-provider", "0.1.0", "darwin"))
 	if result.Path != wantPath {
 		t.Fatalf("Path = %q, want %q", result.Path, wantPath)
 	}
@@ -191,7 +200,7 @@ func TestInstallArchiveReportsOverwrite(t *testing.T) {
 	if errMkdir := os.MkdirAll(targetDir, 0o755); errMkdir != nil {
 		t.Fatalf("MkdirAll() error = %v", errMkdir)
 	}
-	if errWrite := os.WriteFile(filepath.Join(targetDir, "sample-provider.dylib"), []byte("old"), 0o644); errWrite != nil {
+	if errWrite := os.WriteFile(filepath.Join(targetDir, versionedPluginFileName("sample-provider", "0.1.0", "darwin")), []byte("old"), 0o644); errWrite != nil {
 		t.Fatalf("WriteFile() error = %v", errWrite)
 	}
 	result, errInstall := InstallArchive(makeZip(t, map[string]string{
@@ -205,7 +214,7 @@ func TestInstallArchiveReportsOverwrite(t *testing.T) {
 	}
 }
 
-func TestInstallArchiveOverwritesRuntimeSelectedPlugin(t *testing.T) {
+func TestInstallArchiveLeavesLegacyRuntimePluginAndWritesVersionedTarget(t *testing.T) {
 	t.Parallel()
 
 	root := t.TempDir()
@@ -220,13 +229,21 @@ func TestInstallArchiveOverwritesRuntimeSelectedPlugin(t *testing.T) {
 	if errInstall != nil {
 		t.Fatalf("InstallArchive() error = %v", errInstall)
 	}
-	if result.Path != existingPath {
-		t.Fatalf("Path = %q, want selected runtime plugin %q", result.Path, existingPath)
+	wantPath := filepath.Join(root, runtime.GOOS, runtime.GOARCH, versionedPluginFileName("sample-provider", "0.1.0", runtime.GOOS))
+	if result.Path != wantPath {
+		t.Fatalf("Path = %q, want versioned plugin %q", result.Path, wantPath)
 	}
-	if !result.Overwritten {
-		t.Fatal("Overwritten = false, want true")
+	if result.Overwritten {
+		t.Fatal("Overwritten = true, want false for shadow install")
 	}
 	data, errRead := os.ReadFile(existingPath)
+	if errRead != nil {
+		t.Fatalf("ReadFile() error = %v", errRead)
+	}
+	if string(data) != "old" {
+		t.Fatalf("legacy data = %q, want old", data)
+	}
+	data, errRead = os.ReadFile(wantPath)
 	if errRead != nil {
 		t.Fatalf("ReadFile() error = %v", errRead)
 	}
@@ -327,7 +344,7 @@ func TestInstallUsesLatestReleaseVersion(t *testing.T) {
 	if result.Version != "0.2.0" {
 		t.Fatalf("Version = %q, want 0.2.0 from latest release tag", result.Version)
 	}
-	data, errRead := os.ReadFile(filepath.Join(root, "darwin", "arm64", "sample-provider.dylib"))
+	data, errRead := os.ReadFile(filepath.Join(root, "darwin", "arm64", versionedPluginFileName("sample-provider", "0.2.0", "darwin")))
 	if errRead != nil {
 		t.Fatalf("ReadFile() error = %v", errRead)
 	}
@@ -366,7 +383,7 @@ func TestInstallVersionUsesPinnedReleaseTag(t *testing.T) {
 	if result.Version != "0.3.0" {
 		t.Fatalf("Version = %q, want 0.3.0", result.Version)
 	}
-	data, errRead := os.ReadFile(filepath.Join(root, "linux", "amd64", "sample-provider.so"))
+	data, errRead := os.ReadFile(filepath.Join(root, "linux", "amd64", versionedPluginFileName("sample-provider", "0.3.0", "linux")))
 	if errRead != nil {
 		t.Fatalf("ReadFile() error = %v", errRead)
 	}

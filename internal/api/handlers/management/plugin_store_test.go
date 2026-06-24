@@ -358,7 +358,7 @@ func TestInstallPluginFromStoreWritesFileAndEnablesConfig(t *testing.T) {
 	if body.RestartRequired {
 		t.Fatal("restart_required = true, want false")
 	}
-	targetPath := filepath.Join(pluginsDir, runtime.GOOS, runtime.GOARCH, "sample-provider"+managementPluginExtension(runtime.GOOS))
+	targetPath := filepath.Join(pluginsDir, runtime.GOOS, runtime.GOARCH, managementVersionedPluginFile("sample-provider", "0.1.0", runtime.GOOS))
 	data, errRead := os.ReadFile(targetPath)
 	if errRead != nil {
 		t.Fatalf("ReadFile(%s) error = %v", targetPath, errRead)
@@ -444,7 +444,7 @@ func TestInstallPluginFromStoreUsesRequestedThirdPartySource(t *testing.T) {
 	if body.SourceID != communitySourceID || body.Version != "0.3.0" {
 		t.Fatalf("install response = %#v, want community source version 0.3.0", body)
 	}
-	targetPath := filepath.Join(pluginsDir, runtime.GOOS, runtime.GOARCH, "sample-provider"+managementPluginExtension(runtime.GOOS))
+	targetPath := filepath.Join(pluginsDir, runtime.GOOS, runtime.GOARCH, managementVersionedPluginFile("sample-provider", "0.3.0", runtime.GOOS))
 	data, errRead := os.ReadFile(targetPath)
 	if errRead != nil {
 		t.Fatalf("ReadFile(%s) error = %v", targetPath, errRead)
@@ -495,7 +495,11 @@ func TestInstallPluginFromStoreOverwritesFilePreservesConfigAndReloads(t *testin
 	t.Parallel()
 
 	pluginsDir := t.TempDir()
-	existingPath := filepath.Join(pluginsDir, "sample-provider"+managementPluginExtension(runtime.GOOS))
+	targetDir := filepath.Join(pluginsDir, runtime.GOOS, runtime.GOARCH)
+	if errMkdir := os.MkdirAll(targetDir, 0o755); errMkdir != nil {
+		t.Fatalf("MkdirAll(%s) error = %v", targetDir, errMkdir)
+	}
+	existingPath := filepath.Join(targetDir, managementVersionedPluginFile("sample-provider", "0.1.0", runtime.GOOS))
 	if errWrite := os.WriteFile(existingPath, []byte("old-library-data"), 0o644); errWrite != nil {
 		t.Fatalf("WriteFile(%s) error = %v", existingPath, errWrite)
 	}
@@ -711,4 +715,8 @@ func makeManagementPluginStoreZip(t *testing.T, name string, content string) []b
 		t.Fatalf("Close() error = %v", errClose)
 	}
 	return buffer.Bytes()
+}
+
+func managementVersionedPluginFile(id string, version string, goos string) string {
+	return id + "-v" + version + managementPluginExtension(goos)
 }

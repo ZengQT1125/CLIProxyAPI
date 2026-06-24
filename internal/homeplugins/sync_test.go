@@ -62,7 +62,7 @@ func TestSyncPlatformInstallsManifestArtifact(t *testing.T) {
 	if errSync := SyncPlatform(context.Background(), syncTestConfig(t, root), nil, Platform{GOOS: "windows", GOARCH: "amd64"}); errSync != nil {
 		t.Fatalf("SyncPlatform() error = %v", errSync)
 	}
-	target := filepath.Join(root, "windows", "amd64", "sample.dll")
+	target := filepath.Join(root, "windows", "amd64", versionedPluginTestFile("sample", "0.2.0", "windows"))
 	got, errRead := os.ReadFile(target)
 	if errRead != nil {
 		t.Fatalf("read target: %v", errRead)
@@ -105,7 +105,7 @@ func TestSyncPlatformWithReportRecordsSuccessfulInstall(t *testing.T) {
 	if plugin.ID != "sample" || plugin.InstallStatus != pluginInstallStatusInstalled || plugin.Version != "0.2.0" {
 		t.Fatalf("plugin report = %+v, want installed sample 0.2.0", plugin)
 	}
-	if wantPath := filepath.Join(root, "windows", "amd64", "sample.dll"); plugin.Path != wantPath {
+	if wantPath := filepath.Join(root, "windows", "amd64", versionedPluginTestFile("sample", "0.2.0", "windows")); plugin.Path != wantPath {
 		t.Fatalf("plugin path = %q, want %q", plugin.Path, wantPath)
 	}
 }
@@ -116,7 +116,7 @@ func TestSyncPlatformWithReportRecordsSkippedIdenticalArtifact(t *testing.T) {
 	if errMkdir := os.MkdirAll(targetDir, 0o755); errMkdir != nil {
 		t.Fatalf("MkdirAll() error = %v", errMkdir)
 	}
-	target := filepath.Join(targetDir, "sample.dll")
+	target := filepath.Join(targetDir, versionedPluginTestFile("sample", "0.2.0", "windows"))
 	if errWrite := os.WriteFile(target, []byte("library-data"), 0o644); errWrite != nil {
 		t.Fatalf("WriteFile() error = %v", errWrite)
 	}
@@ -159,7 +159,7 @@ func TestSyncPlatformSkipsIdenticalBusyPlugin(t *testing.T) {
 	if errMkdir := os.MkdirAll(targetDir, 0o755); errMkdir != nil {
 		t.Fatalf("MkdirAll() error = %v", errMkdir)
 	}
-	target := filepath.Join(targetDir, "sample.dll")
+	target := filepath.Join(targetDir, versionedPluginTestFile("sample", "0.2.0", "windows"))
 	if errWrite := os.WriteFile(target, []byte("library-data"), 0o644); errWrite != nil {
 		t.Fatalf("WriteFile() error = %v", errWrite)
 	}
@@ -400,6 +400,10 @@ func makeZip(t *testing.T, files map[string]string) []byte {
 		t.Fatalf("Close() error = %v", errClose)
 	}
 	return buffer.Bytes()
+}
+
+func versionedPluginTestFile(id string, version string, goos string) string {
+	return id + "-v" + version + pluginExtension(goos)
 }
 
 type mapHTTPDoer map[string][]byte
