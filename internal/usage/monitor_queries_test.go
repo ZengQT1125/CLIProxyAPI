@@ -71,10 +71,10 @@ func TestSQLiteUsageStoreQueryMonitorChannelStats(t *testing.T) {
 
 	base := time.Date(2026, 2, 7, 12, 0, 0, 0, time.UTC)
 	insertUsageRecords(t, store,
-		UsageRecord{APIKey: "api-1", Model: "model-a", Source: "source-a", RequestedAt: base.Add(-4 * time.Hour)},
-		UsageRecord{APIKey: "api-1", Model: "model-a", Source: "source-a", RequestedAt: base.Add(-3 * time.Hour), Failed: true},
-		UsageRecord{APIKey: "api-1", Model: "model-b", Source: "source-a", RequestedAt: base.Add(-2 * time.Hour)},
-		UsageRecord{APIKey: "api-2", Model: "model-c", Source: "source-b", RequestedAt: base.Add(-1 * time.Hour)},
+		UsageRecord{APIKey: "api-1", Model: "model-a", Source: "source-a", RequestedAt: base.Add(-4 * time.Hour), InputTokens: 100, OutputTokens: 20, CachedTokens: 30},
+		UsageRecord{APIKey: "api-1", Model: "model-a", Source: "source-a", RequestedAt: base.Add(-3 * time.Hour), Failed: true, InputTokens: 50, OutputTokens: 10, CachedTokens: 5},
+		UsageRecord{APIKey: "api-1", Model: "model-b", Source: "source-a", RequestedAt: base.Add(-2 * time.Hour), InputTokens: 25, OutputTokens: 7},
+		UsageRecord{APIKey: "api-2", Model: "model-c", Source: "source-b", RequestedAt: base.Add(-1 * time.Hour), InputTokens: 11, OutputTokens: 13, CachedTokens: 17},
 	)
 
 	result, err := store.QueryMonitorChannelStats(ctx, MonitorQueryFilter{Status: "failed"}, 10, 12)
@@ -92,11 +92,17 @@ func TestSQLiteUsageStoreQueryMonitorChannelStats(t *testing.T) {
 	if item.TotalRequests != 3 || item.SuccessRequests != 2 || item.FailedRequests != 1 {
 		t.Fatalf("unexpected aggregate: %+v", item)
 	}
+	if item.InputTokens != 125 || item.OutputTokens != 27 || item.CachedTokens != 30 {
+		t.Fatalf("unexpected token aggregate: input=%d output=%d cached=%d", item.InputTokens, item.OutputTokens, item.CachedTokens)
+	}
 	if len(item.Models) != 2 {
 		t.Fatalf("unexpected model count: %d", len(item.Models))
 	}
 	if item.Models[0].Model != "model-a" || item.Models[0].Requests != 2 {
 		t.Fatalf("unexpected first model: %+v", item.Models[0])
+	}
+	if item.Models[0].InputTokens != 100 || item.Models[0].OutputTokens != 20 || item.Models[0].CachedTokens != 30 {
+		t.Fatalf("unexpected first model token aggregate: %+v", item.Models[0])
 	}
 
 	assertStringSliceEqual(t, result.Filters.Models, []string{"model-a", "model-b", "model-c"})

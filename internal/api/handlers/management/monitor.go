@@ -87,6 +87,9 @@ type monitorModelStats struct {
 	Requests      int64                  `json:"requests"`
 	Success       int64                  `json:"success"`
 	Failed        int64                  `json:"failed"`
+	InputTokens   int64                  `json:"input_tokens"`
+	OutputTokens  int64                  `json:"output_tokens"`
+	CachedTokens  int64                  `json:"cached_tokens"`
 	SuccessRate   float64                `json:"success_rate"`
 	LastRequestAt *time.Time             `json:"last_request_at,omitempty"`
 	Recent        []monitorRecentRequest `json:"recent_requests"`
@@ -97,6 +100,9 @@ type monitorChannelStatsItem struct {
 	TotalRequests   int64                  `json:"total_requests"`
 	SuccessRequests int64                  `json:"success_requests"`
 	FailedRequests  int64                  `json:"failed_requests"`
+	InputTokens     int64                  `json:"input_tokens"`
+	OutputTokens    int64                  `json:"output_tokens"`
+	CachedTokens    int64                  `json:"cached_tokens"`
 	SuccessRate     float64                `json:"success_rate"`
 	LastRequestAt   *time.Time             `json:"last_request_at,omitempty"`
 	Recent          []monitorRecentRequest `json:"recent_requests"`
@@ -115,6 +121,9 @@ type monitorChannelAggregate struct {
 	TotalRequests   int64
 	SuccessRequests int64
 	FailedRequests  int64
+	InputTokens     int64
+	OutputTokens    int64
+	CachedTokens    int64
 	LastRequestAt   time.Time
 	Recent          []monitorRecentRequest
 	Models          map[string]*monitorModelAggregate
@@ -125,6 +134,9 @@ type monitorModelAggregate struct {
 	Requests      int64
 	Success       int64
 	Failed        int64
+	InputTokens   int64
+	OutputTokens  int64
+	CachedTokens  int64
 	LastRequestAt time.Time
 	Recent        []monitorRecentRequest
 }
@@ -345,6 +357,9 @@ func (h *Handler) GetMonitorChannelStats(c *gin.Context) {
 						Requests:      model.Requests,
 						Success:       model.Success,
 						Failed:        model.Failed,
+						InputTokens:   model.InputTokens,
+						OutputTokens:  model.OutputTokens,
+						CachedTokens:  model.CachedTokens,
 						SuccessRate:   calcRate(model.Success, model.Requests),
 						LastRequestAt: cloneTimePointer(model.LastRequestAt),
 						Recent:        fromUsageRecentRequests(model.Recent),
@@ -356,6 +371,9 @@ func (h *Handler) GetMonitorChannelStats(c *gin.Context) {
 					TotalRequests:   channel.TotalRequests,
 					SuccessRequests: channel.SuccessRequests,
 					FailedRequests:  channel.FailedRequests,
+					InputTokens:     channel.InputTokens,
+					OutputTokens:    channel.OutputTokens,
+					CachedTokens:    channel.CachedTokens,
 					SuccessRate:     calcRate(channel.SuccessRequests, channel.TotalRequests),
 					LastRequestAt:   cloneTimePointer(channel.LastRequestAt),
 					Recent:          fromUsageRecentRequests(channel.Recent),
@@ -403,6 +421,9 @@ func (h *Handler) GetMonitorChannelStats(c *gin.Context) {
 			agg.FailedRequests++
 		} else {
 			agg.SuccessRequests++
+			agg.InputTokens += record.InputTokens
+			agg.OutputTokens += record.OutputTokens
+			agg.CachedTokens += record.CachedTokens
 		}
 		if record.Timestamp.After(agg.LastRequestAt) {
 			agg.LastRequestAt = record.Timestamp
@@ -419,6 +440,9 @@ func (h *Handler) GetMonitorChannelStats(c *gin.Context) {
 			modelAgg.Failed++
 		} else {
 			modelAgg.Success++
+			modelAgg.InputTokens += record.InputTokens
+			modelAgg.OutputTokens += record.OutputTokens
+			modelAgg.CachedTokens += record.CachedTokens
 		}
 		if record.Timestamp.After(modelAgg.LastRequestAt) {
 			modelAgg.LastRequestAt = record.Timestamp
@@ -452,6 +476,9 @@ func (h *Handler) GetMonitorChannelStats(c *gin.Context) {
 				Requests:      modelAgg.Requests,
 				Success:       modelAgg.Success,
 				Failed:        modelAgg.Failed,
+				InputTokens:   modelAgg.InputTokens,
+				OutputTokens:  modelAgg.OutputTokens,
+				CachedTokens:  modelAgg.CachedTokens,
 				SuccessRate:   calcRate(modelAgg.Success, modelAgg.Requests),
 				LastRequestAt: timePointer(modelAgg.LastRequestAt),
 				Recent:        normalizeRecentRequests(modelAgg.Recent),
@@ -469,6 +496,9 @@ func (h *Handler) GetMonitorChannelStats(c *gin.Context) {
 			TotalRequests:   agg.TotalRequests,
 			SuccessRequests: agg.SuccessRequests,
 			FailedRequests:  agg.FailedRequests,
+			InputTokens:     agg.InputTokens,
+			OutputTokens:    agg.OutputTokens,
+			CachedTokens:    agg.CachedTokens,
 			SuccessRate:     calcRate(agg.SuccessRequests, agg.TotalRequests),
 			LastRequestAt:   timePointer(agg.LastRequestAt),
 			Recent:          normalizeRecentRequests(agg.Recent),
@@ -537,6 +567,9 @@ func (h *Handler) GetMonitorFailureAnalysis(c *gin.Context) {
 						Requests:      model.Requests,
 						Success:       model.Success,
 						Failed:        model.Failed,
+						InputTokens:   model.InputTokens,
+						OutputTokens:  model.OutputTokens,
+						CachedTokens:  model.CachedTokens,
 						SuccessRate:   calcRate(model.Success, model.Requests),
 						LastRequestAt: cloneTimePointer(model.LastRequestAt),
 						Recent:        fromUsageRecentRequests(model.Recent),
@@ -602,6 +635,9 @@ func (h *Handler) GetMonitorFailureAnalysis(c *gin.Context) {
 			agg.FailedRequests++
 		} else {
 			agg.SuccessRequests++
+			agg.InputTokens += record.InputTokens
+			agg.OutputTokens += record.OutputTokens
+			agg.CachedTokens += record.CachedTokens
 		}
 		if record.Failed && record.Timestamp.After(agg.LastRequestAt) {
 			agg.LastRequestAt = record.Timestamp
@@ -617,6 +653,9 @@ func (h *Handler) GetMonitorFailureAnalysis(c *gin.Context) {
 			modelAgg.Failed++
 		} else {
 			modelAgg.Success++
+			modelAgg.InputTokens += record.InputTokens
+			modelAgg.OutputTokens += record.OutputTokens
+			modelAgg.CachedTokens += record.CachedTokens
 		}
 		if record.Timestamp.After(modelAgg.LastRequestAt) {
 			modelAgg.LastRequestAt = record.Timestamp
@@ -644,6 +683,9 @@ func (h *Handler) GetMonitorFailureAnalysis(c *gin.Context) {
 				Requests:      modelAgg.Requests,
 				Success:       modelAgg.Success,
 				Failed:        modelAgg.Failed,
+				InputTokens:   modelAgg.InputTokens,
+				OutputTokens:  modelAgg.OutputTokens,
+				CachedTokens:  modelAgg.CachedTokens,
 				SuccessRate:   calcRate(modelAgg.Success, modelAgg.Requests),
 				LastRequestAt: timePointer(modelAgg.LastRequestAt),
 				Recent:        normalizeRecentRequests(modelAgg.Recent),

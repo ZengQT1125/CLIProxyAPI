@@ -83,6 +83,9 @@ type MonitorModelStats struct {
 	Requests      int64
 	Success       int64
 	Failed        int64
+	InputTokens   int64
+	OutputTokens  int64
+	CachedTokens  int64
 	LastRequestAt *time.Time
 	Recent        []MonitorRecentRequest
 }
@@ -93,6 +96,9 @@ type MonitorChannelStats struct {
 	TotalRequests   int64
 	SuccessRequests int64
 	FailedRequests  int64
+	InputTokens     int64
+	OutputTokens    int64
+	CachedTokens    int64
 	LastRequestAt   *time.Time
 	Recent          []MonitorRecentRequest
 	Models          []MonitorModelStats
@@ -973,6 +979,9 @@ func (s *sqliteUsageStore) queryChannelAggregates(ctx context.Context, whereClau
 			COUNT(*),
 			COALESCE(SUM(CASE WHEN failed=0 THEN 1 ELSE 0 END), 0),
 			COALESCE(SUM(CASE WHEN failed=1 THEN 1 ELSE 0 END), 0),
+			COALESCE(SUM(CASE WHEN failed=0 THEN input_tokens ELSE 0 END), 0),
+			COALESCE(SUM(CASE WHEN failed=0 THEN output_tokens ELSE 0 END), 0),
+			COALESCE(SUM(CASE WHEN failed=0 THEN cached_tokens ELSE 0 END), 0),
 			MAX(requested_at)
 		FROM usage_records
 		WHERE %s
@@ -992,7 +1001,16 @@ func (s *sqliteUsageStore) queryChannelAggregates(ctx context.Context, whereClau
 			item     MonitorChannelStats
 			lastUnix sql.NullInt64
 		)
-		if err = rows.Scan(&source, &item.TotalRequests, &item.SuccessRequests, &item.FailedRequests, &lastUnix); err != nil {
+		if err = rows.Scan(
+			&source,
+			&item.TotalRequests,
+			&item.SuccessRequests,
+			&item.FailedRequests,
+			&item.InputTokens,
+			&item.OutputTokens,
+			&item.CachedTokens,
+			&lastUnix,
+		); err != nil {
 			return nil, fmt.Errorf("usage store: scan monitor channel aggregate: %w", err)
 		}
 		item.Source = normalizeMonitorSource(source)
@@ -1014,6 +1032,9 @@ func (s *sqliteUsageStore) attachChannelModels(ctx context.Context, whereClause 
 			COUNT(*),
 			COALESCE(SUM(CASE WHEN failed=0 THEN 1 ELSE 0 END), 0),
 			COALESCE(SUM(CASE WHEN failed=1 THEN 1 ELSE 0 END), 0),
+			COALESCE(SUM(CASE WHEN failed=0 THEN input_tokens ELSE 0 END), 0),
+			COALESCE(SUM(CASE WHEN failed=0 THEN output_tokens ELSE 0 END), 0),
+			COALESCE(SUM(CASE WHEN failed=0 THEN cached_tokens ELSE 0 END), 0),
 			MAX(requested_at)
 		FROM usage_records
 		WHERE %s
@@ -1032,7 +1053,17 @@ func (s *sqliteUsageStore) attachChannelModels(ctx context.Context, whereClause 
 			model    MonitorModelStats
 			lastUnix sql.NullInt64
 		)
-		if err = rows.Scan(&source, &model.Model, &model.Requests, &model.Success, &model.Failed, &lastUnix); err != nil {
+		if err = rows.Scan(
+			&source,
+			&model.Model,
+			&model.Requests,
+			&model.Success,
+			&model.Failed,
+			&model.InputTokens,
+			&model.OutputTokens,
+			&model.CachedTokens,
+			&lastUnix,
+		); err != nil {
 			return fmt.Errorf("usage store: scan monitor channel model: %w", err)
 		}
 		model.LastRequestAt = nullUnixPointer(lastUnix)
@@ -1121,6 +1152,9 @@ func (s *sqliteUsageStore) attachFailureModels(ctx context.Context, failedWhere 
 			COUNT(*),
 			COALESCE(SUM(CASE WHEN failed=0 THEN 1 ELSE 0 END), 0),
 			COALESCE(SUM(CASE WHEN failed=1 THEN 1 ELSE 0 END), 0),
+			COALESCE(SUM(CASE WHEN failed=0 THEN input_tokens ELSE 0 END), 0),
+			COALESCE(SUM(CASE WHEN failed=0 THEN output_tokens ELSE 0 END), 0),
+			COALESCE(SUM(CASE WHEN failed=0 THEN cached_tokens ELSE 0 END), 0),
 			MAX(requested_at)
 		FROM usage_records
 		WHERE %s
@@ -1139,7 +1173,17 @@ func (s *sqliteUsageStore) attachFailureModels(ctx context.Context, failedWhere 
 			model    MonitorModelStats
 			lastUnix sql.NullInt64
 		)
-		if err = rows.Scan(&source, &model.Model, &model.Requests, &model.Success, &model.Failed, &lastUnix); err != nil {
+		if err = rows.Scan(
+			&source,
+			&model.Model,
+			&model.Requests,
+			&model.Success,
+			&model.Failed,
+			&model.InputTokens,
+			&model.OutputTokens,
+			&model.CachedTokens,
+			&lastUnix,
+		); err != nil {
 			return fmt.Errorf("usage store: scan failure model: %w", err)
 		}
 		model.LastRequestAt = nullUnixPointer(lastUnix)

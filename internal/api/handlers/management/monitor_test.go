@@ -98,10 +98,16 @@ func TestGetMonitorChannelStats_StatusFilterAndAggregate(t *testing.T) {
 	gin.SetMode(gin.TestMode)
 
 	base := time.Date(2026, 2, 6, 12, 0, 0, 0, time.Local)
+	first := testUsageRecord(base.Add(-2*time.Hour), "api-1", "model-a", "source-a", false)
+	first.Detail.CachedTokens = 3
+	second := testUsageRecord(base.Add(-90*time.Minute), "api-1", "model-a", "source-a", true)
+	second.Detail.CachedTokens = 5
+	third := testUsageRecord(base.Add(-70*time.Minute), "api-2", "model-b", "source-a", false)
+	third.Detail.CachedTokens = 7
 	h := newMonitorTestHandler(
-		testUsageRecord(base.Add(-2*time.Hour), "api-1", "model-a", "source-a", false),
-		testUsageRecord(base.Add(-90*time.Minute), "api-1", "model-a", "source-a", true),
-		testUsageRecord(base.Add(-70*time.Minute), "api-2", "model-b", "source-a", false),
+		first,
+		second,
+		third,
 		testUsageRecord(base.Add(-60*time.Minute), "api-1", "model-a", "source-b", false),
 	)
 
@@ -116,11 +122,17 @@ func TestGetMonitorChannelStats_StatusFilterAndAggregate(t *testing.T) {
 			TotalRequests   int64   `json:"total_requests"`
 			SuccessRequests int64   `json:"success_requests"`
 			FailedRequests  int64   `json:"failed_requests"`
+			InputTokens     int64   `json:"input_tokens"`
+			OutputTokens    int64   `json:"output_tokens"`
+			CachedTokens    int64   `json:"cached_tokens"`
 			SuccessRate     float64 `json:"success_rate"`
 			Models          []struct {
-				Model    string `json:"model"`
-				Requests int64  `json:"requests"`
-				Failed   int64  `json:"failed"`
+				Model        string `json:"model"`
+				Requests     int64  `json:"requests"`
+				Failed       int64  `json:"failed"`
+				InputTokens  int64  `json:"input_tokens"`
+				OutputTokens int64  `json:"output_tokens"`
+				CachedTokens int64  `json:"cached_tokens"`
 			} `json:"models"`
 		} `json:"items"`
 		Total int `json:"total"`
@@ -142,11 +154,17 @@ func TestGetMonitorChannelStats_StatusFilterAndAggregate(t *testing.T) {
 	if item.TotalRequests != 3 || item.SuccessRequests != 2 || item.FailedRequests != 1 {
 		t.Fatalf("unexpected aggregate: %+v", item)
 	}
+	if item.InputTokens != 20 || item.OutputTokens != 40 || item.CachedTokens != 10 {
+		t.Fatalf("unexpected token aggregate: input=%d output=%d cached=%d", item.InputTokens, item.OutputTokens, item.CachedTokens)
+	}
 	if item.SuccessRate != 66.7 {
 		t.Fatalf("unexpected success rate: %.1f", item.SuccessRate)
 	}
 	if len(item.Models) != 2 {
 		t.Fatalf("unexpected model count: %d", len(item.Models))
+	}
+	if item.Models[0].Model != "model-a" || item.Models[0].InputTokens != 10 || item.Models[0].OutputTokens != 20 || item.Models[0].CachedTokens != 3 {
+		t.Fatalf("unexpected first model token aggregate: %+v", item.Models[0])
 	}
 }
 
