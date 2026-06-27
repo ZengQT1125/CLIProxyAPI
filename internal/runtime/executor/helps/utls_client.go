@@ -3,6 +3,7 @@ package helps
 import (
 	"context"
 	cryptotls "crypto/tls"
+	"fmt"
 	"net"
 	"net/http"
 	"os"
@@ -96,11 +97,30 @@ func (t *utlsRoundTripper) createConnection(host, addr string) (*http2.ClientCon
 	}
 
 	tlsConfig := &tls.Config{ServerName: host}
-	tlsConn := tls.UClient(conn, tlsConfig, tls.HelloChrome_Auto)
+	spec, errSpec := chromeH2ClientHelloSpec()
+	if errSpec != nil {
+		if errClose := conn.Close(); errClose != nil {
+			log.Errorf("utls HTTP/2 connection close after ClientHello spec error: %v", errClose)
+		}
+		return nil, errSpec
+	}
+	tlsConn := tls.UClient(conn, tlsConfig, tls.HelloCustom)
+	if errApply := tlsConn.ApplyPreset(&spec); errApply != nil {
+		if errClose := conn.Close(); errClose != nil {
+			log.Errorf("utls HTTP/2 connection close after ClientHello preset error: %v", errClose)
+		}
+		return nil, errApply
+	}
 
 	if err := tlsConn.Handshake(); err != nil {
 		conn.Close()
 		return nil, err
+	}
+	if negotiated := tlsConn.ConnectionState().NegotiatedProtocol; negotiated != "h2" {
+		if errClose := tlsConn.Close(); errClose != nil {
+			log.Errorf("utls HTTP/2 connection close after ALPN mismatch: %v", errClose)
+		}
+		return nil, fmt.Errorf("utls HTTP/2 negotiated ALPN %q, want h2", negotiated)
 	}
 
 	tr := &http2.Transport{}
@@ -180,7 +200,20 @@ func dialUTLSHTTP11(dialer proxy.Dialer, network, addr string) (net.Conn, error)
 		ServerName: host,
 		NextProtos: []string{"http/1.1"},
 	}
-	tlsConn := tls.UClient(conn, tlsConfig, tls.HelloChrome_Auto)
+	spec, errSpec := chromeHTTP11ClientHelloSpec()
+	if errSpec != nil {
+		if errClose := conn.Close(); errClose != nil {
+			log.Errorf("utls HTTP/1.1 connection close after ClientHello spec error: %v", errClose)
+		}
+		return nil, errSpec
+	}
+	tlsConn := tls.UClient(conn, tlsConfig, tls.HelloCustom)
+	if errApply := tlsConn.ApplyPreset(&spec); errApply != nil {
+		if errClose := conn.Close(); errClose != nil {
+			log.Errorf("utls HTTP/1.1 connection close after ClientHello preset error: %v", errClose)
+		}
+		return nil, errApply
+	}
 	if errHandshake := tlsConn.Handshake(); errHandshake != nil {
 		if errClose := conn.Close(); errClose != nil {
 			log.Errorf("utls HTTP/1.1 connection close after handshake error: %v", errClose)
@@ -188,6 +221,43 @@ func dialUTLSHTTP11(dialer proxy.Dialer, network, addr string) (net.Conn, error)
 		return nil, errHandshake
 	}
 	return tlsConn, nil
+}
+
+func chromeH2ClientHelloSpec() (tls.ClientHelloSpec, error) {
+	return chromeClientHelloSpecWithALPN([]string{"h2"}, false)
+}
+
+func chromeHTTP11ClientHelloSpec() (tls.ClientHelloSpec, error) {
+	return chromeClientHelloSpecWithALPN([]string{"http/1.1"}, true)
+}
+
+func chromeClientHelloSpecWithALPN(alpn []string, dropApplicationSettings bool) (tls.ClientHelloSpec, error) {
+	spec, err := tls.UTLSIdToSpec(tls.HelloChrome_Auto)
+	if err != nil {
+		return tls.ClientHelloSpec{}, err
+	}
+
+	extensions := spec.Extensions[:0]
+	alpnSet := false
+	for _, ext := range spec.Extensions {
+		switch ext.(type) {
+		case *tls.ALPNExtension:
+			extensions = append(extensions, &tls.ALPNExtension{AlpnProtocols: append([]string(nil), alpn...)})
+			alpnSet = true
+		case *tls.ApplicationSettingsExtension, *tls.ApplicationSettingsExtensionNew:
+			if dropApplicationSettings {
+				continue
+			}
+			extensions = append(extensions, ext)
+		default:
+			extensions = append(extensions, ext)
+		}
+	}
+	if !alpnSet {
+		extensions = append(extensions, &tls.ALPNExtension{AlpnProtocols: append([]string(nil), alpn...)})
+	}
+	spec.Extensions = extensions
+	return spec, nil
 }
 
 func (t *utlsHTTP11RoundTripper) RoundTrip(req *http.Request) (*http.Response, error) {

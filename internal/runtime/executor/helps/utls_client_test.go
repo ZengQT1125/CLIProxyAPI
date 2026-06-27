@@ -1,12 +1,20 @@
 package helps
 
 import (
+	"bufio"
 	"context"
+	cryptotls "crypto/tls"
+	"errors"
+	"fmt"
 	"io"
+	"net"
 	"net/http"
 	"net/http/httptest"
 	"strings"
 	"testing"
+	"time"
+
+	"github.com/router-for-me/CLIProxyAPI/v7/internal/config"
 )
 
 type utlsClientRoundTripFunc func(*http.Request) (*http.Response, error)
@@ -167,6 +175,128 @@ func TestNewUtlsHTTPClientCodexHTTP1PinsProtectedTransportToHTTP11(t *testing.T)
 	}
 	if len(tr.TLSNextProto) != 0 {
 		t.Fatalf("protectedHTTP11 TLSNextProto has %d entries, want 0", len(tr.TLSNextProto))
+	}
+}
+
+func TestNewUtlsHTTPClientCodexHTTP1AdvertisesOnlyHTTP11ALPN(t *testing.T) {
+	t.Setenv(codexTransportModeEnv, codexTransportModeHTTP1)
+
+	listener, errListen := net.Listen("tcp", "127.0.0.1:0")
+	if errListen != nil {
+		t.Fatalf("net.Listen() error = %v", errListen)
+	}
+	defer func() {
+		if errClose := listener.Close(); errClose != nil {
+			t.Errorf("listener.Close() error = %v", errClose)
+		}
+	}()
+
+	captured := make(chan []string, 1)
+	proxyErr := make(chan error, 1)
+	go serveALPNCaptureProxy(listener, captured, proxyErr)
+
+	cfg := &config.Config{SDKConfig: config.SDKConfig{ProxyURL: "http://" + listener.Addr().String()}}
+	client := NewUtlsHTTPClient(context.Background(), cfg, nil, 0)
+	resp, errGet := client.Get("https://chatgpt.com/backend-api/codex/responses")
+	if resp != nil {
+		if errClose := resp.Body.Close(); errClose != nil {
+			t.Fatalf("response body close returned error: %v", errClose)
+		}
+	}
+	if errGet == nil {
+		t.Fatal("client.Get() returned nil error, want TLS handshake failure after capturing ClientHello")
+	}
+
+	select {
+	case protos := <-captured:
+		want := []string{"http/1.1"}
+		if strings.Join(protos, ",") != strings.Join(want, ",") {
+			t.Fatalf("advertised ALPN protocols = %v, want %v", protos, want)
+		}
+	case errProxy := <-proxyErr:
+		t.Fatalf("capture proxy error = %v", errProxy)
+	case <-time.After(5 * time.Second):
+		t.Fatal("timed out waiting for ClientHello ALPN capture")
+	}
+}
+
+func TestNewUtlsHTTPClientAutoAdvertisesOnlyH2ALPN(t *testing.T) {
+	t.Setenv(codexTransportModeEnv, "")
+
+	listener, errListen := net.Listen("tcp", "127.0.0.1:0")
+	if errListen != nil {
+		t.Fatalf("net.Listen() error = %v", errListen)
+	}
+	defer func() {
+		if errClose := listener.Close(); errClose != nil {
+			t.Errorf("listener.Close() error = %v", errClose)
+		}
+	}()
+
+	captured := make(chan []string, 1)
+	proxyErr := make(chan error, 1)
+	go serveALPNCaptureProxy(listener, captured, proxyErr)
+
+	cfg := &config.Config{SDKConfig: config.SDKConfig{ProxyURL: "http://" + listener.Addr().String()}}
+	client := NewUtlsHTTPClient(context.Background(), cfg, nil, 0)
+	resp, errGet := client.Get("https://chatgpt.com/backend-api/codex/responses")
+	if resp != nil {
+		if errClose := resp.Body.Close(); errClose != nil {
+			t.Fatalf("response body close returned error: %v", errClose)
+		}
+	}
+	if errGet == nil {
+		t.Fatal("client.Get() returned nil error, want TLS handshake failure after capturing ClientHello")
+	}
+
+	select {
+	case protos := <-captured:
+		want := []string{"h2"}
+		if strings.Join(protos, ",") != strings.Join(want, ",") {
+			t.Fatalf("advertised ALPN protocols = %v, want %v", protos, want)
+		}
+	case errProxy := <-proxyErr:
+		t.Fatalf("capture proxy error = %v", errProxy)
+	case <-time.After(5 * time.Second):
+		t.Fatal("timed out waiting for ClientHello ALPN capture")
+	}
+}
+
+func serveALPNCaptureProxy(listener net.Listener, captured chan<- []string, proxyErr chan<- error) {
+	conn, errAccept := listener.Accept()
+	if errAccept != nil {
+		proxyErr <- errAccept
+		return
+	}
+	defer func() { _ = conn.Close() }()
+
+	req, errRead := http.ReadRequest(bufio.NewReader(conn))
+	if errRead != nil {
+		proxyErr <- fmt.Errorf("read CONNECT request failed: %w", errRead)
+		return
+	}
+	if req.Method != http.MethodConnect {
+		proxyErr <- fmt.Errorf("method = %s, want CONNECT", req.Method)
+		return
+	}
+	if req.Host != "chatgpt.com:443" {
+		proxyErr <- fmt.Errorf("host = %s, want chatgpt.com:443", req.Host)
+		return
+	}
+	if _, errWrite := io.WriteString(conn, "HTTP/1.1 200 Connection Established\r\n\r\n"); errWrite != nil {
+		proxyErr <- fmt.Errorf("write CONNECT response failed: %w", errWrite)
+		return
+	}
+
+	errStopHandshake := errors.New("stop after ClientHello")
+	tlsConn := cryptotls.Server(conn, &cryptotls.Config{
+		GetConfigForClient: func(hello *cryptotls.ClientHelloInfo) (*cryptotls.Config, error) {
+			captured <- append([]string(nil), hello.SupportedProtos...)
+			return nil, errStopHandshake
+		},
+	})
+	if errHandshake := tlsConn.Handshake(); errHandshake != nil && !errors.Is(errHandshake, errStopHandshake) {
+		proxyErr <- fmt.Errorf("TLS handshake failed: %w", errHandshake)
 	}
 }
 
