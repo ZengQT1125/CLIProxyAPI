@@ -6,7 +6,6 @@ import (
 	"fmt"
 	"net"
 	"net/http"
-	"os"
 	"strings"
 	"sync"
 	"time"
@@ -18,14 +17,6 @@ import (
 	log "github.com/sirupsen/logrus"
 	"golang.org/x/net/http2"
 	"golang.org/x/net/proxy"
-)
-
-const (
-	codexTransportModeEnv           = "CLIPROXY_CODEX_TRANSPORT"
-	codexTransportModeAuto          = "auto"
-	codexTransportModeHTTP1         = "http1"
-	codexTransportModeStandardHTTP1 = "standard-http1"
-	codexTransportProtectedHost     = "chatgpt.com"
 )
 
 // utlsRoundTripper implements http.RoundTripper using utls with Chrome fingerprint
@@ -274,49 +265,69 @@ var utlsProtectedHosts = map[string]struct{}{
 // fallbackRoundTripper uses utls for protected HTTPS hosts and falls back to
 // standard transport for all other requests.
 type fallbackRoundTripper struct {
-	utls            http.RoundTripper
-	protectedHTTP11 http.RoundTripper
-	fallback        http.RoundTripper
+	utls                    http.RoundTripper
+	protectedHTTP11         http.RoundTripper
+	protectedFallbackHTTP11 http.RoundTripper
+	fallback                http.RoundTripper
 }
 
 func (f *fallbackRoundTripper) RoundTrip(req *http.Request) (*http.Response, error) {
 	if req.URL.Scheme == "https" {
 		hostname := strings.ToLower(req.URL.Hostname())
-		if hostname == codexTransportProtectedHost {
-			switch codexTransportMode() {
-			case codexTransportModeHTTP1:
-				return f.protectedHTTP11.RoundTrip(req)
-			case codexTransportModeStandardHTTP1:
-				return f.fallback.RoundTrip(req)
-			}
-		}
 		if _, ok := utlsProtectedHosts[hostname]; ok {
-			return f.utls.RoundTrip(req)
+			return f.roundTripProtected(req)
 		}
 	}
 	return f.fallback.RoundTrip(req)
 }
 
-func codexTransportMode() string {
-	switch strings.ToLower(strings.TrimSpace(os.Getenv(codexTransportModeEnv))) {
-	case "", codexTransportModeAuto:
-		return codexTransportModeAuto
-	case codexTransportModeHTTP1:
-		return codexTransportModeHTTP1
-	case codexTransportModeStandardHTTP1:
-		return codexTransportModeStandardHTTP1
-	default:
-		return codexTransportModeAuto
+func (f *fallbackRoundTripper) roundTripProtected(req *http.Request) (*http.Response, error) {
+	transports := []http.RoundTripper{f.utls, f.protectedHTTP11, f.protectedFallbackHTTP11}
+	var lastErr error
+	for attempt, transport := range transports {
+		if transport == nil {
+			continue
+		}
+		attemptReq, errReq := requestForProtectedAttempt(req, attempt)
+		if errReq != nil {
+			return nil, errReq
+		}
+		resp, err := transport.RoundTrip(attemptReq)
+		if resp != nil {
+			return resp, err
+		}
+		if err != nil {
+			lastErr = err
+			continue
+		}
+		return nil, nil
 	}
+	return nil, lastErr
 }
 
-// forceHTTP11Transport returns a clone of base that negotiates HTTP/1.1 only.
+func requestForProtectedAttempt(req *http.Request, attempt int) (*http.Request, error) {
+	if attempt == 0 || req.Body == nil || req.Body == http.NoBody {
+		return req, nil
+	}
+	if req.GetBody == nil {
+		return nil, fmt.Errorf("utls protected transport fallback requires request body rewind")
+	}
+	body, err := req.GetBody()
+	if err != nil {
+		return nil, fmt.Errorf("utls protected transport fallback rewind request body: %w", err)
+	}
+	clone := req.Clone(req.Context())
+	clone.Body = body
+	return clone, nil
+}
+
+// standardHTTP11Transport returns a clone of base that negotiates HTTP/1.1 only.
 // Round-trippers that are not *http.Transport (e.g. an injected context
 // RoundTripper or a uTLS round-tripper) are returned unchanged. Proxy and dial
 // settings on base are preserved; only ALPN/protocol negotiation is pinned.
 // The base is cloned, never mutated, so the shared http.DefaultTransport global
 // is left intact.
-func forceHTTP11Transport(base http.RoundTripper) http.RoundTripper {
+func standardHTTP11Transport(base http.RoundTripper) http.RoundTripper {
 	tr, ok := base.(*http.Transport)
 	if !ok || tr == nil {
 		return base
@@ -361,24 +372,17 @@ func NewUtlsHTTPClient(ctx context.Context, cfg *config.Config, auth *cliproxyau
 		}
 	} else if ctxRoundTripper != nil {
 		utlsRT = ctxRoundTripper
+		protectedHTTP11Transport = ctxRoundTripper
 		standardTransport = ctxRoundTripper
 	}
-
-	// Force HTTP/1.1 on the fallback path (every non-fingerprinted host, e.g.
-	// reseller/aggregator upstreams). HTTP/2 lets a flaky upstream reset a
-	// stream mid-response with RST_STREAM(INTERNAL_ERROR), which leaks to the
-	// client as a raw "stream error ...; received from peer". Over HTTP/1.1 a
-	// mid-response drop is instead a clean EOF that ClaudeExecutor.ExecuteStream
-	// already terminates gracefully with a synthetic message_stop. The uTLS
-	// (Anthropic/ChatGPT) path is intentionally left on HTTP/2 to preserve its
-	// Chrome fingerprint.
-	standardTransport = forceHTTP11Transport(standardTransport)
+	protectedFallbackHTTP11Transport := standardHTTP11Transport(standardTransport)
 
 	client := &http.Client{
 		Transport: &fallbackRoundTripper{
-			utls:            utlsRT,
-			protectedHTTP11: protectedHTTP11Transport,
-			fallback:        standardTransport,
+			utls:                    utlsRT,
+			protectedHTTP11:         protectedHTTP11Transport,
+			protectedFallbackHTTP11: protectedFallbackHTTP11Transport,
+			fallback:                standardTransport,
 		},
 	}
 	if timeout > 0 {

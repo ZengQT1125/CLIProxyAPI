@@ -9,12 +9,9 @@ import (
 	"io"
 	"net"
 	"net/http"
-	"net/http/httptest"
 	"strings"
 	"testing"
 	"time"
-
-	"github.com/router-for-me/CLIProxyAPI/v7/internal/config"
 )
 
 type utlsClientRoundTripFunc func(*http.Request) (*http.Response, error)
@@ -23,9 +20,141 @@ func (f utlsClientRoundTripFunc) RoundTrip(req *http.Request) (*http.Response, e
 	return f(req)
 }
 
-func TestNewUtlsHTTPClientUsesContextRoundTripperForProtectedHost(t *testing.T) {
-	t.Setenv(codexTransportModeEnv, "")
+func TestFallbackRoundTripperProtectedHostFallsBackAfterTransportErrors(t *testing.T) {
+	for host := range utlsProtectedHosts {
+		t.Run(host, func(t *testing.T) {
+			var calls []string
+			client := &http.Client{
+				Transport: &fallbackRoundTripper{
+					utls: utlsClientRoundTripFunc(func(req *http.Request) (*http.Response, error) {
+						calls = append(calls, "utls-h2")
+						return nil, errors.New("h2 transport failed")
+					}),
+					protectedHTTP11: utlsClientRoundTripFunc(func(req *http.Request) (*http.Response, error) {
+						calls = append(calls, "utls-http1")
+						return nil, errors.New("utls http1 transport failed")
+					}),
+					protectedFallbackHTTP11: utlsClientRoundTripFunc(func(req *http.Request) (*http.Response, error) {
+						calls = append(calls, "fallback-http1")
+						return &http.Response{
+							StatusCode: http.StatusTeapot,
+							Header:     make(http.Header),
+							Body:       io.NopCloser(strings.NewReader("{}")),
+							Request:    req,
+						}, nil
+					}),
+				},
+			}
 
+			resp, err := client.Get("https://" + host + "/backend-api/codex/responses")
+			if err != nil {
+				t.Fatalf("client.Get returned error: %v", err)
+			}
+			defer func() {
+				if errClose := resp.Body.Close(); errClose != nil {
+					t.Errorf("response body close returned error: %v", errClose)
+				}
+			}()
+			if resp.StatusCode != http.StatusTeapot {
+				t.Fatalf("status = %d, want %d", resp.StatusCode, http.StatusTeapot)
+			}
+			wantCalls := []string{"utls-h2", "utls-http1", "fallback-http1"}
+			if strings.Join(calls, ",") != strings.Join(wantCalls, ",") {
+				t.Fatalf("calls = %v, want %v", calls, wantCalls)
+			}
+		})
+	}
+}
+
+func TestFallbackRoundTripperProtectedHostHTTPResponseStopsFallback(t *testing.T) {
+	var calls []string
+	client := &http.Client{
+		Transport: &fallbackRoundTripper{
+			utls: utlsClientRoundTripFunc(func(req *http.Request) (*http.Response, error) {
+				calls = append(calls, "utls-h2")
+				return &http.Response{
+					StatusCode: http.StatusInternalServerError,
+					Header:     make(http.Header),
+					Body:       io.NopCloser(strings.NewReader(`{"error":"upstream"}`)),
+					Request:    req,
+				}, nil
+			}),
+			protectedHTTP11: utlsClientRoundTripFunc(func(req *http.Request) (*http.Response, error) {
+				calls = append(calls, "utls-http1")
+				return nil, errors.New("should not be called")
+			}),
+			protectedFallbackHTTP11: utlsClientRoundTripFunc(func(req *http.Request) (*http.Response, error) {
+				calls = append(calls, "fallback-http1")
+				return nil, errors.New("should not be called")
+			}),
+		},
+	}
+
+	resp, err := client.Get("https://chatgpt.com/backend-api/codex/responses")
+	if err != nil {
+		t.Fatalf("client.Get returned error: %v", err)
+	}
+	defer func() {
+		if errClose := resp.Body.Close(); errClose != nil {
+			t.Errorf("response body close returned error: %v", errClose)
+		}
+	}()
+	if resp.StatusCode != http.StatusInternalServerError {
+		t.Fatalf("status = %d, want %d", resp.StatusCode, http.StatusInternalServerError)
+	}
+	wantCalls := []string{"utls-h2"}
+	if strings.Join(calls, ",") != strings.Join(wantCalls, ",") {
+		t.Fatalf("calls = %v, want %v", calls, wantCalls)
+	}
+}
+
+func TestFallbackRoundTripperProtectedHostReplaysBodyOnFallback(t *testing.T) {
+	var bodies []string
+	readBody := func(req *http.Request) string {
+		body, errRead := io.ReadAll(req.Body)
+		if errRead != nil {
+			t.Fatalf("ReadAll() error = %v", errRead)
+		}
+		return string(body)
+	}
+	client := &http.Client{
+		Transport: &fallbackRoundTripper{
+			utls: utlsClientRoundTripFunc(func(req *http.Request) (*http.Response, error) {
+				bodies = append(bodies, readBody(req))
+				return nil, errors.New("h2 transport failed")
+			}),
+			protectedHTTP11: utlsClientRoundTripFunc(func(req *http.Request) (*http.Response, error) {
+				bodies = append(bodies, readBody(req))
+				return nil, errors.New("utls http1 transport failed")
+			}),
+			protectedFallbackHTTP11: utlsClientRoundTripFunc(func(req *http.Request) (*http.Response, error) {
+				bodies = append(bodies, readBody(req))
+				return &http.Response{
+					StatusCode: http.StatusOK,
+					Header:     make(http.Header),
+					Body:       io.NopCloser(strings.NewReader("{}")),
+					Request:    req,
+				}, nil
+			}),
+		},
+	}
+
+	resp, err := client.Post("https://chatgpt.com/backend-api/codex/responses", "application/json", strings.NewReader(`{"input":"hello"}`))
+	if err != nil {
+		t.Fatalf("client.Post returned error: %v", err)
+	}
+	defer func() {
+		if errClose := resp.Body.Close(); errClose != nil {
+			t.Errorf("response body close returned error: %v", errClose)
+		}
+	}()
+	wantBodies := []string{`{"input":"hello"}`, `{"input":"hello"}`, `{"input":"hello"}`}
+	if strings.Join(bodies, "\n") != strings.Join(wantBodies, "\n") {
+		t.Fatalf("bodies = %q, want %q", bodies, wantBodies)
+	}
+}
+
+func TestNewUtlsHTTPClientUsesContextRoundTripperForProtectedHost(t *testing.T) {
 	called := false
 	ctx := context.WithValue(context.Background(), "cliproxy.roundtripper", utlsClientRoundTripFunc(func(req *http.Request) (*http.Response, error) {
 		called = true
@@ -53,104 +182,35 @@ func TestNewUtlsHTTPClientUsesContextRoundTripperForProtectedHost(t *testing.T) 
 	}
 }
 
-func TestNewUtlsHTTPClientCodexHTTP1UsesProtectedHTTP11Transport(t *testing.T) {
-	t.Setenv(codexTransportModeEnv, codexTransportModeHTTP1)
+func TestNewUtlsHTTPClientUsesContextRoundTripperForProtectedFallbacks(t *testing.T) {
+	var calls int
+	ctx := context.WithValue(context.Background(), "cliproxy.roundtripper", utlsClientRoundTripFunc(func(req *http.Request) (*http.Response, error) {
+		calls++
+		if calls < 3 {
+			return nil, fmt.Errorf("injected transport failure %d", calls)
+		}
+		return &http.Response{
+			StatusCode: http.StatusOK,
+			Header:     make(http.Header),
+			Body:       io.NopCloser(strings.NewReader("{}")),
+			Request:    req,
+		}, nil
+	}))
 
-	var protectedH2Called bool
-	var protectedHTTP11Called bool
-	client := &http.Client{
-		Transport: &fallbackRoundTripper{
-			utls: utlsClientRoundTripFunc(func(req *http.Request) (*http.Response, error) {
-				protectedH2Called = true
-				if req.URL.Hostname() != "chatgpt.com" {
-					t.Fatalf("hostname = %q, want chatgpt.com", req.URL.Hostname())
-				}
-				return &http.Response{
-					StatusCode: http.StatusOK,
-					Header:     make(http.Header),
-					Body:       io.NopCloser(strings.NewReader("{}")),
-					Request:    req,
-				}, nil
-			}),
-			protectedHTTP11: utlsClientRoundTripFunc(func(req *http.Request) (*http.Response, error) {
-				protectedHTTP11Called = true
-				if req.URL.Hostname() != "chatgpt.com" {
-					t.Fatalf("hostname = %q, want chatgpt.com", req.URL.Hostname())
-				}
-				return &http.Response{
-					StatusCode: http.StatusOK,
-					Header:     make(http.Header),
-					Body:       io.NopCloser(strings.NewReader("{}")),
-					Request:    req,
-				}, nil
-			}),
-		},
-	}
-
-	resp, err := client.Get("https://chatgpt.com/backend-api/codex/responses")
+	client := NewUtlsHTTPClient(ctx, nil, nil, 0)
+	resp, err := client.Post("https://chatgpt.com/backend-api/codex/responses", "application/json", strings.NewReader("{}"))
 	if err != nil {
-		t.Fatalf("client.Get returned error: %v", err)
+		t.Fatalf("client.Post returned error: %v", err)
 	}
 	if errClose := resp.Body.Close(); errClose != nil {
 		t.Fatalf("response body close returned error: %v", errClose)
 	}
-	if protectedH2Called {
-		t.Fatal("did not expect http1 mode to use protected HTTP/2 path")
-	}
-	if !protectedHTTP11Called {
-		t.Fatal("expected http1 mode to use protected HTTP/1.1 path")
+	if calls != 3 {
+		t.Fatalf("context RoundTripper calls = %d, want 3", calls)
 	}
 }
 
-func TestNewUtlsHTTPClientCodexStandardHTTP1BypassesProtectedTransport(t *testing.T) {
-	t.Setenv(codexTransportModeEnv, codexTransportModeStandardHTTP1)
-
-	var utlsCalled bool
-	var fallbackCalled bool
-	client := &http.Client{
-		Transport: &fallbackRoundTripper{
-			utls: utlsClientRoundTripFunc(func(req *http.Request) (*http.Response, error) {
-				utlsCalled = true
-				return &http.Response{
-					StatusCode: http.StatusOK,
-					Header:     make(http.Header),
-					Body:       io.NopCloser(strings.NewReader("{}")),
-					Request:    req,
-				}, nil
-			}),
-			fallback: utlsClientRoundTripFunc(func(req *http.Request) (*http.Response, error) {
-				fallbackCalled = true
-				if req.URL.Hostname() != "chatgpt.com" {
-					t.Fatalf("hostname = %q, want chatgpt.com", req.URL.Hostname())
-				}
-				return &http.Response{
-					StatusCode: http.StatusOK,
-					Header:     make(http.Header),
-					Body:       io.NopCloser(strings.NewReader("{}")),
-					Request:    req,
-				}, nil
-			}),
-		},
-	}
-
-	resp, err := client.Get("https://chatgpt.com/backend-api/codex/responses")
-	if err != nil {
-		t.Fatalf("client.Get returned error: %v", err)
-	}
-	if errClose := resp.Body.Close(); errClose != nil {
-		t.Fatalf("response body close returned error: %v", errClose)
-	}
-	if utlsCalled {
-		t.Fatal("did not expect standard-http1 mode to use protected uTLS path")
-	}
-	if !fallbackCalled {
-		t.Fatal("expected standard-http1 mode to use standard fallback path")
-	}
-}
-
-func TestNewUtlsHTTPClientCodexHTTP1PinsProtectedTransportToHTTP11(t *testing.T) {
-	t.Setenv(codexTransportModeEnv, codexTransportModeHTTP1)
-
+func TestNewUtlsHTTPClientProtectedHTTP11TransportPinsHTTP11(t *testing.T) {
 	client := NewUtlsHTTPClient(context.Background(), nil, nil, 0)
 	fb, ok := client.Transport.(*fallbackRoundTripper)
 	if !ok {
@@ -178,9 +238,31 @@ func TestNewUtlsHTTPClientCodexHTTP1PinsProtectedTransportToHTTP11(t *testing.T)
 	}
 }
 
-func TestNewUtlsHTTPClientCodexHTTP1AdvertisesOnlyHTTP11ALPN(t *testing.T) {
-	t.Setenv(codexTransportModeEnv, codexTransportModeHTTP1)
+func TestNewUtlsHTTPClientProtectedFallbackPinsStandardHTTP11(t *testing.T) {
+	client := NewUtlsHTTPClient(context.Background(), nil, nil, 0)
+	fb, ok := client.Transport.(*fallbackRoundTripper)
+	if !ok {
+		t.Fatalf("client.Transport type = %T, want *fallbackRoundTripper", client.Transport)
+	}
+	tr, ok := fb.protectedFallbackHTTP11.(*http.Transport)
+	if !ok {
+		t.Fatalf("protectedFallbackHTTP11 transport type = %T, want *http.Transport", fb.protectedFallbackHTTP11)
+	}
+	if tr.ForceAttemptHTTP2 {
+		t.Fatal("protectedFallbackHTTP11 ForceAttemptHTTP2 = true, want false")
+	}
+	if tr.TLSClientConfig == nil {
+		t.Fatal("protectedFallbackHTTP11 TLSClientConfig = nil, want NextProtos pinned to http/1.1")
+	}
+	if got := tr.TLSClientConfig.NextProtos; len(got) != 1 || got[0] != "http/1.1" {
+		t.Fatalf("protectedFallbackHTTP11 NextProtos = %v, want [http/1.1]", got)
+	}
+	if len(tr.TLSNextProto) != 0 {
+		t.Fatalf("protectedFallbackHTTP11 TLSNextProto has %d entries, want 0", len(tr.TLSNextProto))
+	}
+}
 
+func TestUtlsHTTP11RoundTripperAdvertisesOnlyHTTP11ALPN(t *testing.T) {
 	listener, errListen := net.Listen("tcp", "127.0.0.1:0")
 	if errListen != nil {
 		t.Fatalf("net.Listen() error = %v", errListen)
@@ -195,8 +277,7 @@ func TestNewUtlsHTTPClientCodexHTTP1AdvertisesOnlyHTTP11ALPN(t *testing.T) {
 	proxyErr := make(chan error, 1)
 	go serveALPNCaptureProxy(listener, captured, proxyErr)
 
-	cfg := &config.Config{SDKConfig: config.SDKConfig{ProxyURL: "http://" + listener.Addr().String()}}
-	client := NewUtlsHTTPClient(context.Background(), cfg, nil, 0)
+	client := &http.Client{Transport: newUtlsHTTP11RoundTripper("http://" + listener.Addr().String())}
 	resp, errGet := client.Get("https://chatgpt.com/backend-api/codex/responses")
 	if resp != nil {
 		if errClose := resp.Body.Close(); errClose != nil {
@@ -220,9 +301,7 @@ func TestNewUtlsHTTPClientCodexHTTP1AdvertisesOnlyHTTP11ALPN(t *testing.T) {
 	}
 }
 
-func TestNewUtlsHTTPClientAutoAdvertisesOnlyH2ALPN(t *testing.T) {
-	t.Setenv(codexTransportModeEnv, "")
-
+func TestUtlsRoundTripperAdvertisesOnlyH2ALPN(t *testing.T) {
 	listener, errListen := net.Listen("tcp", "127.0.0.1:0")
 	if errListen != nil {
 		t.Fatalf("net.Listen() error = %v", errListen)
@@ -237,8 +316,7 @@ func TestNewUtlsHTTPClientAutoAdvertisesOnlyH2ALPN(t *testing.T) {
 	proxyErr := make(chan error, 1)
 	go serveALPNCaptureProxy(listener, captured, proxyErr)
 
-	cfg := &config.Config{SDKConfig: config.SDKConfig{ProxyURL: "http://" + listener.Addr().String()}}
-	client := NewUtlsHTTPClient(context.Background(), cfg, nil, 0)
+	client := &http.Client{Transport: newUtlsRoundTripper("http://" + listener.Addr().String())}
 	resp, errGet := client.Get("https://chatgpt.com/backend-api/codex/responses")
 	if resp != nil {
 		if errClose := resp.Body.Close(); errClose != nil {
@@ -300,14 +378,7 @@ func serveALPNCaptureProxy(listener net.Listener, captured chan<- []string, prox
 	}
 }
 
-// TestNewUtlsHTTPClientFallbackForcesHTTP11 verifies that requests to
-// non-fingerprinted hosts (everything except the uTLS-protected Anthropic /
-// ChatGPT domains) go through a fallback transport that negotiates HTTP/1.1
-// only. Forcing HTTP/1.1 eliminates the HTTP/2 RST_STREAM(INTERNAL_ERROR)
-// error class that flaky reseller upstreams emit mid-stream; a mid-response
-// drop then surfaces as a clean EOF that the executor already terminates
-// gracefully with a synthetic message_stop.
-func TestNewUtlsHTTPClientFallbackForcesHTTP11(t *testing.T) {
+func TestNewUtlsHTTPClientFallbackKeepsHTTP2Enabled(t *testing.T) {
 	t.Parallel()
 
 	client := NewUtlsHTTPClient(context.Background(), nil, nil, 0)
@@ -322,70 +393,10 @@ func TestNewUtlsHTTPClientFallbackForcesHTTP11(t *testing.T) {
 		t.Fatalf("fallback transport type = %T, want *http.Transport", fb.fallback)
 	}
 
-	if tr.ForceAttemptHTTP2 {
-		t.Error("fallback ForceAttemptHTTP2 = true, want false (HTTP/1.1 only)")
+	if !tr.ForceAttemptHTTP2 {
+		t.Fatal("fallback ForceAttemptHTTP2 = false, want true")
 	}
-	if tr.TLSClientConfig == nil {
-		t.Fatal("fallback TLSClientConfig = nil, want NextProtos pinned to http/1.1")
-	}
-	if got := tr.TLSClientConfig.NextProtos; len(got) != 1 || got[0] != "http/1.1" {
-		t.Errorf("fallback TLSClientConfig.NextProtos = %v, want [http/1.1]", got)
-	}
-	if len(tr.TLSNextProto) != 0 {
-		t.Errorf("fallback TLSNextProto has %d entries, want 0 (no implicit h2 upgrade)", len(tr.TLSNextProto))
-	}
-
-	// The shared global must not be mutated into HTTP/1.1; the client must own
-	// an isolated clone.
-	if def, ok := http.DefaultTransport.(*http.Transport); ok && !def.ForceAttemptHTTP2 {
-		t.Error("http.DefaultTransport.ForceAttemptHTTP2 was flipped to false; expected an isolated clone, not mutation of the global")
-	}
-}
-
-// TestForceHTTP11TransportNegotiatesHTTP11AgainstH2Server proves the real
-// behavior: against a server that advertises HTTP/2 over ALPN, the forced
-// transport still negotiates HTTP/1.1. The control assertion confirms the test
-// server genuinely offers h2, so the HTTP/1.1 result is meaningful and not an
-// artifact of the server only speaking HTTP/1.1.
-func TestForceHTTP11TransportNegotiatesHTTP11AgainstH2Server(t *testing.T) {
-	t.Parallel()
-
-	srv := httptest.NewUnstartedServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
-		w.WriteHeader(http.StatusOK)
-	}))
-	srv.EnableHTTP2 = true
-	srv.StartTLS()
-	defer srv.Close()
-
-	// srv.Client()'s transport trusts the test server's self-signed cert.
-	base, ok := srv.Client().Transport.(*http.Transport)
-	if !ok {
-		t.Fatalf("test server client transport type = %T, want *http.Transport", srv.Client().Transport)
-	}
-
-	// Control: the unmodified client negotiates HTTP/2 with this server.
-	controlResp, err := srv.Client().Get(srv.URL)
-	if err != nil {
-		t.Fatalf("control request returned error: %v", err)
-	}
-	controlProto := controlResp.ProtoMajor
-	_ = controlResp.Body.Close()
-	if controlProto != 2 {
-		t.Fatalf("control negotiated HTTP/%d, want HTTP/2 (test server must offer h2 for this test to be meaningful)", controlProto)
-	}
-
-	// Forced: the same transport, pinned to HTTP/1.1, must negotiate HTTP/1.1.
-	forced, ok := forceHTTP11Transport(base.Clone()).(*http.Transport)
-	if !ok {
-		t.Fatalf("forceHTTP11Transport returned %T, want *http.Transport", forceHTTP11Transport(base.Clone()))
-	}
-	client := &http.Client{Transport: forced}
-	resp, err := client.Get(srv.URL)
-	if err != nil {
-		t.Fatalf("forced request returned error: %v", err)
-	}
-	defer func() { _ = resp.Body.Close() }()
-	if resp.ProtoMajor != 1 {
-		t.Fatalf("forced transport negotiated HTTP/%d, want HTTP/1.1", resp.ProtoMajor)
+	if tr.TLSClientConfig != nil && strings.Join(tr.TLSClientConfig.NextProtos, ",") == "http/1.1" {
+		t.Fatalf("fallback NextProtos = %v, want HTTP/2 capable default transport", tr.TLSClientConfig.NextProtos)
 	}
 }
