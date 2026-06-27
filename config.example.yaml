@@ -106,6 +106,8 @@ proxy-url: ""
 # Set CODEX_BASE_URL in the process environment or .env file to override the
 # default Codex backend for credentials without a per-entry base-url.
 # Example .env: CODEX_BASE_URL=https://example.com/codex
+# Set CLIPROXY_CODEX_TRANSPORT=http1 to keep ChatGPT/Codex on uTLS but force HTTP/1.1.
+# Use CLIPROXY_CODEX_TRANSPORT=standard-http1 only for transport debugging without uTLS.
 
 # When true, disable remote models.json refresh and use only the embedded model catalog.
 # Command-line -local-model takes precedence over this config value.

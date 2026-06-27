@@ -5,6 +5,7 @@ import (
 	cryptotls "crypto/tls"
 	"net"
 	"net/http"
+	"os"
 	"strings"
 	"sync"
 	"time"
@@ -16,6 +17,14 @@ import (
 	log "github.com/sirupsen/logrus"
 	"golang.org/x/net/http2"
 	"golang.org/x/net/proxy"
+)
+
+const (
+	codexTransportModeEnv           = "CLIPROXY_CODEX_TRANSPORT"
+	codexTransportModeAuto          = "auto"
+	codexTransportModeHTTP1         = "http1"
+	codexTransportModeStandardHTTP1 = "standard-http1"
+	codexTransportProtectedHost     = "chatgpt.com"
 )
 
 // utlsRoundTripper implements http.RoundTripper using utls with Chrome fingerprint
@@ -130,6 +139,61 @@ func (t *utlsRoundTripper) RoundTrip(req *http.Request) (*http.Response, error) 
 	return resp, nil
 }
 
+type utlsHTTP11RoundTripper struct {
+	transport http.RoundTripper
+}
+
+func newUtlsHTTP11RoundTripper(proxyURL string) http.RoundTripper {
+	base := &http.Transport{
+		ForceAttemptHTTP2: false,
+		TLSNextProto:      make(map[string]func(authority string, c *cryptotls.Conn) http.RoundTripper),
+		TLSClientConfig: &cryptotls.Config{
+			NextProtos: []string{"http/1.1"},
+		},
+	}
+	var dialer proxy.Dialer = proxy.Direct
+	if proxyURL != "" {
+		proxyDialer, mode, errBuild := proxyutil.BuildDialer(proxyURL)
+		if errBuild != nil {
+			log.Errorf("utls: failed to configure HTTP/1.1 proxy dialer for %q: %v", proxyutil.Redact(proxyURL), errBuild)
+		} else if mode != proxyutil.ModeInherit && proxyDialer != nil {
+			dialer = proxyDialer
+		}
+	}
+	base.DialTLSContext = func(_ context.Context, network, addr string) (net.Conn, error) {
+		return dialUTLSHTTP11(dialer, network, addr)
+	}
+	return &utlsHTTP11RoundTripper{transport: base}
+}
+
+func dialUTLSHTTP11(dialer proxy.Dialer, network, addr string) (net.Conn, error) {
+	conn, err := dialer.Dial(network, addr)
+	if err != nil {
+		return nil, err
+	}
+
+	host, _, errSplit := net.SplitHostPort(addr)
+	if errSplit != nil {
+		host = addr
+	}
+	tlsConfig := &tls.Config{
+		ServerName: host,
+		NextProtos: []string{"http/1.1"},
+	}
+	tlsConn := tls.UClient(conn, tlsConfig, tls.HelloChrome_Auto)
+	if errHandshake := tlsConn.Handshake(); errHandshake != nil {
+		if errClose := conn.Close(); errClose != nil {
+			log.Errorf("utls HTTP/1.1 connection close after handshake error: %v", errClose)
+		}
+		return nil, errHandshake
+	}
+	return tlsConn, nil
+}
+
+func (t *utlsHTTP11RoundTripper) RoundTrip(req *http.Request) (*http.Response, error) {
+	return t.transport.RoundTrip(req)
+}
+
 // utlsProtectedHosts contains the hosts that should use utls Chrome TLS fingerprint
 // to bypass Cloudflare's TLS fingerprinting.
 var utlsProtectedHosts = map[string]struct{}{
@@ -140,17 +204,40 @@ var utlsProtectedHosts = map[string]struct{}{
 // fallbackRoundTripper uses utls for protected HTTPS hosts and falls back to
 // standard transport for all other requests.
 type fallbackRoundTripper struct {
-	utls     http.RoundTripper
-	fallback http.RoundTripper
+	utls            http.RoundTripper
+	protectedHTTP11 http.RoundTripper
+	fallback        http.RoundTripper
 }
 
 func (f *fallbackRoundTripper) RoundTrip(req *http.Request) (*http.Response, error) {
 	if req.URL.Scheme == "https" {
-		if _, ok := utlsProtectedHosts[strings.ToLower(req.URL.Hostname())]; ok {
+		hostname := strings.ToLower(req.URL.Hostname())
+		if hostname == codexTransportProtectedHost {
+			switch codexTransportMode() {
+			case codexTransportModeHTTP1:
+				return f.protectedHTTP11.RoundTrip(req)
+			case codexTransportModeStandardHTTP1:
+				return f.fallback.RoundTrip(req)
+			}
+		}
+		if _, ok := utlsProtectedHosts[hostname]; ok {
 			return f.utls.RoundTrip(req)
 		}
 	}
 	return f.fallback.RoundTrip(req)
+}
+
+func codexTransportMode() string {
+	switch strings.ToLower(strings.TrimSpace(os.Getenv(codexTransportModeEnv))) {
+	case "", codexTransportModeAuto:
+		return codexTransportModeAuto
+	case codexTransportModeHTTP1:
+		return codexTransportModeHTTP1
+	case codexTransportModeStandardHTTP1:
+		return codexTransportModeStandardHTTP1
+	default:
+		return codexTransportModeAuto
+	}
 }
 
 // forceHTTP11Transport returns a clone of base that negotiates HTTP/1.1 only.
@@ -196,6 +283,7 @@ func NewUtlsHTTPClient(ctx context.Context, cfg *config.Config, auth *cliproxyau
 	}
 
 	var utlsRT http.RoundTripper = newUtlsRoundTripper(proxyURL)
+	var protectedHTTP11Transport http.RoundTripper = newUtlsHTTP11RoundTripper(proxyURL)
 	var standardTransport http.RoundTripper = http.DefaultTransport
 	if proxyURL != "" {
 		if transport := buildProxyTransport(proxyURL); transport != nil {
@@ -218,8 +306,9 @@ func NewUtlsHTTPClient(ctx context.Context, cfg *config.Config, auth *cliproxyau
 
 	client := &http.Client{
 		Transport: &fallbackRoundTripper{
-			utls:     utlsRT,
-			fallback: standardTransport,
+			utls:            utlsRT,
+			protectedHTTP11: protectedHTTP11Transport,
+			fallback:        standardTransport,
 		},
 	}
 	if timeout > 0 {

@@ -16,7 +16,7 @@ func (f utlsClientRoundTripFunc) RoundTrip(req *http.Request) (*http.Response, e
 }
 
 func TestNewUtlsHTTPClientUsesContextRoundTripperForProtectedHost(t *testing.T) {
-	t.Parallel()
+	t.Setenv(codexTransportModeEnv, "")
 
 	called := false
 	ctx := context.WithValue(context.Background(), "cliproxy.roundtripper", utlsClientRoundTripFunc(func(req *http.Request) (*http.Response, error) {
@@ -42,6 +42,131 @@ func TestNewUtlsHTTPClientUsesContextRoundTripperForProtectedHost(t *testing.T) 
 	}
 	if !called {
 		t.Fatal("expected context RoundTripper to handle protected host request")
+	}
+}
+
+func TestNewUtlsHTTPClientCodexHTTP1UsesProtectedHTTP11Transport(t *testing.T) {
+	t.Setenv(codexTransportModeEnv, codexTransportModeHTTP1)
+
+	var protectedH2Called bool
+	var protectedHTTP11Called bool
+	client := &http.Client{
+		Transport: &fallbackRoundTripper{
+			utls: utlsClientRoundTripFunc(func(req *http.Request) (*http.Response, error) {
+				protectedH2Called = true
+				if req.URL.Hostname() != "chatgpt.com" {
+					t.Fatalf("hostname = %q, want chatgpt.com", req.URL.Hostname())
+				}
+				return &http.Response{
+					StatusCode: http.StatusOK,
+					Header:     make(http.Header),
+					Body:       io.NopCloser(strings.NewReader("{}")),
+					Request:    req,
+				}, nil
+			}),
+			protectedHTTP11: utlsClientRoundTripFunc(func(req *http.Request) (*http.Response, error) {
+				protectedHTTP11Called = true
+				if req.URL.Hostname() != "chatgpt.com" {
+					t.Fatalf("hostname = %q, want chatgpt.com", req.URL.Hostname())
+				}
+				return &http.Response{
+					StatusCode: http.StatusOK,
+					Header:     make(http.Header),
+					Body:       io.NopCloser(strings.NewReader("{}")),
+					Request:    req,
+				}, nil
+			}),
+		},
+	}
+
+	resp, err := client.Get("https://chatgpt.com/backend-api/codex/responses")
+	if err != nil {
+		t.Fatalf("client.Get returned error: %v", err)
+	}
+	if errClose := resp.Body.Close(); errClose != nil {
+		t.Fatalf("response body close returned error: %v", errClose)
+	}
+	if protectedH2Called {
+		t.Fatal("did not expect http1 mode to use protected HTTP/2 path")
+	}
+	if !protectedHTTP11Called {
+		t.Fatal("expected http1 mode to use protected HTTP/1.1 path")
+	}
+}
+
+func TestNewUtlsHTTPClientCodexStandardHTTP1BypassesProtectedTransport(t *testing.T) {
+	t.Setenv(codexTransportModeEnv, codexTransportModeStandardHTTP1)
+
+	var utlsCalled bool
+	var fallbackCalled bool
+	client := &http.Client{
+		Transport: &fallbackRoundTripper{
+			utls: utlsClientRoundTripFunc(func(req *http.Request) (*http.Response, error) {
+				utlsCalled = true
+				return &http.Response{
+					StatusCode: http.StatusOK,
+					Header:     make(http.Header),
+					Body:       io.NopCloser(strings.NewReader("{}")),
+					Request:    req,
+				}, nil
+			}),
+			fallback: utlsClientRoundTripFunc(func(req *http.Request) (*http.Response, error) {
+				fallbackCalled = true
+				if req.URL.Hostname() != "chatgpt.com" {
+					t.Fatalf("hostname = %q, want chatgpt.com", req.URL.Hostname())
+				}
+				return &http.Response{
+					StatusCode: http.StatusOK,
+					Header:     make(http.Header),
+					Body:       io.NopCloser(strings.NewReader("{}")),
+					Request:    req,
+				}, nil
+			}),
+		},
+	}
+
+	resp, err := client.Get("https://chatgpt.com/backend-api/codex/responses")
+	if err != nil {
+		t.Fatalf("client.Get returned error: %v", err)
+	}
+	if errClose := resp.Body.Close(); errClose != nil {
+		t.Fatalf("response body close returned error: %v", errClose)
+	}
+	if utlsCalled {
+		t.Fatal("did not expect standard-http1 mode to use protected uTLS path")
+	}
+	if !fallbackCalled {
+		t.Fatal("expected standard-http1 mode to use standard fallback path")
+	}
+}
+
+func TestNewUtlsHTTPClientCodexHTTP1PinsProtectedTransportToHTTP11(t *testing.T) {
+	t.Setenv(codexTransportModeEnv, codexTransportModeHTTP1)
+
+	client := NewUtlsHTTPClient(context.Background(), nil, nil, 0)
+	fb, ok := client.Transport.(*fallbackRoundTripper)
+	if !ok {
+		t.Fatalf("client.Transport type = %T, want *fallbackRoundTripper", client.Transport)
+	}
+	protected, ok := fb.protectedHTTP11.(*utlsHTTP11RoundTripper)
+	if !ok {
+		t.Fatalf("protectedHTTP11 transport type = %T, want *utlsHTTP11RoundTripper", fb.protectedHTTP11)
+	}
+	tr, ok := protected.transport.(*http.Transport)
+	if !ok {
+		t.Fatalf("protectedHTTP11 inner transport type = %T, want *http.Transport", protected.transport)
+	}
+	if tr.ForceAttemptHTTP2 {
+		t.Fatal("protectedHTTP11 ForceAttemptHTTP2 = true, want false")
+	}
+	if tr.TLSClientConfig == nil {
+		t.Fatal("protectedHTTP11 TLSClientConfig = nil, want NextProtos pinned to http/1.1")
+	}
+	if got := tr.TLSClientConfig.NextProtos; len(got) != 1 || got[0] != "http/1.1" {
+		t.Fatalf("protectedHTTP11 NextProtos = %v, want [http/1.1]", got)
+	}
+	if len(tr.TLSNextProto) != 0 {
+		t.Fatalf("protectedHTTP11 TLSNextProto has %d entries, want 0", len(tr.TLSNextProto))
 	}
 }
 
