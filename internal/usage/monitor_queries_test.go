@@ -145,6 +145,43 @@ func TestSQLiteUsageStoreQueryMonitorFailureStats(t *testing.T) {
 	assertStringSliceEqual(t, result.Filters.Models, []string{"model-a", "model-b", "model-c"})
 }
 
+func TestSQLiteUsageStoreQueryMonitorKeyStatsBlocksAuthIndexFilter(t *testing.T) {
+	ctx := context.Background()
+	store := newTestSQLiteUsageStore(t)
+	defer store.Close()
+
+	base := time.Date(2026, 2, 7, 12, 0, 0, 0, time.UTC)
+	insertUsageRecords(t, store,
+		UsageRecord{APIKey: "api-a", Model: "model-a", Source: "source-a", AuthIndex: "auth-a", RequestedAt: base.Add(-19 * time.Minute)},
+		UsageRecord{APIKey: "api-a", Model: "model-a", Source: "source-a", AuthIndex: "auth-a", RequestedAt: base.Add(-9 * time.Minute), Failed: true},
+		UsageRecord{APIKey: "api-b", Model: "model-b", Source: "source-b", AuthIndex: "auth-b", RequestedAt: base.Add(-8 * time.Minute)},
+		UsageRecord{APIKey: "api-empty", Model: "model-empty", Source: "source-empty", RequestedAt: base.Add(-7 * time.Minute)},
+	)
+
+	rows, err := store.QueryMonitorKeyStatsBlocks(ctx, base.Add(-20*time.Minute).Unix(), base.Unix(), int((10 * time.Minute).Seconds()), " auth-a ")
+	if err != nil {
+		t.Fatalf("QueryMonitorKeyStatsBlocks failed: %v", err)
+	}
+
+	if len(rows) != 2 {
+		t.Fatalf("unexpected row count: got %d want 2 rows=%#v", len(rows), rows)
+	}
+	var successCount, failureCount int64
+	for _, row := range rows {
+		if row.AuthIndex != "auth-a" {
+			t.Fatalf("unexpected auth index in filtered rows: %+v", row)
+		}
+		if row.Source != "source-a" {
+			t.Fatalf("unexpected source in filtered rows: %+v", row)
+		}
+		successCount += row.Success
+		failureCount += row.Failure
+	}
+	if successCount != 1 || failureCount != 1 {
+		t.Fatalf("unexpected filtered totals: success=%d failure=%d", successCount, failureCount)
+	}
+}
+
 func newTestSQLiteUsageStore(t *testing.T) *sqliteUsageStore {
 	t.Helper()
 	store, err := newSQLiteUsageStoreAtPath(filepath.Join(t.TempDir(), "usage.db"))

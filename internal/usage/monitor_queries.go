@@ -135,7 +135,7 @@ type monitorQueryableStore interface {
 	QueryMonitorHourlySlots(ctx context.Context, filter MonitorQueryFilter, cutoffUnix, nowUnix int64, slotSeconds int) ([]MonitorHourlySlot, error)
 	QueryMonitorHourlyTokenSlots(ctx context.Context, filter MonitorQueryFilter, cutoffUnix, nowUnix int64, slotSeconds int) ([]MonitorHourlyTokenSlot, error)
 	QueryMonitorHealthBlocks(ctx context.Context, windowStartUnix, windowEndUnix int64, blockSeconds int) ([]MonitorHealthBlock, error)
-	QueryMonitorKeyStatsBlocks(ctx context.Context, windowStartUnix, windowEndUnix int64, blockSeconds int) ([]MonitorKeyStatsRow, error)
+	QueryMonitorKeyStatsBlocks(ctx context.Context, windowStartUnix, windowEndUnix int64, blockSeconds int, authIndex string) ([]MonitorKeyStatsRow, error)
 }
 
 // MonitorRequestDetail represents a single request detail row for the request-details endpoint.
@@ -353,7 +353,7 @@ func (p *DatabasePlugin) QueryMonitorHealthBlocks(ctx context.Context, windowSta
 }
 
 // QueryMonitorKeyStatsBlocks queries per-source/auth time-block aggregates directly from persistence layer.
-func (p *DatabasePlugin) QueryMonitorKeyStatsBlocks(ctx context.Context, windowStartUnix, windowEndUnix int64, blockSeconds int) ([]MonitorKeyStatsRow, error) {
+func (p *DatabasePlugin) QueryMonitorKeyStatsBlocks(ctx context.Context, windowStartUnix, windowEndUnix int64, blockSeconds int, authIndex string) ([]MonitorKeyStatsRow, error) {
 	queryable, err := p.monitorQueryableStore()
 	if err != nil {
 		return nil, err
@@ -361,7 +361,7 @@ func (p *DatabasePlugin) QueryMonitorKeyStatsBlocks(ctx context.Context, windowS
 	if ctx == nil {
 		ctx = context.Background()
 	}
-	return queryable.QueryMonitorKeyStatsBlocks(ctx, windowStartUnix, windowEndUnix, blockSeconds)
+	return queryable.QueryMonitorKeyStatsBlocks(ctx, windowStartUnix, windowEndUnix, blockSeconds, authIndex)
 }
 
 func (s *mirrorUsageStore) QueryMonitorRequestLogs(ctx context.Context, filter MonitorQueryFilter, page, pageSize, recentLimit int) (MonitorRequestLogsResult, error) {
@@ -434,11 +434,11 @@ func (s *mirrorUsageStore) QueryMonitorHealthBlocks(ctx context.Context, windowS
 	return s.local.QueryMonitorHealthBlocks(ctx, windowStartUnix, windowEndUnix, blockSeconds)
 }
 
-func (s *mirrorUsageStore) QueryMonitorKeyStatsBlocks(ctx context.Context, windowStartUnix, windowEndUnix int64, blockSeconds int) ([]MonitorKeyStatsRow, error) {
+func (s *mirrorUsageStore) QueryMonitorKeyStatsBlocks(ctx context.Context, windowStartUnix, windowEndUnix int64, blockSeconds int, authIndex string) ([]MonitorKeyStatsRow, error) {
 	if s == nil || s.local == nil {
 		return nil, fmt.Errorf("usage store: mirror store not initialized")
 	}
-	return s.local.QueryMonitorKeyStatsBlocks(ctx, windowStartUnix, windowEndUnix, blockSeconds)
+	return s.local.QueryMonitorKeyStatsBlocks(ctx, windowStartUnix, windowEndUnix, blockSeconds, authIndex)
 }
 
 func (s *sqliteUsageStore) QueryMonitorRequestLogs(ctx context.Context, filter MonitorQueryFilter, page, pageSize, recentLimit int) (MonitorRequestLogsResult, error) {
@@ -1743,26 +1743,34 @@ func (s *sqliteUsageStore) QueryMonitorHealthBlocks(ctx context.Context, windowS
 	return items, nil
 }
 
-func (s *sqliteUsageStore) QueryMonitorKeyStatsBlocks(ctx context.Context, windowStartUnix, windowEndUnix int64, blockSeconds int) ([]MonitorKeyStatsRow, error) {
+func (s *sqliteUsageStore) QueryMonitorKeyStatsBlocks(ctx context.Context, windowStartUnix, windowEndUnix int64, blockSeconds int, authIndex string) ([]MonitorKeyStatsRow, error) {
 	if s == nil || s.db == nil {
 		return nil, fmt.Errorf("usage store: sqlite store not initialized")
 	}
 	if blockSeconds <= 0 {
 		blockSeconds = 600
 	}
+	authIndex = strings.TrimSpace(authIndex)
 
-	query := `
+	whereClause := "requested_at >= ? AND requested_at <= ?"
+	args := []any{windowStartUnix, blockSeconds, windowStartUnix, windowEndUnix}
+	if authIndex != "" {
+		whereClause += " AND COALESCE(NULLIF(auth_index, ''), 'unknown') = ?"
+		args = append(args, authIndex)
+	}
+
+	query := fmt.Sprintf(`
 		SELECT (requested_at - ?) / ? AS block_idx,
 			COALESCE(NULLIF(source, ''), 'unknown'),
 			COALESCE(NULLIF(auth_index, ''), 'unknown'),
 			COALESCE(SUM(CASE WHEN failed=0 THEN 1 ELSE 0 END), 0),
 			COALESCE(SUM(CASE WHEN failed=1 THEN 1 ELSE 0 END), 0)
 		FROM usage_records
-		WHERE requested_at >= ? AND requested_at <= ?
+		WHERE %s
 		GROUP BY block_idx, COALESCE(NULLIF(source, ''), 'unknown'), COALESCE(NULLIF(auth_index, ''), 'unknown')
-	`
+	`, whereClause)
 
-	rows, err := s.db.QueryContext(ctx, query, windowStartUnix, blockSeconds, windowStartUnix, windowEndUnix)
+	rows, err := s.db.QueryContext(ctx, query, args...)
 	if err != nil {
 		return nil, fmt.Errorf("usage store: query monitor key stats blocks: %w", err)
 	}

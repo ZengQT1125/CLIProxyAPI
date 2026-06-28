@@ -331,6 +331,74 @@ func TestGetMonitorRequestLogs_DatabasePluginPath(t *testing.T) {
 	}
 }
 
+func TestGetMonitorKeyStats_AuthIndexFilter(t *testing.T) {
+	gin.SetMode(gin.TestMode)
+
+	now := time.Now()
+	authA := testUsageRecord(now.Add(-10*time.Minute), "api-a", "model-a", "source-a", false)
+	authA.AuthIndex = "auth-a"
+	authAFail := testUsageRecord(now.Add(-9*time.Minute), "api-a", "model-a", "source-a", true)
+	authAFail.AuthIndex = "auth-a"
+	authB := testUsageRecord(now.Add(-8*time.Minute), "api-b", "model-b", "source-b", false)
+	authB.AuthIndex = "auth-b"
+
+	h := newMonitorTestHandler(authA, authAFail, authB)
+
+	rr := executeMonitorRequest(h.GetMonitorKeyStats, "/monitor/key-stats?auth_index=auth-a")
+	if rr.Code != http.StatusOK {
+		t.Fatalf("unexpected status: %d, body=%s", rr.Code, rr.Body.String())
+	}
+
+	var resp struct {
+		BySource map[string]struct {
+			Success int64 `json:"success"`
+			Failure int64 `json:"failure"`
+		} `json:"by_source"`
+		ByAuthIndex map[string]struct {
+			Success int64 `json:"success"`
+			Failure int64 `json:"failure"`
+			Blocks  []struct {
+				Success int64 `json:"success"`
+				Failure int64 `json:"failure"`
+			} `json:"blocks"`
+		} `json:"by_auth_index"`
+		BlockConfig struct {
+			Count int `json:"count"`
+		} `json:"block_config"`
+		Filter struct {
+			AuthIndex string `json:"auth_index"`
+		} `json:"filter"`
+	}
+	if err := json.Unmarshal(rr.Body.Bytes(), &resp); err != nil {
+		t.Fatalf("decode response failed: %v", err)
+	}
+
+	if len(resp.ByAuthIndex) != 1 {
+		t.Fatalf("unexpected auth index entries: %#v", resp.ByAuthIndex)
+	}
+	if got := resp.ByAuthIndex["auth-a"]; got.Success != 1 || got.Failure != 1 || len(got.Blocks) != 20 {
+		t.Fatalf("unexpected auth-a stats: %+v", got)
+	}
+	if _, ok := resp.ByAuthIndex["auth-b"]; ok {
+		t.Fatalf("unexpected auth-b stats in filtered response: %#v", resp.ByAuthIndex)
+	}
+	if len(resp.BySource) != 1 {
+		t.Fatalf("unexpected source entries: %#v", resp.BySource)
+	}
+	if got := resp.BySource["source-a"]; got.Success != 1 || got.Failure != 1 {
+		t.Fatalf("unexpected source-a stats: %+v", got)
+	}
+	if _, ok := resp.BySource["source-b"]; ok {
+		t.Fatalf("unexpected source-b stats in filtered response: %#v", resp.BySource)
+	}
+	if resp.BlockConfig.Count != 20 {
+		t.Fatalf("unexpected block count: got %d want 20", resp.BlockConfig.Count)
+	}
+	if resp.Filter.AuthIndex != "auth-a" {
+		t.Fatalf("unexpected filter auth index: got %q want auth-a", resp.Filter.AuthIndex)
+	}
+}
+
 func newMonitorTestHandler(records ...coreusage.Record) *Handler {
 	stats := usage.NewRequestStatistics()
 	for _, record := range records {

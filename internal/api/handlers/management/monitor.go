@@ -1892,6 +1892,7 @@ func (h *Handler) GetMonitorKeyStats(c *gin.Context) {
 
 	now := time.Now()
 	windowStart := now.Add(-windowDuration)
+	authIndexFilter := strings.TrimSpace(c.Query("auth_index"))
 
 	type blockStats struct {
 		Success int64 `json:"success"`
@@ -1917,10 +1918,13 @@ func (h *Handler) GetMonitorKeyStats(c *gin.Context) {
 	}
 
 	if dbPlugin := usage.GetDatabasePlugin(); dbPlugin != nil {
-		rows, queryErr := dbPlugin.QueryMonitorKeyStatsBlocks(c.Request.Context(), windowStart.Unix(), now.Unix(), int(blockDuration.Seconds()))
+		rows, queryErr := dbPlugin.QueryMonitorKeyStatsBlocks(c.Request.Context(), windowStart.Unix(), now.Unix(), int(blockDuration.Seconds()), authIndexFilter)
 		if queryErr == nil {
 			for _, row := range rows {
 				if row.BlockIndex < 0 || row.BlockIndex >= blockCount {
+					continue
+				}
+				if authIndexFilter != "" && row.AuthIndex != authIndexFilter {
 					continue
 				}
 				srcStats := ensureEntry(bySource, row.Source)
@@ -1948,16 +1952,19 @@ func (h *Handler) GetMonitorKeyStats(c *gin.Context) {
 			idx = blockCount - 1
 		}
 
+		authIdx := record.AuthIndex
+		if authIdx == "" {
+			authIdx = "unknown"
+		}
+		if authIndexFilter != "" && authIdx != authIndexFilter {
+			return
+		}
+
 		source := record.Source
 		if source == "" {
 			source = "unknown"
 		}
 		srcStats := ensureEntry(bySource, source)
-
-		authIdx := record.AuthIndex
-		if authIdx == "" {
-			authIdx = "unknown"
-		}
 		aiStats := ensureEntry(byAuthIndex, authIdx)
 
 		if record.Failed {
@@ -1983,7 +1990,7 @@ buildKeyStatsResponse:
 		authResp[k] = *v
 	}
 
-	c.JSON(http.StatusOK, gin.H{
+	response := gin.H{
 		"by_source":     sourceResp,
 		"by_auth_index": authResp,
 		"block_config": gin.H{
@@ -1991,7 +1998,12 @@ buildKeyStatsResponse:
 			"duration_ms":     blockDurationMs,
 			"window_start_ms": windowStart.UnixMilli(),
 		},
-	})
+	}
+	if authIndexFilter != "" {
+		response["filter"] = gin.H{"auth_index": authIndexFilter}
+	}
+
+	c.JSON(http.StatusOK, response)
 }
 
 // GetMonitorRequestDetails returns request-level details with method/path from the database.
