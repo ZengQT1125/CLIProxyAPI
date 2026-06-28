@@ -26,7 +26,7 @@ import (
 )
 
 const (
-	defaultManagementReleaseURL  = "https://api.github.com/repos/router-for-me/Cli-Proxy-API-Management-Center/releases/latest"
+	defaultManagementReleaseURL  = "https://api.github.com/repos/caidaoli/Cli-Proxy-API-Management-Center/releases/latest"
 	defaultManagementFallbackURL = "https://cpamc.router-for.me/"
 	managementAssetName          = "management.html"
 	httpUserAgent                = "CLIProxyAPI-management-updater"
@@ -136,7 +136,74 @@ type releaseAsset struct {
 }
 
 type releaseResponse struct {
-	Assets []releaseAsset `json:"assets"`
+	TagName string         `json:"tag_name"`
+	Name    string         `json:"name"`
+	Assets  []releaseAsset `json:"assets"`
+}
+
+// LatestRelease describes the latest management panel release.
+type LatestRelease struct {
+	Version string
+}
+
+// GetLatestRelease returns the latest management panel release metadata.
+func GetLatestRelease(ctx context.Context, proxyURL string, panelRepository string) (LatestRelease, error) {
+	if ctx == nil {
+		ctx = context.Background()
+	}
+
+	release, err := fetchLatestRelease(ctx, newHTTPClient(proxyURL), resolveReleaseURL(panelRepository))
+	if err != nil {
+		return LatestRelease{}, err
+	}
+
+	version := strings.TrimSpace(release.TagName)
+	if version == "" {
+		version = strings.TrimSpace(release.Name)
+	}
+	if version == "" {
+		return LatestRelease{}, fmt.Errorf("missing release version")
+	}
+
+	return LatestRelease{Version: version}, nil
+}
+
+// UpdateLatestManagementHTML downloads the latest management panel asset and writes it atomically.
+func UpdateLatestManagementHTML(ctx context.Context, staticDir string, proxyURL string, panelRepository string) (string, error) {
+	if ctx == nil {
+		ctx = context.Background()
+	}
+
+	staticDir = strings.TrimSpace(staticDir)
+	if staticDir == "" {
+		return "", fmt.Errorf("empty static directory")
+	}
+	if err := os.MkdirAll(staticDir, 0o755); err != nil {
+		return "", fmt.Errorf("prepare static directory: %w", err)
+	}
+
+	client := newHTTPClient(proxyURL)
+	releaseURL := resolveReleaseURL(panelRepository)
+	asset, remoteHash, err := fetchLatestAsset(ctx, client, releaseURL)
+	if err != nil {
+		return "", err
+	}
+
+	data, downloadedHash, err := downloadAsset(ctx, client, asset.BrowserDownloadURL)
+	if err != nil {
+		return "", err
+	}
+	if remoteHash != "" && !strings.EqualFold(remoteHash, downloadedHash) {
+		return "", fmt.Errorf("management asset digest mismatch: expected %s got %s", remoteHash, downloadedHash)
+	}
+
+	localPath := filepath.Join(staticDir, managementAssetName)
+	if err = atomicWriteFile(localPath, data); err != nil {
+		return "", fmt.Errorf("write management asset: %w", err)
+	}
+
+	log.Infof("management asset updated by manual request (hash=%s)", downloadedHash)
+	return downloadedHash, nil
 }
 
 // StaticDir resolves the directory that stores the management control panel asset.
@@ -323,6 +390,10 @@ func resolveReleaseURL(repo string) string {
 	host := strings.ToLower(parsed.Host)
 	parsed.Path = strings.TrimSuffix(parsed.Path, "/")
 
+	if strings.HasSuffix(strings.ToLower(parsed.Path), "/releases/latest") {
+		return parsed.String()
+	}
+
 	if host == "api.github.com" {
 		if !strings.HasSuffix(strings.ToLower(parsed.Path), "/releases/latest") {
 			parsed.Path = parsed.Path + "/releases/latest"
@@ -341,7 +412,7 @@ func resolveReleaseURL(repo string) string {
 	return defaultManagementReleaseURL
 }
 
-func fetchLatestAsset(ctx context.Context, client *http.Client, releaseURL string) (*releaseAsset, string, error) {
+func fetchLatestRelease(ctx context.Context, client *http.Client, releaseURL string) (releaseResponse, error) {
 	if strings.TrimSpace(releaseURL) == "" {
 		releaseURL = defaultManagementReleaseURL
 	}
@@ -357,12 +428,21 @@ func fetchLatestAsset(ctx context.Context, client *http.Client, releaseURL strin
 
 	data, err := httpfetch.GetBytes(ctx, client, releaseURL, headers, 0)
 	if err != nil {
-		return nil, "", fmt.Errorf("fetch release: %w", err)
+		return releaseResponse{}, fmt.Errorf("fetch release: %w", err)
 	}
 
 	var release releaseResponse
 	if err = json.Unmarshal(data, &release); err != nil {
-		return nil, "", fmt.Errorf("decode release response: %w", err)
+		return releaseResponse{}, fmt.Errorf("decode release response: %w", err)
+	}
+
+	return release, nil
+}
+
+func fetchLatestAsset(ctx context.Context, client *http.Client, releaseURL string) (*releaseAsset, string, error) {
+	release, err := fetchLatestRelease(ctx, client, releaseURL)
+	if err != nil {
+		return nil, "", err
 	}
 
 	for i := range release.Assets {
