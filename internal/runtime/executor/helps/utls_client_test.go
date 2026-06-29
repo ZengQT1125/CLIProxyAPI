@@ -20,6 +20,33 @@ func (f utlsClientRoundTripFunc) RoundTrip(req *http.Request) (*http.Response, e
 	return f(req)
 }
 
+func resetUtlsH2DegradeCacheForTest(t *testing.T, now func() time.Time) {
+	t.Helper()
+
+	utlsH2DegradeCache.mu.Lock()
+	oldStates := utlsH2DegradeCache.states
+	oldNow := utlsH2DegradeCache.now
+	utlsH2DegradeCache.states = make(map[string]utlsH2DegradeState)
+	utlsH2DegradeCache.now = now
+	utlsH2DegradeCache.mu.Unlock()
+
+	t.Cleanup(func() {
+		utlsH2DegradeCache.mu.Lock()
+		utlsH2DegradeCache.states = oldStates
+		utlsH2DegradeCache.now = oldNow
+		utlsH2DegradeCache.mu.Unlock()
+	})
+}
+
+func utlsTestResponse(req *http.Request) *http.Response {
+	return &http.Response{
+		StatusCode: http.StatusOK,
+		Header:     make(http.Header),
+		Body:       io.NopCloser(strings.NewReader("{}")),
+		Request:    req,
+	}
+}
+
 func TestFallbackRoundTripperProtectedHostFallsBackAfterTransportErrors(t *testing.T) {
 	for host := range utlsProtectedHosts {
 		t.Run(host, func(t *testing.T) {
@@ -398,5 +425,216 @@ func TestNewUtlsHTTPClientFallbackKeepsHTTP2Enabled(t *testing.T) {
 	}
 	if tr.TLSClientConfig != nil && strings.Join(tr.TLSClientConfig.NextProtos, ",") == "http/1.1" {
 		t.Fatalf("fallback NextProtos = %v, want HTTP/2 capable default transport", tr.TLSClientConfig.NextProtos)
+	}
+}
+
+func TestFallbackRoundTripperSkipsH2DuringDegradeWindowAcrossClients(t *testing.T) {
+	now := time.Date(2026, 6, 29, 12, 0, 0, 0, time.UTC)
+	resetUtlsH2DegradeCacheForTest(t, func() time.Time { return now })
+
+	scope := "test-direct"
+	var firstCalls []string
+	firstClient := &http.Client{Transport: &fallbackRoundTripper{
+		h2DegradeScope: scope,
+		utls: utlsClientRoundTripFunc(func(req *http.Request) (*http.Response, error) {
+			firstCalls = append(firstCalls, "utls-h2")
+			return nil, errors.New("h2 transport failed")
+		}),
+		protectedHTTP11: utlsClientRoundTripFunc(func(req *http.Request) (*http.Response, error) {
+			firstCalls = append(firstCalls, "utls-http1")
+			return utlsTestResponse(req), nil
+		}),
+	}}
+
+	resp, err := firstClient.Get("https://chatgpt.com/backend-api/codex/responses")
+	if err != nil {
+		t.Fatalf("first client.Get returned error: %v", err)
+	}
+	if errClose := resp.Body.Close(); errClose != nil {
+		t.Fatalf("first response body close returned error: %v", errClose)
+	}
+	if got, want := strings.Join(firstCalls, ","), "utls-h2,utls-http1"; got != want {
+		t.Fatalf("first calls = %s, want %s", got, want)
+	}
+
+	var secondCalls []string
+	secondClient := &http.Client{Transport: &fallbackRoundTripper{
+		h2DegradeScope: scope,
+		utls: utlsClientRoundTripFunc(func(req *http.Request) (*http.Response, error) {
+			secondCalls = append(secondCalls, "utls-h2")
+			return nil, errors.New("h2 should be skipped")
+		}),
+		protectedHTTP11: utlsClientRoundTripFunc(func(req *http.Request) (*http.Response, error) {
+			secondCalls = append(secondCalls, "utls-http1")
+			return utlsTestResponse(req), nil
+		}),
+	}}
+
+	resp, err = secondClient.Get("https://chatgpt.com/backend-api/codex/responses")
+	if err != nil {
+		t.Fatalf("second client.Get returned error: %v", err)
+	}
+	if errClose := resp.Body.Close(); errClose != nil {
+		t.Fatalf("second response body close returned error: %v", errClose)
+	}
+	if got, want := strings.Join(secondCalls, ","), "utls-http1"; got != want {
+		t.Fatalf("second calls = %s, want %s", got, want)
+	}
+}
+
+func TestFallbackRoundTripperReprobesH2AfterDegradeTTLAndBacksOff(t *testing.T) {
+	base := time.Date(2026, 6, 29, 12, 0, 0, 0, time.UTC)
+	now := base
+	resetUtlsH2DegradeCacheForTest(t, func() time.Time { return now })
+
+	var calls []string
+	client := &http.Client{Transport: &fallbackRoundTripper{
+		h2DegradeScope: "test-backoff",
+		utls: utlsClientRoundTripFunc(func(req *http.Request) (*http.Response, error) {
+			calls = append(calls, "utls-h2")
+			return nil, errors.New("h2 transport failed")
+		}),
+		protectedHTTP11: utlsClientRoundTripFunc(func(req *http.Request) (*http.Response, error) {
+			calls = append(calls, "utls-http1")
+			return utlsTestResponse(req), nil
+		}),
+	}}
+
+	doGet := func() {
+		t.Helper()
+		resp, err := client.Get("https://chatgpt.com/backend-api/codex/responses")
+		if err != nil {
+			t.Fatalf("client.Get returned error: %v", err)
+		}
+		if errClose := resp.Body.Close(); errClose != nil {
+			t.Fatalf("response body close returned error: %v", errClose)
+		}
+	}
+
+	doGet()
+	if got, want := strings.Join(calls, ","), "utls-h2,utls-http1"; got != want {
+		t.Fatalf("initial calls = %s, want %s", got, want)
+	}
+
+	calls = nil
+	now = base.Add(2*time.Minute - time.Nanosecond)
+	doGet()
+	if got, want := strings.Join(calls, ","), "utls-http1"; got != want {
+		t.Fatalf("calls before initial TTL expiry = %s, want %s", got, want)
+	}
+
+	calls = nil
+	probeTime := base.Add(2*time.Minute + time.Nanosecond)
+	now = probeTime
+	doGet()
+	if got, want := strings.Join(calls, ","), "utls-h2,utls-http1"; got != want {
+		t.Fatalf("calls after initial TTL expiry = %s, want %s", got, want)
+	}
+
+	calls = nil
+	now = probeTime.Add(4*time.Minute - time.Nanosecond)
+	doGet()
+	if got, want := strings.Join(calls, ","), "utls-http1"; got != want {
+		t.Fatalf("calls before second TTL expiry = %s, want %s", got, want)
+	}
+}
+
+func TestFallbackRoundTripperH2DegradeTTLCapsAtThirtyMinutes(t *testing.T) {
+	now := time.Date(2026, 6, 29, 12, 0, 0, 0, time.UTC)
+	resetUtlsH2DegradeCacheForTest(t, func() time.Time { return now })
+
+	h2Calls := 0
+	client := &http.Client{Transport: &fallbackRoundTripper{
+		h2DegradeScope: "test-cap",
+		utls: utlsClientRoundTripFunc(func(req *http.Request) (*http.Response, error) {
+			h2Calls++
+			return nil, errors.New("h2 transport failed")
+		}),
+		protectedHTTP11: utlsClientRoundTripFunc(func(req *http.Request) (*http.Response, error) {
+			return utlsTestResponse(req), nil
+		}),
+	}}
+
+	doGet := func() {
+		t.Helper()
+		resp, err := client.Get("https://chatgpt.com/backend-api/codex/responses")
+		if err != nil {
+			t.Fatalf("client.Get returned error: %v", err)
+		}
+		if errClose := resp.Body.Close(); errClose != nil {
+			t.Fatalf("response body close returned error: %v", errClose)
+		}
+	}
+
+	doGet()
+	for _, wait := range []time.Duration{2 * time.Minute, 4 * time.Minute, 8 * time.Minute, 16 * time.Minute} {
+		now = now.Add(wait + time.Nanosecond)
+		doGet()
+	}
+	if h2Calls != 5 {
+		t.Fatalf("h2 calls after probes = %d, want 5", h2Calls)
+	}
+
+	now = now.Add(31 * time.Minute)
+	doGet()
+	if h2Calls != 6 {
+		t.Fatalf("h2 calls after capped TTL expiry = %d, want 6", h2Calls)
+	}
+}
+
+func TestFallbackRoundTripperSkippedH2DoesNotRequireBodyReplay(t *testing.T) {
+	now := time.Date(2026, 6, 29, 12, 0, 0, 0, time.UTC)
+	resetUtlsH2DegradeCacheForTest(t, func() time.Time { return now })
+
+	scope := "test-body"
+	warmup := &http.Client{Transport: &fallbackRoundTripper{
+		h2DegradeScope: scope,
+		utls: utlsClientRoundTripFunc(func(req *http.Request) (*http.Response, error) {
+			return nil, errors.New("h2 transport failed")
+		}),
+		protectedHTTP11: utlsClientRoundTripFunc(func(req *http.Request) (*http.Response, error) {
+			return utlsTestResponse(req), nil
+		}),
+	}}
+	resp, err := warmup.Get("https://chatgpt.com/backend-api/codex/responses")
+	if err != nil {
+		t.Fatalf("warmup client.Get returned error: %v", err)
+	}
+	if errClose := resp.Body.Close(); errClose != nil {
+		t.Fatalf("warmup response body close returned error: %v", errClose)
+	}
+
+	body := io.NopCloser(strings.NewReader(`{"input":"hello"}`))
+	req, errReq := http.NewRequest(http.MethodPost, "https://chatgpt.com/backend-api/codex/responses", body)
+	if errReq != nil {
+		t.Fatalf("NewRequest returned error: %v", errReq)
+	}
+	if req.GetBody != nil {
+		t.Fatal("test request unexpectedly has GetBody")
+	}
+
+	client := &http.Client{Transport: &fallbackRoundTripper{
+		h2DegradeScope: scope,
+		utls: utlsClientRoundTripFunc(func(req *http.Request) (*http.Response, error) {
+			return nil, errors.New("h2 should be skipped")
+		}),
+		protectedHTTP11: utlsClientRoundTripFunc(func(req *http.Request) (*http.Response, error) {
+			got, errRead := io.ReadAll(req.Body)
+			if errRead != nil {
+				t.Fatalf("ReadAll returned error: %v", errRead)
+			}
+			if string(got) != `{"input":"hello"}` {
+				t.Fatalf("body = %q, want original payload", got)
+			}
+			return utlsTestResponse(req), nil
+		}),
+	}}
+
+	resp, err = client.Do(req)
+	if err != nil {
+		t.Fatalf("client.Do returned error: %v", err)
+	}
+	if errClose := resp.Body.Close(); errClose != nil {
+		t.Fatalf("response body close returned error: %v", errClose)
 	}
 }

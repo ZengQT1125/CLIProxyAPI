@@ -147,6 +147,8 @@ Modified:
 - `internal/runtime/executor/helps/utls_client.go`（+`_test.go`）— **fork** uTLS protected host 自动降级：`uTLS HTTP/2 -> uTLS HTTP/1.1 -> standard HTTP/1.1`；只在没有拿到 HTTP response 的 transport error 时降级，任何 HTTP status（含 401/403/429/5xx）都直接返回；POST 降级必须通过 `GetBody` 重放请求体。
   - 合并保护：不要恢复 `CLIPROXY_CODEX_TRANSPORT` / `codexTransportMode` 手动开关。
   - 合并保护：不要重新套用上游/PR #4012 的“所有 fallback upstream 强制 HTTP/1.1”。普通非 protected host 必须保留默认 HTTP/2 能力；只有 protected host 的第三段 `protectedFallbackHTTP11` 使用 standard HTTP/1.1。
+  - **fork** h2 降级内存缓存（`utlsH2DegradeCache`）：protected host 的 h2 发生 response-less transport error 后，按 `scope+host`（scope=`direct`/`proxy:<redacted>` 脱敏）进程内标记跳过 h2，初始 2m、指数退避封顶 30m；h2 拿到任何 `*http.Response`（含 4xx/5xx）立即重置；scope 为空（注入式 ctx transport）或非 protected host 不进缓存。无后台 goroutine、无持久化、无配置开关。
+  - 合并保护：`roundTripProtected` 用 `sentAttempts`（实际发送数）而非循环下标传给 `requestForProtectedAttempt`——跳过 h2 时 HTTP/1.1 为首次发送、无需 `GetBody`，合并时不要回退成下标。
 - `sdk/api/handlers/handlers.go`（+`handlers_request_details_test.go`）— Codex chat completions 暴露 cached tokens；mixed search/function tool calls 路由到兼容 provider
 
 ### 6. Utility Additions

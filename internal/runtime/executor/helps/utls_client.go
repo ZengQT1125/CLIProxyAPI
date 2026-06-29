@@ -262,6 +262,82 @@ var utlsProtectedHosts = map[string]struct{}{
 	"chatgpt.com":       {},
 }
 
+// utlsH2DegradeInitialTTL is the first window during which h2 is skipped after a
+// transport error; utlsH2DegradeMaxTTL caps the exponential backoff between
+// reprobes so h2 is retried at least every 30 minutes.
+const (
+	utlsH2DegradeInitialTTL = 2 * time.Minute
+	utlsH2DegradeMaxTTL     = 30 * time.Minute
+)
+
+// utlsH2DegradeState records how long h2 stays skipped for one cache key plus
+// the TTL used last time, so the next failure can back off exponentially.
+type utlsH2DegradeState struct {
+	until time.Time
+	ttl   time.Duration
+}
+
+// utlsH2DegradeCacheStore is a process-wide cache of protected hosts whose h2
+// transport is currently failing. NewUtlsHTTPClient builds a fresh client per
+// upstream request, so this state must live outside the client to let later
+// requests skip the known-bad h2 path. State is memory only and never persisted.
+type utlsH2DegradeCacheStore struct {
+	mu     sync.Mutex
+	states map[string]utlsH2DegradeState
+	now    func() time.Time
+}
+
+var utlsH2DegradeCache = &utlsH2DegradeCacheStore{
+	states: make(map[string]utlsH2DegradeState),
+	now:    time.Now,
+}
+
+// shouldSkip reports whether h2 is still within an active degrade window for key.
+func (c *utlsH2DegradeCacheStore) shouldSkip(key string) bool {
+	if c == nil || key == "" {
+		return false
+	}
+	now := c.now()
+
+	c.mu.Lock()
+	defer c.mu.Unlock()
+
+	state, ok := c.states[key]
+	return ok && now.Before(state.until)
+}
+
+// recordFailure opens or extends the degrade window for key, doubling the TTL up
+// to utlsH2DegradeMaxTTL on repeated failures.
+func (c *utlsH2DegradeCacheStore) recordFailure(key string) {
+	if c == nil || key == "" {
+		return
+	}
+	now := c.now()
+
+	c.mu.Lock()
+	defer c.mu.Unlock()
+
+	ttl := utlsH2DegradeInitialTTL
+	if state, ok := c.states[key]; ok && state.ttl > 0 {
+		ttl = min(state.ttl*2, utlsH2DegradeMaxTTL)
+	}
+	c.states[key] = utlsH2DegradeState{
+		until: now.Add(ttl),
+		ttl:   ttl,
+	}
+}
+
+// recordSuccess clears any degrade window for key after h2 returns a response.
+func (c *utlsH2DegradeCacheStore) recordSuccess(key string) {
+	if c == nil || key == "" {
+		return
+	}
+
+	c.mu.Lock()
+	delete(c.states, key)
+	c.mu.Unlock()
+}
+
 // fallbackRoundTripper uses utls for protected HTTPS hosts and falls back to
 // standard transport for all other requests.
 type fallbackRoundTripper struct {
@@ -269,6 +345,35 @@ type fallbackRoundTripper struct {
 	protectedHTTP11         http.RoundTripper
 	protectedFallbackHTTP11 http.RoundTripper
 	fallback                http.RoundTripper
+	h2DegradeScope          string
+}
+
+// utlsH2DegradeScope returns the cache scope for h2 degrade state. Direct and
+// proxied outbound paths get distinct scopes; the proxy endpoint is redacted so
+// credentials never enter cache keys. An injected context RoundTripper is a
+// custom transport and must not poison global h2 protocol state, so it gets an
+// empty scope that disables the cache.
+func utlsH2DegradeScope(proxyURL string, hasInjectedRoundTripper bool) string {
+	if proxyURL != "" {
+		return "proxy:" + proxyutil.Redact(proxyURL)
+	}
+	if hasInjectedRoundTripper {
+		return ""
+	}
+	return "direct"
+}
+
+// h2DegradeKey combines the transport scope with the request hostname. An empty
+// scope yields an empty key, which disables the degrade cache for this client.
+func (f *fallbackRoundTripper) h2DegradeKey(hostname string) string {
+	if f == nil || f.h2DegradeScope == "" {
+		return ""
+	}
+	hostname = strings.ToLower(strings.TrimSpace(hostname))
+	if hostname == "" {
+		return ""
+	}
+	return f.h2DegradeScope + "\x00" + hostname
 }
 
 func (f *fallbackRoundTripper) RoundTrip(req *http.Request) (*http.Response, error) {
@@ -282,17 +387,46 @@ func (f *fallbackRoundTripper) RoundTrip(req *http.Request) (*http.Response, err
 }
 
 func (f *fallbackRoundTripper) roundTripProtected(req *http.Request) (*http.Response, error) {
-	transports := []http.RoundTripper{f.utls, f.protectedHTTP11, f.protectedFallbackHTTP11}
+	h2Key := f.h2DegradeKey(req.URL.Hostname())
+	transports := []struct {
+		transport http.RoundTripper
+		h2        bool
+	}{
+		{transport: f.utls, h2: true},
+		{transport: f.protectedHTTP11},
+		{transport: f.protectedFallbackHTTP11},
+	}
+
 	var lastErr error
-	for attempt, transport := range transports {
-		if transport == nil {
+	// sentAttempts counts transports actually invoked, not the loop index, so a
+	// skipped h2 leaves HTTP/1.1 as the first real send and avoids needing GetBody.
+	sentAttempts := 0
+	for _, candidate := range transports {
+		if candidate.transport == nil {
 			continue
 		}
-		attemptReq, errReq := requestForProtectedAttempt(req, attempt)
+		if candidate.h2 && utlsH2DegradeCache.shouldSkip(h2Key) {
+			continue
+		}
+
+		attemptReq, errReq := requestForProtectedAttempt(req, sentAttempts)
 		if errReq != nil {
 			return nil, errReq
 		}
-		resp, err := transport.RoundTrip(attemptReq)
+		resp, err := candidate.transport.RoundTrip(attemptReq)
+		sentAttempts++
+
+		if candidate.h2 {
+			// A non-nil response means the h2 transport works regardless of HTTP
+			// status, so clear the degrade window. Only a response-less transport
+			// error degrades h2.
+			if resp != nil {
+				utlsH2DegradeCache.recordSuccess(h2Key)
+			} else if err != nil {
+				utlsH2DegradeCache.recordFailure(h2Key)
+			}
+		}
+
 		if resp != nil {
 			return resp, err
 		}
@@ -376,6 +510,7 @@ func NewUtlsHTTPClient(ctx context.Context, cfg *config.Config, auth *cliproxyau
 		standardTransport = ctxRoundTripper
 	}
 	protectedFallbackHTTP11Transport := standardHTTP11Transport(standardTransport)
+	h2DegradeScope := utlsH2DegradeScope(proxyURL, ctxRoundTripper != nil)
 
 	client := &http.Client{
 		Transport: &fallbackRoundTripper{
@@ -383,6 +518,7 @@ func NewUtlsHTTPClient(ctx context.Context, cfg *config.Config, auth *cliproxyau
 			protectedHTTP11:         protectedHTTP11Transport,
 			protectedFallbackHTTP11: protectedFallbackHTTP11Transport,
 			fallback:                standardTransport,
+			h2DegradeScope:          h2DegradeScope,
 		},
 	}
 	if timeout > 0 {
