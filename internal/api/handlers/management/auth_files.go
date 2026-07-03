@@ -15,6 +15,7 @@ import (
 	"net/http"
 	"os"
 	"path/filepath"
+	"regexp"
 	"runtime"
 	"sort"
 	"strconv"
@@ -67,6 +68,22 @@ var (
 	errAuthFileNotFound   = errors.New("auth file not found")
 	errPluginVirtualAuth  = errors.New("plugin virtual auth cannot be modified directly; edit or delete the source auth file")
 	newCodexOAuthService  = func(cfg *config.Config) codexOAuthService { return codex.NewCodexAuth(cfg) }
+)
+
+var (
+	authFileEmailNamePrefixes = []string{
+		"antigravity-",
+		"gemini-cli-",
+		"claude-",
+		"codex-",
+		"gemini-",
+		"iflow-",
+		"kimi-",
+		"qwen-",
+		"vertex-",
+		"xai-",
+	}
+	authFileEmailNamePattern = regexp.MustCompile(`(?i)(?:^|[-_])([a-z0-9._%+\-]+@[a-z0-9](?:[a-z0-9-]*[a-z0-9])?(?:\.[a-z0-9](?:[a-z0-9-]*[a-z0-9])?)*\.[a-z]{2,})(?:[-_+]|$)`)
 )
 
 func extractLastRefreshTimestamp(meta map[string]any) (time.Time, bool) {
@@ -1025,6 +1042,7 @@ func (h *Handler) writeAuthFile(ctx context.Context, name string, data []byte) e
 			dst = abs
 		}
 	}
+	data = fillMissingAuthEmailFromFileName(name, data)
 	auth, err := h.buildAuthFromFileData(dst, data)
 	if err != nil {
 		return err
@@ -1036,6 +1054,46 @@ func (h *Handler) writeAuthFile(ctx context.Context, name string, data []byte) e
 		return err
 	}
 	return nil
+}
+
+func fillMissingAuthEmailFromFileName(name string, data []byte) []byte {
+	var metadata map[string]any
+	if err := json.Unmarshal(data, &metadata); err != nil || metadata == nil {
+		return data
+	}
+	if email, ok := metadata["email"].(string); ok && strings.TrimSpace(email) != "" {
+		return data
+	}
+	email := authEmailFromFileName(name)
+	if email == "" {
+		return data
+	}
+	metadata["email"] = email
+	normalized, err := json.Marshal(metadata)
+	if err != nil {
+		return data
+	}
+	return normalized
+}
+
+func authEmailFromFileName(name string) string {
+	base := filepath.Base(strings.TrimSpace(name))
+	base = strings.TrimSuffix(base, filepath.Ext(base))
+	if base == "" {
+		return ""
+	}
+	lowerBase := strings.ToLower(base)
+	for _, prefix := range authFileEmailNamePrefixes {
+		if strings.HasPrefix(lowerBase, prefix) {
+			base = base[len(prefix):]
+			break
+		}
+	}
+	matches := authFileEmailNamePattern.FindStringSubmatch(base)
+	if len(matches) < 2 {
+		return ""
+	}
+	return matches[1]
 }
 
 func requestedAuthFileNamesForDelete(c *gin.Context) ([]string, error) {
