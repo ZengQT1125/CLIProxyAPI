@@ -2,11 +2,18 @@ package management
 
 import (
 	"context"
+	"crypto/tls"
+	"fmt"
+	"net"
 	"net/http"
+	"net/http/httptest"
 	"os"
 	"path/filepath"
+	"sync/atomic"
 	"testing"
+	"time"
 
+	"github.com/gin-gonic/gin"
 	"github.com/router-for-me/CLIProxyAPI/v7/internal/config"
 	coreauth "github.com/router-for-me/CLIProxyAPI/v7/sdk/cliproxy/auth"
 	sdkconfig "github.com/router-for-me/CLIProxyAPI/v7/sdk/config"
@@ -66,6 +73,192 @@ func TestRemoveCodexAuthRemovesRuntimeAuth(t *testing.T) {
 	}
 	if _, ok := manager.GetByID(auth.ID); ok {
 		t.Fatalf("expected runtime auth %q to be removed", auth.ID)
+	}
+}
+
+func TestCleanupCodexAuthDeletesClientErrorsOnly(t *testing.T) {
+	cases := []struct {
+		name       string
+		statusCode int
+		body       string
+		wantDelete bool
+	}{
+		{
+			name:       "deactivated_workspace",
+			statusCode: http.StatusPaymentRequired,
+			body:       `{"detail":{"code":"deactivated_workspace"}}`,
+			wantDelete: true,
+		},
+		{
+			name:       "server_error",
+			statusCode: http.StatusInternalServerError,
+			body:       `{"error":"temporary upstream failure"}`,
+			wantDelete: false,
+		},
+	}
+
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			authDir := t.TempDir()
+			fileName := tc.name + ".json"
+			filePath := filepath.Join(authDir, fileName)
+			if err := os.WriteFile(filePath, []byte(`{"type":"codex"}`), 0o600); err != nil {
+				t.Fatalf("write auth file: %v", err)
+			}
+
+			var verifyRequests atomic.Int32
+			verifyServer := httptest.NewTLSServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				verifyRequests.Add(1)
+				if got := r.URL.Path; got != "/backend-api/wham/usage" {
+					t.Errorf("verify path = %q, want /backend-api/wham/usage", got)
+				}
+				if got := r.Header.Get("Authorization"); got != "Bearer codex-token" {
+					t.Errorf("authorization header = %q, want Bearer codex-token", got)
+				}
+				w.Header().Set("Content-Type", "application/json")
+				w.WriteHeader(tc.statusCode)
+				_, _ = w.Write([]byte(tc.body))
+			}))
+			defer verifyServer.Close()
+
+			oldTransport := http.DefaultTransport
+			http.DefaultTransport = &http.Transport{
+				DialContext: func(ctx context.Context, network, _ string) (net.Conn, error) {
+					var dialer net.Dialer
+					return dialer.DialContext(ctx, network, verifyServer.Listener.Addr().String())
+				},
+				TLSClientConfig: &tls.Config{InsecureSkipVerify: true},
+			}
+			t.Cleanup(func() {
+				http.DefaultTransport = oldTransport
+			})
+
+			manager := coreauth.NewManager(nil, nil, nil)
+			auth := &coreauth.Auth{
+				ID:       "cleanup-" + tc.name,
+				FileName: fileName,
+				Provider: "codex",
+				Status:   coreauth.StatusActive,
+				Attributes: map[string]string{
+					"path": filePath,
+				},
+				Metadata: map[string]any{
+					"access_token": "codex-token",
+				},
+			}
+			if _, err := manager.Register(context.Background(), auth); err != nil {
+				t.Fatalf("register auth: %v", err)
+			}
+
+			h := NewHandlerWithoutConfigFilePath(&config.Config{AuthDir: authDir}, manager)
+			h.tokenStore = &memoryAuthStore{}
+
+			gin.SetMode(gin.TestMode)
+			recorder := httptest.NewRecorder()
+			c, _ := gin.CreateTestContext(recorder)
+			c.Request = httptest.NewRequest(http.MethodPost, "/v0/management/api-tools/codex/cleanup", nil)
+
+			h.CleanupCodexAuth(c)
+
+			if recorder.Code != http.StatusOK {
+				t.Fatalf("cleanup status = %d, want %d; body=%s", recorder.Code, http.StatusOK, recorder.Body.String())
+			}
+			if got := verifyRequests.Load(); got != 1 {
+				t.Fatalf("verify requests = %d, want 1", got)
+			}
+			_, statErr := os.Stat(filePath)
+			_, stillRegistered := manager.GetByID(auth.ID)
+			if tc.wantDelete {
+				if !os.IsNotExist(statErr) {
+					t.Fatalf("expected 4xx auth file to be removed, stat err: %v", statErr)
+				}
+				if stillRegistered {
+					t.Fatalf("expected runtime auth %q to be removed", auth.ID)
+				}
+			} else {
+				if statErr != nil {
+					t.Fatalf("expected 5xx auth file to remain, stat err: %v", statErr)
+				}
+				if !stillRegistered {
+					t.Fatalf("expected runtime auth %q to remain", auth.ID)
+				}
+			}
+		})
+	}
+}
+
+func TestCleanupCodexAuthVerifiesCredentialsConcurrently(t *testing.T) {
+	const authCount = 4
+
+	authDir := t.TempDir()
+	manager := coreauth.NewManager(nil, nil, nil)
+	for i := 0; i < authCount; i++ {
+		fileName := fmt.Sprintf("concurrent-%d.json", i)
+		filePath := filepath.Join(authDir, fileName)
+		if err := os.WriteFile(filePath, []byte(`{"type":"codex"}`), 0o600); err != nil {
+			t.Fatalf("write auth file %d: %v", i, err)
+		}
+		auth := &coreauth.Auth{
+			ID:       fmt.Sprintf("cleanup-concurrent-%d", i),
+			FileName: fileName,
+			Provider: "codex",
+			Status:   coreauth.StatusActive,
+			Attributes: map[string]string{
+				"path": filePath,
+			},
+			Metadata: map[string]any{
+				"access_token": fmt.Sprintf("codex-token-%d", i),
+			},
+		}
+		if _, err := manager.Register(context.Background(), auth); err != nil {
+			t.Fatalf("register auth %d: %v", i, err)
+		}
+	}
+
+	var inFlight atomic.Int32
+	var maxInFlight atomic.Int32
+	verifyServer := httptest.NewTLSServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		current := inFlight.Add(1)
+		for {
+			previous := maxInFlight.Load()
+			if current <= previous || maxInFlight.CompareAndSwap(previous, current) {
+				break
+			}
+		}
+		time.Sleep(100 * time.Millisecond)
+		inFlight.Add(-1)
+		w.WriteHeader(http.StatusOK)
+		_, _ = w.Write([]byte(`{}`))
+	}))
+	defer verifyServer.Close()
+
+	oldTransport := http.DefaultTransport
+	http.DefaultTransport = &http.Transport{
+		DialContext: func(ctx context.Context, network, _ string) (net.Conn, error) {
+			var dialer net.Dialer
+			return dialer.DialContext(ctx, network, verifyServer.Listener.Addr().String())
+		},
+		TLSClientConfig: &tls.Config{InsecureSkipVerify: true},
+	}
+	t.Cleanup(func() {
+		http.DefaultTransport = oldTransport
+	})
+
+	h := NewHandlerWithoutConfigFilePath(&config.Config{AuthDir: authDir}, manager)
+	h.tokenStore = &memoryAuthStore{}
+
+	gin.SetMode(gin.TestMode)
+	recorder := httptest.NewRecorder()
+	c, _ := gin.CreateTestContext(recorder)
+	c.Request = httptest.NewRequest(http.MethodPost, "/v0/management/api-tools/codex/cleanup", nil)
+
+	h.CleanupCodexAuth(c)
+
+	if recorder.Code != http.StatusOK {
+		t.Fatalf("cleanup status = %d, want %d; body=%s", recorder.Code, http.StatusOK, recorder.Body.String())
+	}
+	if got := maxInFlight.Load(); got < 2 {
+		t.Fatalf("max concurrent verify requests = %d, want at least 2", got)
 	}
 }
 

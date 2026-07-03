@@ -10,6 +10,7 @@ import (
 	"os"
 	"path/filepath"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/gin-gonic/gin"
@@ -639,6 +640,8 @@ const (
 	codexVerifyUserAgent = "codex_cli_rs/0.76.0 (Debian 13.0.0; x86_64) WindowsTerminal"
 )
 
+const codexCleanupMaxConcurrency = 8
+
 // CleanupCodexAuth verifies all codex credentials and removes invalid ones.
 //
 // Endpoint:
@@ -646,8 +649,9 @@ const (
 //	POST /v0/management/custom/codex-cleanup
 //
 // For each codex credential, sends a GET request to chatgpt.com to verify token
-// validity. If the upstream returns 401, the credential file is deleted and the
-// auth record is disabled.
+// validity. If the upstream returns a 4xx client error, the credential file is
+// deleted and the auth record is disabled. 5xx responses and request errors are
+// treated as transient upstream failures and keep the credential.
 //
 // Response: NDJSON stream (application/x-ndjson), one JSON object per line:
 //
@@ -697,67 +701,146 @@ func (h *Handler) CleanupCodexAuth(c *gin.Context) {
 	writeEvent(gin.H{"type": "start", "total": total})
 
 	deleted := 0
-	for i, auth := range codexAuths {
-		name := strings.TrimSpace(auth.FileName)
-		if name == "" {
-			name = auth.ID
-		}
-
-		ev := gin.H{
-			"type":       "progress",
-			"index":      i + 1,
-			"total":      total,
-			"name":       name,
-			"auth_index": auth.Index,
-		}
-
-		// Resolve access token.
-		token, tokenErr := h.resolveTokenForAuth(ctx, auth)
-		if tokenErr != nil || token == "" {
-			errMsg := "token not available"
-			if tokenErr != nil {
-				errMsg = tokenErr.Error()
-			}
-			log.Warnf("[codex-cleanup] %s: token resolve failed: %s", name, errMsg)
-			ev["error"] = errMsg
+	for result := range h.verifyCodexAuthsForCleanup(ctx, codexAuths) {
+		ev := result.event
+		if result.verifyErr != nil {
 			writeEvent(ev)
 			continue
 		}
 
-		// Extract chatgpt_account_id from ID token claims.
-		accountID := extractCodexAccountID(auth)
-
-		// Verify token.
-		statusCode, verifyErr := h.verifyCodexToken(ctx, auth, token, accountID)
-		ev["status_code"] = statusCode
-		if verifyErr != nil {
-			log.Warnf("[codex-cleanup] %s: verify request failed: %v", name, verifyErr)
-			ev["error"] = verifyErr.Error()
-			writeEvent(ev)
-			continue
-		}
-
-		// Delete invalid credentials.
-		if statusCode == http.StatusUnauthorized {
-			log.Infof("[codex-cleanup] %s: token invalid (401), removing", name)
-			if delErr := h.removeCodexAuth(ctx, auth); delErr != nil {
-				log.Errorf("[codex-cleanup] %s: delete failed: %v", name, delErr)
+		if result.shouldDelete {
+			log.Infof("[codex-cleanup] %s: token invalid (status %d), removing", result.name, result.statusCode)
+			if delErr := h.removeCodexAuth(ctx, result.auth); delErr != nil {
+				log.Errorf("[codex-cleanup] %s: delete failed: %v", result.name, delErr)
 				ev["deleted"] = false
 				ev["error"] = delErr.Error()
 			} else {
-				log.Infof("[codex-cleanup] %s: deleted successfully", name)
+				log.Infof("[codex-cleanup] %s: deleted successfully", result.name)
 				ev["deleted"] = true
 				deleted++
 			}
 		} else {
 			ev["deleted"] = false
-			log.Debugf("[codex-cleanup] %s: valid (status %d)", name, statusCode)
+			if result.statusCode >= http.StatusInternalServerError {
+				log.Warnf("[codex-cleanup] %s: verify returned status %d, keeping credential", result.name, result.statusCode)
+			} else {
+				log.Debugf("[codex-cleanup] %s: valid (status %d)", result.name, result.statusCode)
+			}
 		}
 		writeEvent(ev)
 	}
 
 	writeEvent(gin.H{"type": "done", "total": total, "deleted": deleted})
 	log.Infof("[codex-cleanup] finished: checked %d, deleted %d", total, deleted)
+}
+
+type codexCleanupJob struct {
+	index int
+	total int
+	auth  *coreauth.Auth
+	name  string
+}
+
+type codexCleanupVerifyResult struct {
+	auth         *coreauth.Auth
+	name         string
+	statusCode   int
+	shouldDelete bool
+	verifyErr    error
+	event        gin.H
+}
+
+func (h *Handler) verifyCodexAuthsForCleanup(ctx context.Context, auths []*coreauth.Auth) <-chan codexCleanupVerifyResult {
+	results := make(chan codexCleanupVerifyResult, len(auths))
+	total := len(auths)
+	if total == 0 {
+		close(results)
+		return results
+	}
+
+	workers := codexCleanupWorkerCount(total)
+	jobs := make(chan codexCleanupJob)
+	var wg sync.WaitGroup
+	wg.Add(workers)
+	for i := 0; i < workers; i++ {
+		go func() {
+			defer wg.Done()
+			for job := range jobs {
+				results <- h.verifyCodexAuthForCleanup(ctx, job)
+			}
+		}()
+	}
+
+	go func() {
+		for i, auth := range auths {
+			name := strings.TrimSpace(auth.FileName)
+			if name == "" {
+				name = auth.ID
+			}
+			jobs <- codexCleanupJob{
+				index: i + 1,
+				total: total,
+				auth:  auth,
+				name:  name,
+			}
+		}
+		close(jobs)
+		wg.Wait()
+		close(results)
+	}()
+
+	return results
+}
+
+func codexCleanupWorkerCount(total int) int {
+	if total <= 0 {
+		return 0
+	}
+	if total < codexCleanupMaxConcurrency {
+		return total
+	}
+	return codexCleanupMaxConcurrency
+}
+
+func (h *Handler) verifyCodexAuthForCleanup(ctx context.Context, job codexCleanupJob) codexCleanupVerifyResult {
+	ev := gin.H{
+		"type":       "progress",
+		"index":      job.index,
+		"total":      job.total,
+		"name":       job.name,
+		"auth_index": job.auth.Index,
+	}
+	result := codexCleanupVerifyResult{
+		auth:  job.auth,
+		name:  job.name,
+		event: ev,
+	}
+
+	token, tokenErr := h.resolveTokenForAuth(ctx, job.auth)
+	if tokenErr != nil || token == "" {
+		errMsg := "token not available"
+		if tokenErr != nil {
+			errMsg = tokenErr.Error()
+		}
+		log.Warnf("[codex-cleanup] %s: token resolve failed: %s", job.name, errMsg)
+		ev["error"] = errMsg
+		result.verifyErr = fmt.Errorf("%s", errMsg)
+		return result
+	}
+
+	accountID := extractCodexAccountID(job.auth)
+	statusCode, verifyErr := h.verifyCodexToken(ctx, job.auth, token, accountID)
+	ev["status_code"] = statusCode
+	result.statusCode = statusCode
+	if verifyErr != nil {
+		log.Warnf("[codex-cleanup] %s: verify request failed: %v", job.name, verifyErr)
+		ev["error"] = verifyErr.Error()
+		result.verifyErr = verifyErr
+		return result
+	}
+
+	result.shouldDelete = statusCode >= http.StatusBadRequest && statusCode < http.StatusInternalServerError
+	return result
 }
 
 func (h *Handler) verifyCodexToken(ctx context.Context, auth *coreauth.Auth, token, accountID string) (int, error) {
@@ -781,7 +864,7 @@ func (h *Handler) verifyCodexToken(ctx context.Context, auth *coreauth.Auth, tok
 		return 0, fmt.Errorf("request failed: %w", err)
 	}
 	defer func() { _ = resp.Body.Close() }()
-	// Drain body so the connection can be reused.
+
 	_, _ = io.Copy(io.Discard, resp.Body)
 
 	return resp.StatusCode, nil
