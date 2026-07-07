@@ -291,6 +291,9 @@ type CodexHeaderDefaults struct {
 // CodexConfig configures provider-wide Codex request behavior.
 type CodexConfig struct {
 	IdentityConfuse bool `yaml:"identity-confuse" json:"identity-confuse"`
+	// StripIntermediaryUpdates removes Codex Desktop local progress-update instructions
+	// from upstream Codex request instructions when explicitly enabled.
+	StripIntermediaryUpdates bool `yaml:"strip-intermediary-updates" json:"strip-intermediary-updates"`
 }
 
 // TLSConfig holds HTTPS server settings.

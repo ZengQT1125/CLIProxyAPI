@@ -203,6 +203,8 @@ codex:
   # Some superstitious users believe request tracking identifiers can be used
   # as evidence for TOS enforcement bans; this option only satisfies those odd concerns.
   identity-confuse: false
+  # When true, strip Codex Desktop local intermediary-update instructions before forwarding upstream.
+  strip-intermediary-updates: false
 
 # When true, enable authentication for the WebSocket API (/v1/ws).
 ws-auth: true
