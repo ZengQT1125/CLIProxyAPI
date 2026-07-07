@@ -167,8 +167,8 @@ func (e *modelExecutionCaptureExecutor) captured() (coreexecutor.Request, coreex
 	return e.lastRequest, e.lastOptions
 }
 
-func newModelExecutionHandler(t *testing.T, model string, executor *modelExecutionCaptureExecutor, cfg *sdkconfig.SDKConfig) *BaseAPIHandler {
-	t.Helper()
+func newModelExecutionHandler(tb testing.TB, model string, executor *modelExecutionCaptureExecutor, cfg *sdkconfig.SDKConfig) *BaseAPIHandler {
+	tb.Helper()
 	manager := coreauth.NewManager(nil, nil, nil)
 	manager.RegisterExecutor(executor)
 	auth := &coreauth.Auth{
@@ -178,13 +178,54 @@ func newModelExecutionHandler(t *testing.T, model string, executor *modelExecuti
 		Metadata: map[string]any{"email": model + "@example.com"},
 	}
 	if _, errRegister := manager.Register(context.Background(), auth); errRegister != nil {
-		t.Fatalf("manager.Register(): %v", errRegister)
+		tb.Fatalf("manager.Register(): %v", errRegister)
 	}
 	registry.GetGlobalRegistry().RegisterClient(auth.ID, auth.Provider, []*registry.ModelInfo{{ID: model}})
-	t.Cleanup(func() {
+	tb.Cleanup(func() {
 		registry.GetGlobalRegistry().UnregisterClient(auth.ID)
 	})
 	return NewBaseAPIHandlers(cfg, manager)
+}
+
+func BenchmarkExecuteStreamWithAuthManagerForwardNoInterceptors(b *testing.B) {
+	model := "model-execution-stream-benchmark"
+	requestBody := []byte(fmt.Sprintf(`{"model":%q,"stream":true}`, model))
+	payload := []byte(strings.Repeat("x", 4096))
+	executor := &modelExecutionCaptureExecutor{
+		stream: func(ctx context.Context, auth *coreauth.Auth, req coreexecutor.Request, opts coreexecutor.Options) (*coreexecutor.StreamResult, error) {
+			chunks := make(chan coreexecutor.StreamChunk, 1)
+			chunks <- coreexecutor.StreamChunk{Payload: payload}
+			close(chunks)
+			return &coreexecutor.StreamResult{Chunks: chunks}, nil
+		},
+	}
+	handler := newModelExecutionHandler(b, model, executor, &sdkconfig.SDKConfig{})
+
+	b.ReportAllocs()
+	b.ResetTimer()
+	for i := 0; i < b.N; i++ {
+		dataChan, _, errChan := handler.executeStreamWithAuthManagerFormats(context.Background(), constant.OpenAI, constant.OpenAI, model, requestBody, "", false, modelExecutionOptions{})
+		for dataChan != nil || errChan != nil {
+			select {
+			case data, ok := <-dataChan:
+				if !ok {
+					dataChan = nil
+					continue
+				}
+				if len(data) != len(payload) {
+					b.Fatalf("payload len = %d, want %d", len(data), len(payload))
+				}
+			case errMsg, ok := <-errChan:
+				if !ok {
+					errChan = nil
+					continue
+				}
+				if errMsg != nil {
+					b.Fatalf("stream error = %+v", errMsg)
+				}
+			}
+		}
+	}
 }
 
 func TestExecuteModelCarriesEntryAndExitProtocols(t *testing.T) {

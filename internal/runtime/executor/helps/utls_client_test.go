@@ -12,6 +12,8 @@ import (
 	"strings"
 	"testing"
 	"time"
+
+	cliproxyauth "github.com/router-for-me/CLIProxyAPI/v7/sdk/cliproxy/auth"
 )
 
 type utlsClientRoundTripFunc func(*http.Request) (*http.Response, error)
@@ -286,6 +288,65 @@ func TestNewUtlsHTTPClientProtectedFallbackPinsStandardHTTP11(t *testing.T) {
 	}
 	if len(tr.TLSNextProto) != 0 {
 		t.Fatalf("protectedFallbackHTTP11 TLSNextProto has %d entries, want 0", len(tr.TLSNextProto))
+	}
+}
+
+func TestNewUtlsHTTPClientReusesReusableTransport(t *testing.T) {
+	first := NewUtlsHTTPClient(context.Background(), nil, nil, time.Second)
+	second := NewUtlsHTTPClient(context.Background(), nil, nil, 2*time.Second)
+
+	if first == second {
+		t.Fatal("clients unexpectedly share the same *http.Client")
+	}
+	if first.Transport == nil || second.Transport == nil {
+		t.Fatalf("transports must be non-nil: first=%T second=%T", first.Transport, second.Transport)
+	}
+	if first.Transport != second.Transport {
+		t.Fatalf("direct transports differ: first=%T %p second=%T %p", first.Transport, first.Transport, second.Transport, second.Transport)
+	}
+	if first.Timeout != time.Second {
+		t.Fatalf("first timeout = %s, want %s", first.Timeout, time.Second)
+	}
+	if second.Timeout != 2*time.Second {
+		t.Fatalf("second timeout = %s, want %s", second.Timeout, 2*time.Second)
+	}
+
+	authA := &cliproxyauth.Auth{ID: "codex-a"}
+	authB := &cliproxyauth.Auth{ID: "codex-b"}
+	firstAuth := NewUtlsHTTPClient(context.Background(), nil, authA, 0)
+	secondAuth := NewUtlsHTTPClient(context.Background(), nil, authA, 0)
+	otherAuth := NewUtlsHTTPClient(context.Background(), nil, authB, 0)
+
+	if firstAuth.Transport != secondAuth.Transport {
+		t.Fatalf("same auth transports differ: first=%T %p second=%T %p", firstAuth.Transport, firstAuth.Transport, secondAuth.Transport, secondAuth.Transport)
+	}
+	if firstAuth.Transport == otherAuth.Transport {
+		t.Fatal("different auth transports unexpectedly share the same transport")
+	}
+
+	firstProxy := NewUtlsHTTPClient(context.Background(), nil, &cliproxyauth.Auth{ID: "codex-proxy", ProxyURL: "http://127.0.0.1:9"}, 0)
+	secondProxy := NewUtlsHTTPClient(context.Background(), nil, &cliproxyauth.Auth{ID: "codex-proxy", ProxyURL: "http://127.0.0.1:9"}, 0)
+	otherProxy := NewUtlsHTTPClient(context.Background(), nil, &cliproxyauth.Auth{ID: "codex-proxy", ProxyURL: "http://127.0.0.1:10"}, 0)
+
+	if firstProxy.Transport != secondProxy.Transport {
+		t.Fatalf("same proxy transports differ: first=%T %p second=%T %p", firstProxy.Transport, firstProxy.Transport, secondProxy.Transport, secondProxy.Transport)
+	}
+	if firstProxy.Transport == otherProxy.Transport {
+		t.Fatal("different proxy transports unexpectedly share the same transport")
+	}
+}
+
+func BenchmarkNewUtlsHTTPClient(b *testing.B) {
+	ctx := context.Background()
+	_ = NewUtlsHTTPClient(ctx, nil, nil, 0)
+
+	b.ReportAllocs()
+	b.ResetTimer()
+	for i := 0; i < b.N; i++ {
+		client := NewUtlsHTTPClient(ctx, nil, nil, 0)
+		if client.Transport == nil {
+			b.Fatal("client transport is nil")
+		}
 	}
 }
 

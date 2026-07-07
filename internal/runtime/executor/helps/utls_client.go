@@ -278,9 +278,7 @@ type utlsH2DegradeState struct {
 }
 
 // utlsH2DegradeCacheStore is a process-wide cache of protected hosts whose h2
-// transport is currently failing. NewUtlsHTTPClient builds a fresh client per
-// upstream request, so this state must live outside the client to let later
-// requests skip the known-bad h2 path. State is memory only and never persisted.
+// transport is currently failing. State is memory only and never persisted.
 type utlsH2DegradeCacheStore struct {
 	mu     sync.Mutex
 	states map[string]utlsH2DegradeState
@@ -480,6 +478,81 @@ func standardHTTP11Transport(base http.RoundTripper) http.RoundTripper {
 	return clone
 }
 
+type utlsClientTransportCacheStore struct {
+	mu         sync.Mutex
+	transports map[string]http.RoundTripper
+}
+
+var utlsClientTransportCache = &utlsClientTransportCacheStore{
+	transports: make(map[string]http.RoundTripper),
+}
+
+func (c *utlsClientTransportCacheStore) transport(proxyURL, authScope string) http.RoundTripper {
+	if c == nil {
+		return newUtlsFallbackRoundTripper(proxyURL, nil)
+	}
+	key := utlsClientTransportCacheKey(proxyURL, authScope)
+
+	c.mu.Lock()
+	defer c.mu.Unlock()
+
+	if transport := c.transports[key]; transport != nil {
+		return transport
+	}
+	transport := newUtlsFallbackRoundTripper(proxyURL, nil)
+	c.transports[key] = transport
+	return transport
+}
+
+func utlsClientTransportCacheKey(proxyURL, authScope string) string {
+	if authScope == "" {
+		authScope = "anonymous"
+	}
+	if proxyURL == "" {
+		return "direct\x00" + authScope
+	}
+	return "proxy\x00" + proxyURL + "\x00" + authScope
+}
+
+func utlsClientTransportScope(auth *cliproxyauth.Auth) string {
+	if auth == nil {
+		return "anonymous"
+	}
+	if id := strings.TrimSpace(auth.ID); id != "" {
+		return "auth-id\x00" + id
+	}
+	if index := strings.TrimSpace(auth.Index); index != "" {
+		return "auth-index\x00" + index
+	}
+	return "anonymous"
+}
+
+func newUtlsFallbackRoundTripper(proxyURL string, ctxRoundTripper http.RoundTripper) *fallbackRoundTripper {
+	hasInjectedRoundTripper := proxyURL == "" && ctxRoundTripper != nil
+	var utlsRT http.RoundTripper = newUtlsRoundTripper(proxyURL)
+	var protectedHTTP11Transport http.RoundTripper = newUtlsHTTP11RoundTripper(proxyURL)
+	var standardTransport http.RoundTripper = http.DefaultTransport
+	if proxyURL != "" {
+		if transport := buildProxyTransport(proxyURL); transport != nil {
+			standardTransport = transport
+		}
+	} else if hasInjectedRoundTripper {
+		utlsRT = ctxRoundTripper
+		protectedHTTP11Transport = ctxRoundTripper
+		standardTransport = ctxRoundTripper
+	}
+	protectedFallbackHTTP11Transport := standardHTTP11Transport(standardTransport)
+	h2DegradeScope := utlsH2DegradeScope(proxyURL, hasInjectedRoundTripper)
+
+	return &fallbackRoundTripper{
+		utls:                    utlsRT,
+		protectedHTTP11:         protectedHTTP11Transport,
+		protectedFallbackHTTP11: protectedFallbackHTTP11Transport,
+		fallback:                standardTransport,
+		h2DegradeScope:          h2DegradeScope,
+	}
+}
+
 // NewUtlsHTTPClient creates an HTTP client using utls Chrome TLS fingerprint.
 // Use this for provider requests that need a Chrome-like TLS fingerprint.
 // Falls back to standard transport for non-HTTPS requests.
@@ -497,29 +570,15 @@ func NewUtlsHTTPClient(ctx context.Context, cfg *config.Config, auth *cliproxyau
 		ctxRoundTripper, _ = ctx.Value("cliproxy.roundtripper").(http.RoundTripper)
 	}
 
-	var utlsRT http.RoundTripper = newUtlsRoundTripper(proxyURL)
-	var protectedHTTP11Transport http.RoundTripper = newUtlsHTTP11RoundTripper(proxyURL)
-	var standardTransport http.RoundTripper = http.DefaultTransport
-	if proxyURL != "" {
-		if transport := buildProxyTransport(proxyURL); transport != nil {
-			standardTransport = transport
-		}
-	} else if ctxRoundTripper != nil {
-		utlsRT = ctxRoundTripper
-		protectedHTTP11Transport = ctxRoundTripper
-		standardTransport = ctxRoundTripper
+	var transport http.RoundTripper
+	if proxyURL == "" && ctxRoundTripper != nil {
+		transport = newUtlsFallbackRoundTripper(proxyURL, ctxRoundTripper)
+	} else {
+		transport = utlsClientTransportCache.transport(proxyURL, utlsClientTransportScope(auth))
 	}
-	protectedFallbackHTTP11Transport := standardHTTP11Transport(standardTransport)
-	h2DegradeScope := utlsH2DegradeScope(proxyURL, ctxRoundTripper != nil)
 
 	client := &http.Client{
-		Transport: &fallbackRoundTripper{
-			utls:                    utlsRT,
-			protectedHTTP11:         protectedHTTP11Transport,
-			protectedFallbackHTTP11: protectedFallbackHTTP11Transport,
-			fallback:                standardTransport,
-			h2DegradeScope:          h2DegradeScope,
-		},
+		Transport: transport,
 	}
 	if timeout > 0 {
 		client.Timeout = timeout

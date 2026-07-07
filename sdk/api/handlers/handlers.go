@@ -1070,8 +1070,9 @@ func (h *BaseAPIHandler) streamWithPluginExecutor(ctx context.Context, entryProt
 			if len(chunk.Payload) == 0 {
 				continue
 			}
-			payload := cloneBytes(chunk.Payload)
+			payload := chunk.Payload
 			if streamInterceptorsActive {
+				payload = cloneBytes(chunk.Payload)
 				intercepted := interceptStreamChunk(ctx, interceptorHost, pluginapi.StreamChunkInterceptRequest{
 					SourceFormat:    responseProtocol,
 					Model:           modelName,
@@ -1385,8 +1386,9 @@ func (h *BaseAPIHandler) executeStreamWithAuthManagerFormats(ctx context.Context
 				}
 				if len(chunk.Payload) > 0 {
 					applyStreamHeaderInit()
-					payload := cloneBytes(chunk.Payload)
+					payload := chunk.Payload
 					if streamInterceptorsActive {
+						payload = cloneBytes(chunk.Payload)
 						executedReq, executedOpts := executedRequest()
 						intercepted := interceptStreamChunk(ctx, interceptorHost, pluginapi.StreamChunkInterceptRequest{
 							SourceFormat:    responseProtocol,
