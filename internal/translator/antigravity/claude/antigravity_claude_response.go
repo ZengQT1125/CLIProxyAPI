@@ -320,24 +320,19 @@ func ConvertAntigravityResponseToClaude(ctx context.Context, _ string, originalR
 
 			// Handle text content (both regular content and thinking)
 			if partTextResult.Exists() {
-				// Process thinking content (internal reasoning)
-				if partResult.Get("thought").Bool() || hasThoughtSignature {
+				partText := partTextResult.String()
+				if partResult.Get("thought").Bool() {
+					appendThinkingText(partText)
 					if hasThoughtSignature {
-						// log.Debug("Branch: signature_delta")
-
-						// Flush co-located text before emitting the signature
-						if partText := partTextResult.String(); partText != "" {
-							appendThinkingText(partText)
-						}
-
 						appendThinkingSignature(thoughtSignatureResult.String())
-					} else {
-						appendThinkingText(partTextResult.String())
 					}
 				} else {
+					if hasThoughtSignature {
+						appendThinkingSignature(thoughtSignatureResult.String())
+					}
 					finishReasonResult := gjson.GetBytes(rawJSON, "response.candidates.0.finishReason")
-					if partTextResult.String() != "" || !finishReasonResult.Exists() {
-						appendPseudoThinkingSegments(partTextResult.String(), false)
+					if partText != "" || !finishReasonResult.Exists() {
+						appendPseudoThinkingSegments(partText, false)
 					}
 				}
 			} else if functionCallResult.Exists() {
@@ -618,8 +613,8 @@ func ConvertAntigravityResponseToClaudeNonStream(_ context.Context, _ string, or
 				sig = part.Get("thought_signature")
 			}
 			hasThoughtSignature := sig.Exists() && sig.String() != "" && !part.Get("functionCall").Exists()
-			isThought := part.Get("thought").Bool() || hasThoughtSignature
-			if hasThoughtSignature {
+			isThought := part.Get("thought").Bool()
+			if hasThoughtSignature && (isThought || thinkingBuilder.Len() > 0) {
 				thinkingSignature = sig.String()
 			}
 
