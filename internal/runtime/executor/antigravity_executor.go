@@ -250,6 +250,15 @@ var (
 	antigravityTransportOnce sync.Once
 )
 
+type antigravityHTTP11TransportCacheStore struct {
+	mu         sync.Mutex
+	transports map[string]*http.Transport
+}
+
+var antigravityHTTP11ProxyTransportCache = &antigravityHTTP11TransportCacheStore{
+	transports: make(map[string]*http.Transport),
+}
+
 func cloneTransportWithHTTP11(base *http.Transport) *http.Transport {
 	if base == nil {
 		return nil
@@ -278,24 +287,74 @@ func initAntigravityTransport() {
 	antigravityTransport = cloneTransportWithHTTP11(base)
 }
 
+func (c *antigravityHTTP11TransportCacheStore) transport(proxyURL string) *http.Transport {
+	proxyURL = strings.TrimSpace(proxyURL)
+	if proxyURL == "" {
+		return nil
+	}
+	if c == nil {
+		return cloneTransportWithHTTP11(helps.CachedProxyTransport(proxyURL))
+	}
+
+	c.mu.Lock()
+	defer c.mu.Unlock()
+
+	if transport := c.transports[proxyURL]; transport != nil {
+		return transport
+	}
+	base := helps.CachedProxyTransport(proxyURL)
+	if base == nil {
+		return nil
+	}
+	transport := cloneTransportWithHTTP11(base)
+	if transport == nil {
+		return nil
+	}
+	c.transports[proxyURL] = transport
+	return transport
+}
+
 // newAntigravityHTTPClient creates an HTTP client specifically for Antigravity,
 // enforcing HTTP/1.1 by disabling HTTP/2 to perfectly mimic Node.js https defaults.
 // The underlying Transport is a singleton to avoid leaking connection pools.
 func newAntigravityHTTPClient(ctx context.Context, cfg *config.Config, auth *cliproxyauth.Auth, timeout time.Duration) *http.Client {
 	antigravityTransportOnce.Do(initAntigravityTransport)
 
-	client := helps.NewProxyAwareHTTPClient(ctx, cfg, auth, timeout)
-	// If no transport is set, use the shared HTTP/1.1 transport.
-	if client.Transport == nil {
-		client.Transport = antigravityTransport
-		return client
+	client := &http.Client{}
+	if timeout > 0 {
+		client.Timeout = timeout
 	}
 
-	// Preserve proxy settings from proxy-aware transports while forcing HTTP/1.1.
-	if transport, ok := client.Transport.(*http.Transport); ok {
-		client.Transport = cloneTransportWithHTTP11(transport)
+	if proxyURL := helps.ProxyURLForHTTPClient(cfg, auth); proxyURL != "" {
+		if transport := antigravityHTTP11ProxyTransportCache.transport(proxyURL); transport != nil {
+			client.Transport = transport
+			return client
+		}
+		log.Debug("failed to setup antigravity proxy transport, falling back to context transport")
 	}
+
+	if ctx != nil {
+		if rt, ok := ctx.Value("cliproxy.roundtripper").(http.RoundTripper); ok && rt != nil {
+			client.Transport = rt
+			if transport, ok := rt.(*http.Transport); ok {
+				client.Transport = cloneTransportWithHTTP11(transport)
+			}
+			return client
+		}
+	}
+
+	client.Transport = antigravityTransport
 	return client
+}
+
+func translateAntigravityRequestPair(from, to sdktranslator.Format, model string, originalPayload, payload []byte, stream bool) ([]byte, []byte) {
+	if bytes.Equal(originalPayload, payload) {
+		body := sdktranslator.TranslateRequest(from, to, model, payload, stream)
+		return body, body
+	}
+	originalTranslated := sdktranslator.TranslateRequest(from, to, model, originalPayload, stream)
+	body := sdktranslator.TranslateRequest(from, to, model, payload, stream)
+	return originalTranslated, body
 }
 
 func validateAntigravityRequestSignatures(ctx context.Context, modelName string, from sdktranslator.Format, rawJSON []byte) ([]byte, error) {
@@ -444,7 +503,6 @@ func (e *AntigravityExecutor) HttpRequest(ctx context.Context, auth *cliproxyaut
 	}
 	// Content-Length is managed automatically by Go's http.Client from the Body
 	httpReq.Header.Set("User-Agent", resolveUserAgent(auth))
-	httpReq.Close = true // sends Connection: close
 
 	// Inject Authorization: Bearer <token>
 	if err := e.PrepareRequest(httpReq, auth); err != nil {
@@ -655,8 +713,7 @@ func (e *AntigravityExecutor) Execute(ctx context.Context, auth *cliproxyauth.Au
 	if updatedAuth != nil {
 		auth = updatedAuth
 	}
-	originalTranslated := sdktranslator.TranslateRequest(from, to, baseModel, originalPayload, false)
-	translated := sdktranslator.TranslateRequest(from, to, baseModel, req.Payload, false)
+	originalTranslated, translated := translateAntigravityRequestPair(from, to, baseModel, originalPayload, req.Payload, false)
 
 	translated, err = thinking.ApplyThinking(translated, req.Model, from.String(), to.String(), e.Identifier())
 	if err != nil {
@@ -880,8 +937,7 @@ func (e *AntigravityExecutor) executeClaudeNonStream(ctx context.Context, auth *
 	if updatedAuth != nil {
 		auth = updatedAuth
 	}
-	originalTranslated := sdktranslator.TranslateRequest(from, to, baseModel, originalPayload, true)
-	translated := sdktranslator.TranslateRequest(from, to, baseModel, req.Payload, true)
+	originalTranslated, translated := translateAntigravityRequestPair(from, to, baseModel, originalPayload, req.Payload, true)
 
 	translated, err = thinking.ApplyThinking(translated, req.Model, from.String(), to.String(), e.Identifier())
 	if err != nil {
@@ -1357,8 +1413,7 @@ func (e *AntigravityExecutor) ExecuteStream(ctx context.Context, auth *cliproxya
 		auth = updatedAuth
 	}
 
-	originalTranslated := sdktranslator.TranslateRequest(from, to, baseModel, originalPayload, true)
-	translated := sdktranslator.TranslateRequest(from, to, baseModel, req.Payload, true)
+	originalTranslated, translated := translateAntigravityRequestPair(from, to, baseModel, originalPayload, req.Payload, true)
 
 	translated, err = thinking.ApplyThinking(translated, req.Model, from.String(), to.String(), e.Identifier())
 	if err != nil {
@@ -1742,7 +1797,6 @@ func (e *AntigravityExecutor) CountTokens(ctx context.Context, auth *cliproxyaut
 		if errReq != nil {
 			return cliproxyexecutor.Response{}, errReq
 		}
-		httpReq.Close = true
 		httpReq.Header.Set("Content-Type", "application/json")
 		httpReq.Header.Set("Authorization", "Bearer "+token)
 		httpReq.Header.Set("User-Agent", resolveUserAgent(auth))
@@ -2354,7 +2408,6 @@ func (e *AntigravityExecutor) buildRequest(ctx context.Context, auth *cliproxyau
 	if errReq != nil {
 		return nil, errReq
 	}
-	httpReq.Close = true
 	httpReq.Header.Set("Content-Type", "application/json")
 	httpReq.Header.Set("Authorization", "Bearer "+token)
 	httpReq.Header.Set("User-Agent", resolveUserAgent(auth))

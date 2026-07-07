@@ -315,6 +315,61 @@ func TestAntigravityBuildRequest_RejectsMissingProjectID(t *testing.T) {
 	}
 }
 
+func TestAntigravityBuildRequest_KeepsConnectionReusable(t *testing.T) {
+	executor := &AntigravityExecutor{}
+	auth := &cliproxyauth.Auth{Metadata: map[string]any{"project_id": "project-1"}}
+
+	req, err := executor.buildRequest(context.Background(), auth, "token", "gemini-3.1-pro", []byte(`{"request":{}}`), false, "", "https://example.com")
+	if err != nil {
+		t.Fatalf("buildRequest error: %v", err)
+	}
+	if req.Close {
+		t.Fatal("buildRequest should not force Connection: close")
+	}
+	if got := req.Header.Get("Connection"); strings.EqualFold(got, "close") {
+		t.Fatalf("Connection header = %q, want keep-alive capable request", got)
+	}
+}
+
+func TestAntigravityHttpRequest_KeepsConnectionReusable(t *testing.T) {
+	executor := &AntigravityExecutor{}
+	auth := &cliproxyauth.Auth{Metadata: map[string]any{
+		"access_token": "token",
+		"expired":      time.Now().Add(time.Hour).Format(time.RFC3339),
+	}}
+	var sawRequest bool
+	ctx := context.WithValue(context.Background(), "cliproxy.roundtripper", roundTripperFunc(func(req *http.Request) (*http.Response, error) {
+		sawRequest = true
+		if req.Close {
+			t.Fatal("HttpRequest should not force Connection: close")
+		}
+		if got := req.Header.Get("Connection"); strings.EqualFold(got, "close") {
+			t.Fatalf("Connection header = %q, want keep-alive capable request", got)
+		}
+		return &http.Response{
+			StatusCode: http.StatusOK,
+			Header:     make(http.Header),
+			Body:       io.NopCloser(strings.NewReader(`{"ok":true}`)),
+		}, nil
+	}))
+	req, err := http.NewRequestWithContext(context.Background(), http.MethodPost, "https://example.com/v1internal:generateContent", strings.NewReader(`{}`))
+	if err != nil {
+		t.Fatalf("create request: %v", err)
+	}
+	req.Header.Set("Content-Type", "application/json")
+
+	resp, err := executor.HttpRequest(ctx, auth, req)
+	if err != nil {
+		t.Fatalf("HttpRequest error: %v", err)
+	}
+	if errClose := resp.Body.Close(); errClose != nil {
+		t.Fatalf("response body close error: %v", errClose)
+	}
+	if !sawRequest {
+		t.Fatal("round tripper did not observe request")
+	}
+}
+
 type captureAntigravityLogHook struct {
 	messages []string
 }
