@@ -1050,7 +1050,7 @@ func (h *Handler) writeAuthFile(ctx context.Context, name string, data []byte) e
 	if errWrite := os.WriteFile(dst, data, 0o600); errWrite != nil {
 		return fmt.Errorf("failed to write file: %w", errWrite)
 	}
-	if err := h.upsertAuthRecord(ctx, auth); err != nil {
+	if err := h.upsertAuthRecord(coreauth.WithAuthMaterialReplacement(ctx), auth); err != nil {
 		return err
 	}
 	return nil

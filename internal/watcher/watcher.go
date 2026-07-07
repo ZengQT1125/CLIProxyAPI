@@ -78,6 +78,8 @@ type AuthUpdate struct {
 	Action AuthUpdateAction
 	ID     string
 	Auth   *coreauth.Auth
+	// ReplaceMaterial means the persisted credential material changed and stale runtime errors must be cleared.
+	ReplaceMaterial bool
 }
 
 const (

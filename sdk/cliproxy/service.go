@@ -523,17 +523,22 @@ func (s *Service) handleAuthUpdates(ctx context.Context, updates []watcher.AuthU
 			if update.Auth == nil || update.Auth.ID == "" {
 				continue
 			}
-			auth := s.prepareCoreAuthForModelRegistration(registrationCtx, update.Auth)
+			updateCtx := registrationCtx
+			if update.ReplaceMaterial {
+				updateCtx = coreauth.WithAuthMaterialReplacement(updateCtx)
+			}
+			auth := s.prepareCoreAuthForModelRegistration(updateCtx, update.Auth)
 			if auth == nil {
 				continue
 			}
 			needsAliasRebuild = true
 			authForRegistration := auth
+			registrationTaskCtx := updateCtx
 			tasks = append(tasks, modelRegistrationTask{
 				phase:    modelRegistrationPhase(authForRegistration),
 				category: modelRegistrationCategory(authForRegistration),
 				run: func(compatCache *openAICompatibilityRegistrationCache) {
-					s.completeModelRegistrationForAuthWithCache(registrationCtx, authForRegistration, compatCache)
+					s.completeModelRegistrationForAuthWithCache(registrationTaskCtx, authForRegistration, compatCache)
 				},
 			})
 			needsPluginSync = true

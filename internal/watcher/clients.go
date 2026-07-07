@@ -305,7 +305,7 @@ func (w *Watcher) computePerPathUpdatesLocked(oldByID, newByID map[string]*corea
 		}
 		if !authEqual(existing, newAuth) {
 			w.currentAuths[id] = newAuth.Clone()
-			updates = append(updates, AuthUpdate{Action: AuthUpdateActionModify, ID: id, Auth: newAuth.Clone()})
+			updates = append(updates, AuthUpdate{Action: AuthUpdateActionModify, ID: id, Auth: newAuth.Clone(), ReplaceMaterial: true})
 		}
 	}
 	for id := range oldByID {

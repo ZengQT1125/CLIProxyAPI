@@ -2,10 +2,12 @@ package cliproxy
 
 import (
 	"context"
+	"net/http"
 	"testing"
 	"time"
 
 	"github.com/router-for-me/CLIProxyAPI/v7/internal/registry"
+	"github.com/router-for-me/CLIProxyAPI/v7/internal/watcher"
 	coreauth "github.com/router-for-me/CLIProxyAPI/v7/sdk/cliproxy/auth"
 	"github.com/router-for-me/CLIProxyAPI/v7/sdk/config"
 )
@@ -68,6 +70,71 @@ func TestServiceApplyCoreAuthAddOrUpdate_DeleteReAddDoesNotInheritStaleRuntimeSt
 	}
 	if models := registry.GetGlobalRegistry().GetModelsForClient(authID); len(models) == 0 {
 		t.Fatalf("expected re-added auth to re-register models in global registry")
+	}
+}
+
+func TestHandleAuthUpdate_ReplaceMaterialClearsRuntimeErrorState(t *testing.T) {
+	service := &Service{
+		cfg:         &config.Config{},
+		coreManager: coreauth.NewManager(nil, nil, nil),
+	}
+
+	ctx := context.Background()
+	authID := "codex-user@example.com.json"
+	modelID := "gpt-5"
+
+	t.Cleanup(func() {
+		GlobalModelRegistry().UnregisterClient(authID)
+	})
+
+	if _, errRegister := service.coreManager.Register(ctx, &coreauth.Auth{
+		ID:       authID,
+		Provider: "codex",
+		Status:   coreauth.StatusActive,
+	}); errRegister != nil {
+		t.Fatalf("register auth: %v", errRegister)
+	}
+
+	service.coreManager.MarkResult(ctx, coreauth.Result{
+		AuthID:   authID,
+		Provider: "codex",
+		Model:    modelID,
+		Success:  false,
+		Error: &coreauth.Error{
+			Code:       "unauthorized",
+			Message:    "401 Your authentication token has been invalidated",
+			HTTPStatus: http.StatusUnauthorized,
+		},
+	})
+
+	failedAuth, ok := service.coreManager.GetByID(authID)
+	if !ok || failedAuth == nil {
+		t.Fatalf("expected auth %q to exist", authID)
+	}
+	if len(failedAuth.ModelStates) == 0 || failedAuth.LastError == nil {
+		t.Fatalf("expected runtime error state before replacement, got %+v", failedAuth)
+	}
+
+	service.handleAuthUpdate(ctx, watcher.AuthUpdate{
+		Action:          watcher.AuthUpdateActionModify,
+		ID:              authID,
+		Auth:            &coreauth.Auth{ID: authID, Provider: "codex", Status: coreauth.StatusActive},
+		ReplaceMaterial: true,
+	})
+
+	updated, ok := service.coreManager.GetByID(authID)
+	if !ok || updated == nil {
+		t.Fatalf("expected updated auth %q to exist", authID)
+	}
+	if updated.Status != coreauth.StatusActive {
+		t.Fatalf("status = %q, want %q", updated.Status, coreauth.StatusActive)
+	}
+	if updated.LastError != nil || updated.StatusMessage != "" || updated.Unavailable || !updated.NextRetryAfter.IsZero() {
+		t.Fatalf("runtime error state survived replacement: status_message=%q unavailable=%v next=%v last_error=%+v",
+			updated.StatusMessage, updated.Unavailable, updated.NextRetryAfter, updated.LastError)
+	}
+	if len(updated.ModelStates) != 0 {
+		t.Fatalf("model states survived replacement: %+v", updated.ModelStates)
 	}
 }
 

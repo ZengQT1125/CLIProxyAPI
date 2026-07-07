@@ -2,6 +2,7 @@ package management
 
 import (
 	"bytes"
+	"context"
 	"encoding/json"
 	"mime/multipart"
 	"net/http"
@@ -15,6 +16,35 @@ import (
 	"github.com/router-for-me/CLIProxyAPI/v7/internal/config"
 	coreauth "github.com/router-for-me/CLIProxyAPI/v7/sdk/cliproxy/auth"
 )
+
+func uploadMultipartAuthFile(t *testing.T, h *Handler, name string, content string) {
+	t.Helper()
+
+	var body bytes.Buffer
+	writer := multipart.NewWriter(&body)
+	part, err := writer.CreateFormFile("file", name)
+	if err != nil {
+		t.Fatalf("failed to create multipart file: %v", err)
+	}
+	if _, err = part.Write([]byte(content)); err != nil {
+		t.Fatalf("failed to write multipart content: %v", err)
+	}
+	if err = writer.Close(); err != nil {
+		t.Fatalf("failed to close multipart writer: %v", err)
+	}
+
+	rec := httptest.NewRecorder()
+	ctx, _ := gin.CreateTestContext(rec)
+	req := httptest.NewRequest(http.MethodPost, "/v0/management/auth-files", &body)
+	req.Header.Set("Content-Type", writer.FormDataContentType())
+	ctx.Request = req
+
+	h.UploadAuthFile(ctx)
+
+	if rec.Code != http.StatusOK {
+		t.Fatalf("expected upload status %d, got %d with body %s", http.StatusOK, rec.Code, rec.Body.String())
+	}
+}
 
 func TestUploadAuthFile_PreservesPriorityAttributes(t *testing.T) {
 	t.Setenv("MANAGEMENT_PASSWORD", "")
@@ -205,5 +235,54 @@ func TestUploadAuthFile_FillsMissingEmailFromRawUploadName(t *testing.T) {
 	}
 	if got := saved["email"]; got != "user@example.com" {
 		t.Fatalf("saved email = %#v, want %q", got, "user@example.com")
+	}
+}
+
+func TestUploadAuthFile_ReplacingSameNameClearsRuntimeErrorState(t *testing.T) {
+	t.Setenv("MANAGEMENT_PASSWORD", "")
+	gin.SetMode(gin.TestMode)
+
+	authDir := t.TempDir()
+	manager := coreauth.NewManager(nil, nil, nil)
+	h := NewHandlerWithoutConfigFilePath(&config.Config{AuthDir: authDir}, manager)
+
+	name := "codex-user@example.com.json"
+	uploadMultipartAuthFile(t, h, name, `{"type":"codex","email":"user@example.com","access_token":"old"}`)
+
+	manager.MarkResult(context.Background(), coreauth.Result{
+		AuthID:   name,
+		Provider: "codex",
+		Model:    "gpt-5",
+		Success:  false,
+		Error: &coreauth.Error{
+			Code:       "unauthorized",
+			Message:    "401 Your authentication token has been invalidated",
+			HTTPStatus: http.StatusUnauthorized,
+		},
+	})
+
+	failedAuth, ok := manager.GetByID(name)
+	if !ok || failedAuth == nil {
+		t.Fatalf("expected auth record %s to exist", name)
+	}
+	if len(failedAuth.ModelStates) == 0 || failedAuth.LastError == nil {
+		t.Fatalf("expected 401 model state before replacement, got %+v", failedAuth)
+	}
+
+	uploadMultipartAuthFile(t, h, name, `{"type":"codex","email":"user@example.com","access_token":"new"}`)
+
+	replacedAuth, ok := manager.GetByID(name)
+	if !ok || replacedAuth == nil {
+		t.Fatalf("expected replaced auth record %s to exist", name)
+	}
+	if replacedAuth.Status != coreauth.StatusActive {
+		t.Fatalf("status = %q, want %q", replacedAuth.Status, coreauth.StatusActive)
+	}
+	if replacedAuth.LastError != nil || replacedAuth.StatusMessage != "" || replacedAuth.Unavailable || !replacedAuth.NextRetryAfter.IsZero() {
+		t.Fatalf("runtime error state survived replacement: status_message=%q unavailable=%v next=%v last_error=%+v",
+			replacedAuth.StatusMessage, replacedAuth.Unavailable, replacedAuth.NextRetryAfter, replacedAuth.LastError)
+	}
+	if len(replacedAuth.ModelStates) != 0 {
+		t.Fatalf("model states survived same-name replacement: %+v", replacedAuth.ModelStates)
 	}
 }

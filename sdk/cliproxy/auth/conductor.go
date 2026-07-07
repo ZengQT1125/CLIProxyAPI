@@ -2153,12 +2153,21 @@ func (m *Manager) Update(ctx context.Context, auth *Auth) (*Auth, error) {
 	if auth == nil || auth.ID == "" {
 		return nil, nil
 	}
+	var resumeModels []string
+	cooldownStateChanged := false
 	m.mu.Lock()
 	existing, ok := m.auths[auth.ID]
 	if !ok || existing == nil {
 		m.mu.Unlock()
 		return nil, nil
 	}
+	now := time.Now()
+	var cooldownRecordsBefore []CooldownStateRecord
+	trackCooldownState := m.cooldownStore != nil
+	if trackCooldownState {
+		cooldownRecordsBefore = m.cooldownStateRecordsForAuthLocked(existing, now)
+	}
+	resetRuntimeState := shouldResetRuntimeStateOnUpdate(ctx) && !auth.Disabled && auth.Status != StatusDisabled
 	if !auth.indexAssigned && auth.Index == "" {
 		auth.Index = existing.Index
 		auth.indexAssigned = existing.indexAssigned
@@ -2166,12 +2175,14 @@ func (m *Manager) Update(ctx context.Context, auth *Auth) (*Auth, error) {
 	auth.Success = existing.Success
 	auth.Failed = existing.Failed
 	auth.recentRequests = existing.recentRequests
-	if !existing.Disabled && existing.Status != StatusDisabled && !auth.Disabled && auth.Status != StatusDisabled {
+	if resetRuntimeState {
+		resumeModels = runtimeStateModelKeys(existing)
+		resetRuntimeAvailabilityState(auth, now)
+	} else if !existing.Disabled && existing.Status != StatusDisabled && !auth.Disabled && auth.Status != StatusDisabled {
 		if len(auth.ModelStates) == 0 && len(existing.ModelStates) > 0 {
 			auth.ModelStates = existing.ModelStates
 		}
 	}
-	now := time.Now()
 	clearedCooldown := false
 	if m.cooldownDisabledForAuth(auth) || auth.Disabled || auth.Status == StatusDisabled {
 		clearedCooldown = clearCooldownStateForAuth(auth, now)
@@ -2179,6 +2190,10 @@ func (m *Manager) Update(ctx context.Context, auth *Auth) (*Auth, error) {
 	auth.EnsureIndex()
 	authClone := auth.Clone()
 	m.auths[auth.ID] = authClone
+	if trackCooldownState {
+		cooldownRecordsAfter := m.cooldownStateRecordsForAuthLocked(authClone, now)
+		cooldownStateChanged = !cooldownStateRecordsEqual(cooldownRecordsBefore, cooldownRecordsAfter)
+	}
 	m.mu.Unlock()
 	if !shouldDeferAPIKeyModelAliasRebuild(ctx) {
 		m.rebuildAPIKeyModelAliasFromRuntimeConfig()
@@ -2189,10 +2204,54 @@ func (m *Manager) Update(ctx context.Context, auth *Auth) (*Auth, error) {
 	m.queueRefreshReschedule(auth.ID)
 	_ = m.persist(ctx, auth)
 	m.hook.OnAuthUpdated(ctx, auth.Clone())
-	if clearedCooldown {
+	if clearedCooldown || cooldownStateChanged {
 		m.persistCooldownStates(ctx)
 	}
+	for _, model := range resumeModels {
+		registry.GetGlobalRegistry().ClearModelQuotaExceeded(auth.ID, model)
+		registry.GetGlobalRegistry().ResumeClientModel(auth.ID, model)
+	}
 	return auth.Clone(), nil
+}
+
+func resetRuntimeAvailabilityState(auth *Auth, now time.Time) {
+	if auth == nil {
+		return
+	}
+	auth.Unavailable = false
+	if auth.Status == "" || auth.Status == StatusUnknown || auth.Status == StatusError {
+		auth.Status = StatusActive
+	}
+	auth.StatusMessage = ""
+	auth.Quota = QuotaState{}
+	auth.LastError = nil
+	auth.NextRetryAfter = time.Time{}
+	auth.ModelStates = nil
+	auth.UpdatedAt = now
+}
+
+func runtimeStateModelKeys(auth *Auth) []string {
+	if auth == nil || len(auth.ModelStates) == 0 {
+		return nil
+	}
+	seen := make(map[string]struct{}, len(auth.ModelStates))
+	models := make([]string, 0, len(auth.ModelStates))
+	for model := range auth.ModelStates {
+		modelKey := canonicalModelKey(model)
+		if modelKey == "" {
+			modelKey = strings.TrimSpace(model)
+		}
+		if modelKey == "" {
+			continue
+		}
+		if _, ok := seen[modelKey]; ok {
+			continue
+		}
+		seen[modelKey] = struct{}{}
+		models = append(models, modelKey)
+	}
+	sort.Strings(models)
+	return models
 }
 
 // Remove deletes an auth from runtime state without persisting.

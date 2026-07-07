@@ -117,6 +117,9 @@ func (w *Watcher) dispatchPersistedAuthUpdate(update AuthUpdate) bool {
 	if update.ID == "" {
 		update.ID = clone.ID
 	}
+	if update.Action == AuthUpdateActionModify {
+		update.ReplaceMaterial = true
+	}
 	update.Auth = clone.Clone()
 	w.dispatchAuthUpdates([]AuthUpdate{update})
 	return true
@@ -182,7 +185,7 @@ func (w *Watcher) prepareAuthUpdatesLocked(auths []*coreauth.Auth, force bool) [
 		if existing, ok := w.currentAuths[id]; !ok {
 			updates = append(updates, AuthUpdate{Action: AuthUpdateActionAdd, ID: id, Auth: auth.Clone()})
 		} else if force || !authEqual(existing, auth) {
-			updates = append(updates, AuthUpdate{Action: AuthUpdateActionModify, ID: id, Auth: auth.Clone()})
+			updates = append(updates, AuthUpdate{Action: AuthUpdateActionModify, ID: id, Auth: auth.Clone(), ReplaceMaterial: true})
 		}
 	}
 	for id := range w.currentAuths {

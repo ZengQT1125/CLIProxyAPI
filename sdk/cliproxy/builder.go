@@ -310,9 +310,10 @@ func (s *Service) runtimeAuthSyncHook() coreauth.PostAuthHook {
 			}
 		}
 		update := watcher.AuthUpdate{
-			Action: action,
-			ID:     auth.ID,
-			Auth:   auth,
+			Action:          action,
+			ID:              auth.ID,
+			Auth:            auth,
+			ReplaceMaterial: action == watcher.AuthUpdateActionModify,
 		}
 		if s.watcher != nil && s.watcher.DispatchPersistedAuthUpdate(update) {
 			return nil
