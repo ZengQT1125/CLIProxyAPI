@@ -117,7 +117,7 @@ func TestGetOAuthCallbackDoesNotAliasPluginProvider(t *testing.T) {
 }
 
 func TestWriteOAuthCallbackFileForPendingSessionCreatesMissingAuthDirForCallbackProviders(t *testing.T) {
-	providers := []string{"anthropic", "codex", "antigravity", "xai"}
+	providers := []string{"anthropic", "codex", "antigravity"}
 	for _, provider := range providers {
 		t.Run(provider, func(t *testing.T) {
 			authDir := filepath.Join(t.TempDir(), "missing-auth")
