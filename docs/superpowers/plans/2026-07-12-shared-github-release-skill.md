@@ -116,7 +116,7 @@ Expected gap: the current rule requires user input for A and B instead of inferr
 Replace the subject-only command with:
 
 ```bash
-COMMIT_COUNT=$(git rev-list --count "${PREV_TAG}..HEAD")
+COMMIT_COUNT=$(git rev-list --count --no-merges "${PREV_TAG}..HEAD")
 git log "${PREV_TAG}..HEAD" --no-merges --pretty=format:'%H%n%s%n%b%n---'
 ```
 
