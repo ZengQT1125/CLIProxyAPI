@@ -15,7 +15,7 @@ func TestSQLiteUsageStoreQueryMonitorRequestLogs(t *testing.T) {
 
 	base := time.Date(2026, 2, 7, 12, 0, 0, 0, time.UTC)
 	insertUsageRecords(t, store,
-		UsageRecord{APIKey: "api-1", Model: "model-a", Source: "source-a", RequestedAt: base.Add(-3 * time.Hour), TotalTokens: 10},
+		UsageRecord{APIKey: "api-1", Model: "model-a", Source: "source-a", RequestedAt: base.Add(-3 * time.Hour), CacheWriteTokens: 9, TotalTokens: 10},
 		UsageRecord{APIKey: "api-1", Model: "model-a", Source: "source-a", RequestedAt: base.Add(-2 * time.Hour), Failed: true, TotalTokens: 20},
 		UsageRecord{APIKey: "api-1", Model: "model-a", Source: "source-a", RequestedAt: base.Add(-1 * time.Hour), TotalTokens: 30},
 		UsageRecord{APIKey: "api-2", Model: "model-b", Source: "source-b", RequestedAt: base.Add(-30 * time.Minute), TotalTokens: 40},
@@ -44,6 +44,9 @@ func TestSQLiteUsageStoreQueryMonitorRequestLogs(t *testing.T) {
 	if !result.Items[0].Timestamp.Equal(base.Add(-3 * time.Hour)) {
 		t.Fatalf("unexpected item timestamp: got %s", result.Items[0].Timestamp)
 	}
+	if result.Items[0].CacheWriteTokens != 9 {
+		t.Fatalf("cache write tokens = %d, want 9", result.Items[0].CacheWriteTokens)
+	}
 
 	stats, ok := result.GroupStats[MonitorGroupKey("source-a", "model-a")]
 	if !ok {
@@ -71,10 +74,10 @@ func TestSQLiteUsageStoreQueryMonitorChannelStats(t *testing.T) {
 
 	base := time.Date(2026, 2, 7, 12, 0, 0, 0, time.UTC)
 	insertUsageRecords(t, store,
-		UsageRecord{APIKey: "api-1", Model: "model-a", Source: "source-a", RequestedAt: base.Add(-4 * time.Hour), InputTokens: 100, OutputTokens: 20, CachedTokens: 30},
-		UsageRecord{APIKey: "api-1", Model: "model-a", Source: "source-a", RequestedAt: base.Add(-3 * time.Hour), Failed: true, InputTokens: 50, OutputTokens: 10, CachedTokens: 5},
-		UsageRecord{APIKey: "api-1", Model: "model-b", Source: "source-a", RequestedAt: base.Add(-2 * time.Hour), InputTokens: 25, OutputTokens: 7},
-		UsageRecord{APIKey: "api-2", Model: "model-c", Source: "source-b", RequestedAt: base.Add(-1 * time.Hour), InputTokens: 11, OutputTokens: 13, CachedTokens: 17},
+		UsageRecord{APIKey: "api-1", Model: "model-a", Source: "source-a", RequestedAt: base.Add(-4 * time.Hour), InputTokens: 100, OutputTokens: 20, CachedTokens: 30, CacheWriteTokens: 40},
+		UsageRecord{APIKey: "api-1", Model: "model-a", Source: "source-a", RequestedAt: base.Add(-3 * time.Hour), Failed: true, InputTokens: 50, OutputTokens: 10, CachedTokens: 5, CacheWriteTokens: 5},
+		UsageRecord{APIKey: "api-1", Model: "model-b", Source: "source-a", RequestedAt: base.Add(-2 * time.Hour), InputTokens: 25, OutputTokens: 7, CacheWriteTokens: 7},
+		UsageRecord{APIKey: "api-2", Model: "model-c", Source: "source-b", RequestedAt: base.Add(-1 * time.Hour), InputTokens: 11, OutputTokens: 13, CachedTokens: 17, CacheWriteTokens: 17},
 	)
 
 	result, err := store.QueryMonitorChannelStats(ctx, MonitorQueryFilter{Status: "failed"}, 10, 12)
@@ -95,6 +98,9 @@ func TestSQLiteUsageStoreQueryMonitorChannelStats(t *testing.T) {
 	if item.InputTokens != 125 || item.OutputTokens != 27 || item.CachedTokens != 30 {
 		t.Fatalf("unexpected token aggregate: input=%d output=%d cached=%d", item.InputTokens, item.OutputTokens, item.CachedTokens)
 	}
+	if item.CacheWriteTokens != 47 {
+		t.Fatalf("cache write aggregate = %d, want 47", item.CacheWriteTokens)
+	}
 	if len(item.Models) != 2 {
 		t.Fatalf("unexpected model count: %d", len(item.Models))
 	}
@@ -103,6 +109,9 @@ func TestSQLiteUsageStoreQueryMonitorChannelStats(t *testing.T) {
 	}
 	if item.Models[0].InputTokens != 100 || item.Models[0].OutputTokens != 20 || item.Models[0].CachedTokens != 30 {
 		t.Fatalf("unexpected first model token aggregate: %+v", item.Models[0])
+	}
+	if item.Models[0].CacheWriteTokens != 40 {
+		t.Fatalf("first model cache write aggregate = %d, want 40", item.Models[0].CacheWriteTokens)
 	}
 
 	assertStringSliceEqual(t, result.Filters.Models, []string{"model-a", "model-b", "model-c"})

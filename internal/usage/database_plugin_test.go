@@ -102,3 +102,24 @@ func TestGetCombinedSnapshot_StoreOnlySnapshotIgnoresMemory(t *testing.T) {
 		t.Fatalf("db api missing in snapshot")
 	}
 }
+
+func TestDatabasePluginBuffersCacheWriteTokens(t *testing.T) {
+	plugin := &DatabasePlugin{store: &fakeUsageStore{}}
+	plugin.HandleUsage(context.Background(), coreusage.Record{
+		Model: "gpt-5.6",
+		Detail: coreusage.Detail{
+			InputTokens:         100,
+			OutputTokens:        20,
+			CacheCreationTokens: 40,
+		},
+	})
+
+	plugin.bufferMu.Lock()
+	defer plugin.bufferMu.Unlock()
+	if len(plugin.buffer) != 1 {
+		t.Fatalf("buffer len = %d, want 1", len(plugin.buffer))
+	}
+	if plugin.buffer[0].CacheWriteTokens != 40 {
+		t.Fatalf("cache write tokens = %d, want 40", plugin.buffer[0].CacheWriteTokens)
+	}
+}

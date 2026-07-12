@@ -100,10 +100,13 @@ func TestGetMonitorChannelStats_StatusFilterAndAggregate(t *testing.T) {
 	base := time.Date(2026, 2, 6, 12, 0, 0, 0, time.Local)
 	first := testUsageRecord(base.Add(-2*time.Hour), "api-1", "model-a", "source-a", false)
 	first.Detail.CachedTokens = 3
+	first.Detail.CacheCreationTokens = 4
 	second := testUsageRecord(base.Add(-90*time.Minute), "api-1", "model-a", "source-a", true)
 	second.Detail.CachedTokens = 5
+	second.Detail.CacheCreationTokens = 5
 	third := testUsageRecord(base.Add(-70*time.Minute), "api-2", "model-b", "source-a", false)
 	third.Detail.CachedTokens = 7
+	third.Detail.CacheCreationTokens = 7
 	h := newMonitorTestHandler(
 		first,
 		second,
@@ -118,21 +121,23 @@ func TestGetMonitorChannelStats_StatusFilterAndAggregate(t *testing.T) {
 
 	var resp struct {
 		Items []struct {
-			Source          string  `json:"source"`
-			TotalRequests   int64   `json:"total_requests"`
-			SuccessRequests int64   `json:"success_requests"`
-			FailedRequests  int64   `json:"failed_requests"`
-			InputTokens     int64   `json:"input_tokens"`
-			OutputTokens    int64   `json:"output_tokens"`
-			CachedTokens    int64   `json:"cached_tokens"`
-			SuccessRate     float64 `json:"success_rate"`
-			Models          []struct {
-				Model        string `json:"model"`
-				Requests     int64  `json:"requests"`
-				Failed       int64  `json:"failed"`
-				InputTokens  int64  `json:"input_tokens"`
-				OutputTokens int64  `json:"output_tokens"`
-				CachedTokens int64  `json:"cached_tokens"`
+			Source           string  `json:"source"`
+			TotalRequests    int64   `json:"total_requests"`
+			SuccessRequests  int64   `json:"success_requests"`
+			FailedRequests   int64   `json:"failed_requests"`
+			InputTokens      int64   `json:"input_tokens"`
+			OutputTokens     int64   `json:"output_tokens"`
+			CachedTokens     int64   `json:"cached_tokens"`
+			CacheWriteTokens int64   `json:"cache_write_tokens"`
+			SuccessRate      float64 `json:"success_rate"`
+			Models           []struct {
+				Model            string `json:"model"`
+				Requests         int64  `json:"requests"`
+				Failed           int64  `json:"failed"`
+				InputTokens      int64  `json:"input_tokens"`
+				OutputTokens     int64  `json:"output_tokens"`
+				CachedTokens     int64  `json:"cached_tokens"`
+				CacheWriteTokens int64  `json:"cache_write_tokens"`
 			} `json:"models"`
 		} `json:"items"`
 		Total int `json:"total"`
@@ -148,6 +153,9 @@ func TestGetMonitorChannelStats_StatusFilterAndAggregate(t *testing.T) {
 		t.Fatalf("unexpected items count: got %d", len(resp.Items))
 	}
 	item := resp.Items[0]
+	if item.CacheWriteTokens != 11 {
+		t.Fatalf("cache write tokens = %d, want 11", item.CacheWriteTokens)
+	}
 	if item.Source != "source-a" {
 		t.Fatalf("unexpected source: %s", item.Source)
 	}

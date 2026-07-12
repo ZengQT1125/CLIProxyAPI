@@ -32,6 +32,27 @@ func TestRequestStatisticsRecordIncludesLatency(t *testing.T) {
 	}
 }
 
+func TestRequestStatisticsRecordIncludesCacheWriteTokens(t *testing.T) {
+	stats := NewRequestStatistics()
+	stats.Record(context.Background(), coreusage.Record{
+		APIKey:      "test-key",
+		Model:       "gpt-5.6",
+		RequestedAt: time.Date(2026, 7, 12, 12, 0, 0, 0, time.UTC),
+		Detail: coreusage.Detail{
+			InputTokens:         100,
+			OutputTokens:        20,
+			CacheReadTokens:     30,
+			CacheCreationTokens: 40,
+			TotalTokens:         120,
+		},
+	})
+
+	detail := stats.Snapshot().APIs["test-key"].Models["gpt-5.6"].Details[0]
+	if detail.Tokens.CacheWriteTokens != 40 {
+		t.Fatalf("cache write tokens = %d, want 40", detail.Tokens.CacheWriteTokens)
+	}
+}
+
 func TestRequestStatisticsMergeSnapshotDedupIgnoresLatency(t *testing.T) {
 	stats := NewRequestStatistics()
 	timestamp := time.Date(2026, 3, 20, 12, 0, 0, 0, time.UTC)

@@ -45,19 +45,20 @@ type MonitorFilterOptions struct {
 
 // MonitorRequestLog represents a single request log row.
 type MonitorRequestLog struct {
-	Timestamp       time.Time
-	APIKey          string
-	Model           string
-	Source          string
-	AuthIndex       string
-	Failed          bool
-	InputTokens     int64
-	OutputTokens    int64
-	ReasoningTokens int64
-	CachedTokens    int64
-	TotalTokens     int64
-	LatencyMs       int64
-	TTFTMs          int64
+	Timestamp        time.Time
+	APIKey           string
+	Model            string
+	Source           string
+	AuthIndex        string
+	Failed           bool
+	InputTokens      int64
+	OutputTokens     int64
+	ReasoningTokens  int64
+	CachedTokens     int64
+	CacheWriteTokens int64
+	TotalTokens      int64
+	LatencyMs        int64
+	TTFTMs           int64
 }
 
 // MonitorRequestGroupStats represents per-channel+model counters for request logs.
@@ -79,29 +80,31 @@ type MonitorRequestLogsResult struct {
 
 // MonitorModelStats is the model-level aggregate used by channel/failure analysis.
 type MonitorModelStats struct {
-	Model         string
-	Requests      int64
-	Success       int64
-	Failed        int64
-	InputTokens   int64
-	OutputTokens  int64
-	CachedTokens  int64
-	LastRequestAt *time.Time
-	Recent        []MonitorRecentRequest
+	Model            string
+	Requests         int64
+	Success          int64
+	Failed           int64
+	InputTokens      int64
+	OutputTokens     int64
+	CachedTokens     int64
+	CacheWriteTokens int64
+	LastRequestAt    *time.Time
+	Recent           []MonitorRecentRequest
 }
 
 // MonitorChannelStats is the source-level aggregate used by channel stats endpoint.
 type MonitorChannelStats struct {
-	Source          string
-	TotalRequests   int64
-	SuccessRequests int64
-	FailedRequests  int64
-	InputTokens     int64
-	OutputTokens    int64
-	CachedTokens    int64
-	LastRequestAt   *time.Time
-	Recent          []MonitorRecentRequest
-	Models          []MonitorModelStats
+	Source           string
+	TotalRequests    int64
+	SuccessRequests  int64
+	FailedRequests   int64
+	InputTokens      int64
+	OutputTokens     int64
+	CachedTokens     int64
+	CacheWriteTokens int64
+	LastRequestAt    *time.Time
+	Recent           []MonitorRecentRequest
+	Models           []MonitorModelStats
 }
 
 // MonitorChannelStatsResult is the SQL-backed result for channel stats endpoint.
@@ -151,16 +154,17 @@ type MonitorRequestDetail struct {
 
 // MonitorKpiResult is the SQL-backed result for KPI endpoint.
 type MonitorKpiResult struct {
-	TotalRequests   int64
-	SuccessRequests int64
-	FailedRequests  int64
-	TotalTokens     int64
-	InputTokens     int64
-	OutputTokens    int64
-	ReasoningTokens int64
-	CachedTokens    int64
-	MinTimestamp    *time.Time
-	MaxTimestamp    *time.Time
+	TotalRequests    int64
+	SuccessRequests  int64
+	FailedRequests   int64
+	TotalTokens      int64
+	InputTokens      int64
+	OutputTokens     int64
+	ReasoningTokens  int64
+	CachedTokens     int64
+	CacheWriteTokens int64
+	MinTimestamp     *time.Time
+	MaxTimestamp     *time.Time
 }
 
 // MonitorModelDistItem represents a single model in the distribution.
@@ -172,14 +176,15 @@ type MonitorModelDistItem struct {
 
 // MonitorDailyTrendItem represents a single day in the daily trend.
 type MonitorDailyTrendItem struct {
-	Date            string
-	Requests        int64
-	SuccessRequests int64
-	FailedRequests  int64
-	InputTokens     int64
-	OutputTokens    int64
-	ReasoningTokens int64
-	CachedTokens    int64
+	Date             string
+	Requests         int64
+	SuccessRequests  int64
+	FailedRequests   int64
+	InputTokens      int64
+	OutputTokens     int64
+	ReasoningTokens  int64
+	CachedTokens     int64
+	CacheWriteTokens int64
 }
 
 // MonitorHourlySlot represents per-slot per-model counts for hourly-models.
@@ -192,12 +197,13 @@ type MonitorHourlySlot struct {
 
 // MonitorHourlyTokenSlot represents per-slot token breakdowns for hourly-tokens.
 type MonitorHourlyTokenSlot struct {
-	SlotIndex       int
-	TotalTokens     int64
-	InputTokens     int64
-	OutputTokens    int64
-	ReasoningTokens int64
-	CachedTokens    int64
+	SlotIndex        int
+	TotalTokens      int64
+	InputTokens      int64
+	OutputTokens     int64
+	ReasoningTokens  int64
+	CachedTokens     int64
+	CacheWriteTokens int64
 }
 
 // MonitorHealthBlock represents a single time block for service health.
@@ -466,7 +472,7 @@ func (s *sqliteUsageStore) QueryMonitorRequestLogs(ctx context.Context, filter M
 	query := fmt.Sprintf(`
 		SELECT api_key, model, COALESCE(NULLIF(source, ''), 'unknown'), auth_index,
 			failed, requested_at, input_tokens, output_tokens, reasoning_tokens,
-			cached_tokens, total_tokens, latency_ms, ttft_ms
+			cached_tokens, cache_write_tokens, total_tokens, latency_ms, ttft_ms
 		FROM usage_records
 		WHERE %s
 		ORDER BY requested_at DESC, id DESC
@@ -500,6 +506,7 @@ func (s *sqliteUsageStore) QueryMonitorRequestLogs(ctx context.Context, filter M
 			&item.OutputTokens,
 			&item.ReasoningTokens,
 			&item.CachedTokens,
+			&item.CacheWriteTokens,
 			&item.TotalTokens,
 			&item.LatencyMs,
 			&item.TTFTMs,
@@ -982,6 +989,7 @@ func (s *sqliteUsageStore) queryChannelAggregates(ctx context.Context, whereClau
 			COALESCE(SUM(CASE WHEN failed=0 THEN input_tokens ELSE 0 END), 0),
 			COALESCE(SUM(CASE WHEN failed=0 THEN output_tokens ELSE 0 END), 0),
 			COALESCE(SUM(CASE WHEN failed=0 THEN cached_tokens ELSE 0 END), 0),
+			COALESCE(SUM(CASE WHEN failed=0 THEN cache_write_tokens ELSE 0 END), 0),
 			MAX(requested_at)
 		FROM usage_records
 		WHERE %s
@@ -1009,6 +1017,7 @@ func (s *sqliteUsageStore) queryChannelAggregates(ctx context.Context, whereClau
 			&item.InputTokens,
 			&item.OutputTokens,
 			&item.CachedTokens,
+			&item.CacheWriteTokens,
 			&lastUnix,
 		); err != nil {
 			return nil, fmt.Errorf("usage store: scan monitor channel aggregate: %w", err)
@@ -1035,6 +1044,7 @@ func (s *sqliteUsageStore) attachChannelModels(ctx context.Context, whereClause 
 			COALESCE(SUM(CASE WHEN failed=0 THEN input_tokens ELSE 0 END), 0),
 			COALESCE(SUM(CASE WHEN failed=0 THEN output_tokens ELSE 0 END), 0),
 			COALESCE(SUM(CASE WHEN failed=0 THEN cached_tokens ELSE 0 END), 0),
+			COALESCE(SUM(CASE WHEN failed=0 THEN cache_write_tokens ELSE 0 END), 0),
 			MAX(requested_at)
 		FROM usage_records
 		WHERE %s
@@ -1062,6 +1072,7 @@ func (s *sqliteUsageStore) attachChannelModels(ctx context.Context, whereClause 
 			&model.InputTokens,
 			&model.OutputTokens,
 			&model.CachedTokens,
+			&model.CacheWriteTokens,
 			&lastUnix,
 		); err != nil {
 			return fmt.Errorf("usage store: scan monitor channel model: %w", err)
@@ -1155,6 +1166,7 @@ func (s *sqliteUsageStore) attachFailureModels(ctx context.Context, failedWhere 
 			COALESCE(SUM(CASE WHEN failed=0 THEN input_tokens ELSE 0 END), 0),
 			COALESCE(SUM(CASE WHEN failed=0 THEN output_tokens ELSE 0 END), 0),
 			COALESCE(SUM(CASE WHEN failed=0 THEN cached_tokens ELSE 0 END), 0),
+			COALESCE(SUM(CASE WHEN failed=0 THEN cache_write_tokens ELSE 0 END), 0),
 			MAX(requested_at)
 		FROM usage_records
 		WHERE %s
@@ -1182,6 +1194,7 @@ func (s *sqliteUsageStore) attachFailureModels(ctx context.Context, failedWhere 
 			&model.InputTokens,
 			&model.OutputTokens,
 			&model.CachedTokens,
+			&model.CacheWriteTokens,
 			&lastUnix,
 		); err != nil {
 			return fmt.Errorf("usage store: scan failure model: %w", err)
@@ -1497,6 +1510,7 @@ func (s *sqliteUsageStore) QueryMonitorKpi(ctx context.Context, filter MonitorQu
 			COALESCE(SUM(CASE WHEN failed=0 THEN output_tokens ELSE 0 END), 0),
 			COALESCE(SUM(CASE WHEN failed=0 THEN reasoning_tokens ELSE 0 END), 0),
 			COALESCE(SUM(CASE WHEN failed=0 THEN cached_tokens ELSE 0 END), 0),
+			COALESCE(SUM(CASE WHEN failed=0 THEN cache_write_tokens ELSE 0 END), 0),
 			MIN(requested_at),
 			MAX(requested_at)
 		FROM usage_records
@@ -1514,6 +1528,7 @@ func (s *sqliteUsageStore) QueryMonitorKpi(ctx context.Context, filter MonitorQu
 		&result.OutputTokens,
 		&result.ReasoningTokens,
 		&result.CachedTokens,
+		&result.CacheWriteTokens,
 		&minTs,
 		&maxTs,
 	); err != nil {
@@ -1580,7 +1595,8 @@ func (s *sqliteUsageStore) QueryMonitorDailyTrend(ctx context.Context, filter Mo
 			COALESCE(SUM(CASE WHEN failed=0 THEN input_tokens ELSE 0 END), 0),
 			COALESCE(SUM(CASE WHEN failed=0 THEN output_tokens ELSE 0 END), 0),
 			COALESCE(SUM(CASE WHEN failed=0 THEN reasoning_tokens ELSE 0 END), 0),
-			COALESCE(SUM(CASE WHEN failed=0 THEN cached_tokens ELSE 0 END), 0)
+			COALESCE(SUM(CASE WHEN failed=0 THEN cached_tokens ELSE 0 END), 0),
+			COALESCE(SUM(CASE WHEN failed=0 THEN cache_write_tokens ELSE 0 END), 0)
 		FROM usage_records
 		WHERE %s
 		GROUP BY date_key
@@ -1605,6 +1621,7 @@ func (s *sqliteUsageStore) QueryMonitorDailyTrend(ctx context.Context, filter Mo
 			&item.OutputTokens,
 			&item.ReasoningTokens,
 			&item.CachedTokens,
+			&item.CacheWriteTokens,
 		); err != nil {
 			return nil, fmt.Errorf("usage store: scan monitor daily trend: %w", err)
 		}
@@ -1675,7 +1692,8 @@ func (s *sqliteUsageStore) QueryMonitorHourlyTokenSlots(ctx context.Context, fil
 			COALESCE(SUM(input_tokens), 0),
 			COALESCE(SUM(output_tokens), 0),
 			COALESCE(SUM(reasoning_tokens), 0),
-			COALESCE(SUM(cached_tokens), 0)
+			COALESCE(SUM(cached_tokens), 0),
+			COALESCE(SUM(cache_write_tokens), 0)
 		FROM usage_records
 		WHERE %s AND requested_at >= ? AND requested_at <= ? AND failed = 0
 		GROUP BY slot_idx
@@ -1695,7 +1713,7 @@ func (s *sqliteUsageStore) QueryMonitorHourlyTokenSlots(ctx context.Context, fil
 	items := make([]MonitorHourlyTokenSlot, 0)
 	for rows.Next() {
 		var item MonitorHourlyTokenSlot
-		if err = rows.Scan(&item.SlotIndex, &item.TotalTokens, &item.InputTokens, &item.OutputTokens, &item.ReasoningTokens, &item.CachedTokens); err != nil {
+		if err = rows.Scan(&item.SlotIndex, &item.TotalTokens, &item.InputTokens, &item.OutputTokens, &item.ReasoningTokens, &item.CachedTokens, &item.CacheWriteTokens); err != nil {
 			return nil, fmt.Errorf("usage store: scan monitor hourly token slot: %w", err)
 		}
 		items = append(items, item)

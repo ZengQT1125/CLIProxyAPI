@@ -2,12 +2,103 @@ package usage
 
 import (
 	"context"
+	"database/sql"
 	"fmt"
 	"os"
 	"path/filepath"
 	"testing"
 	"time"
 )
+
+func TestSQLiteUsageStorePersistsCacheWriteTokens(t *testing.T) {
+	ctx := context.Background()
+	store, err := newSQLiteUsageStoreAtPath(filepath.Join(t.TempDir(), "usage.db"))
+	if err != nil {
+		t.Fatalf("newSQLiteUsageStoreAtPath failed: %v", err)
+	}
+	defer store.Close()
+
+	err = store.Insert(ctx, UsageRecord{
+		APIKey:           "api-1",
+		Model:            "gpt-5.6",
+		RequestedAt:      time.Unix(1_700_000_000, 0),
+		InputTokens:      100,
+		OutputTokens:     20,
+		CachedTokens:     30,
+		CacheWriteTokens: 40,
+		TotalTokens:      120,
+	})
+	if err != nil {
+		t.Fatalf("Insert failed: %v", err)
+	}
+
+	details, err := store.GetDetails(ctx, 0, 10)
+	if err != nil {
+		t.Fatalf("GetDetails failed: %v", err)
+	}
+	if len(details) != 1 {
+		t.Fatalf("details len = %d, want 1", len(details))
+	}
+	if details[0].CacheWriteTokens != 40 {
+		t.Fatalf("cache write tokens = %d, want 40", details[0].CacheWriteTokens)
+	}
+}
+
+func TestSQLiteUsageStoreMigratesCacheWriteTokensColumn(t *testing.T) {
+	ctx := context.Background()
+	dbPath := filepath.Join(t.TempDir(), "usage.db")
+	db, err := sql.Open("sqlite", dbPath)
+	if err != nil {
+		t.Fatalf("open legacy db failed: %v", err)
+	}
+	_, err = db.ExecContext(ctx, `
+		CREATE TABLE usage_records (
+			id INTEGER PRIMARY KEY AUTOINCREMENT,
+			api_key TEXT NOT NULL,
+			model TEXT NOT NULL,
+			source TEXT,
+			auth_index TEXT,
+			failed INTEGER NOT NULL DEFAULT 0,
+			requested_at INTEGER NOT NULL,
+			input_tokens INTEGER NOT NULL DEFAULT 0,
+			output_tokens INTEGER NOT NULL DEFAULT 0,
+			reasoning_tokens INTEGER NOT NULL DEFAULT 0,
+			cached_tokens INTEGER NOT NULL DEFAULT 0,
+			total_tokens INTEGER NOT NULL DEFAULT 0
+		)
+	`)
+	if err != nil {
+		t.Fatalf("create legacy schema failed: %v", err)
+	}
+	if err = db.Close(); err != nil {
+		t.Fatalf("close legacy db failed: %v", err)
+	}
+
+	store, err := newSQLiteUsageStoreAtPath(dbPath)
+	if err != nil {
+		t.Fatalf("open migrated store failed: %v", err)
+	}
+	defer store.Close()
+
+	columns := make(map[string]struct{})
+	rows, err := store.db.QueryContext(ctx, "PRAGMA table_info(usage_records)")
+	if err != nil {
+		t.Fatalf("query columns failed: %v", err)
+	}
+	defer rows.Close()
+	for rows.Next() {
+		var cid, notNull, pk int
+		var name, columnType string
+		var defaultValue any
+		if err = rows.Scan(&cid, &name, &columnType, &notNull, &defaultValue, &pk); err != nil {
+			t.Fatalf("scan column failed: %v", err)
+		}
+		columns[name] = struct{}{}
+	}
+	if _, ok := columns["cache_write_tokens"]; !ok {
+		t.Fatal("cache_write_tokens column missing after migration")
+	}
+}
 
 func TestResolveLocalUsageDBPath(t *testing.T) {
 	authDir := filepath.Join(t.TempDir(), "auth")
