@@ -1,7 +1,9 @@
 package api
 
 import (
+	"bytes"
 	"encoding/json"
+	"io"
 	"net/http"
 	"net/http/httptest"
 	"os"
@@ -11,6 +13,7 @@ import (
 	"time"
 
 	gin "github.com/gin-gonic/gin"
+	"github.com/klauspost/compress/zstd"
 	managementHandlers "github.com/router-for-me/CLIProxyAPI/v7/internal/api/handlers/management"
 	proxyconfig "github.com/router-for-me/CLIProxyAPI/v7/internal/config"
 	internallogging "github.com/router-for-me/CLIProxyAPI/v7/internal/logging"
@@ -120,6 +123,36 @@ func TestManagementResponseExposesPluginSupportHeaderForCORS(t *testing.T) {
 		if _, ok := exposedHeaders[strings.ToLower(headerName)]; !ok {
 			t.Fatalf("Access-Control-Expose-Headers missing %s: %q", headerName, rr.Header().Get("Access-Control-Expose-Headers"))
 		}
+	}
+}
+
+func TestV0ManagementResponseNegotiatesZstdCompression(t *testing.T) {
+	t.Setenv("MANAGEMENT_PASSWORD", "test-management-key")
+
+	server := newTestServer(t)
+	request := httptest.NewRequest(http.MethodGet, "/v0/management/config", nil)
+	request.Header.Set("Authorization", "Bearer test-management-key")
+	request.Header.Set("Accept-Encoding", "zstd, gzip")
+	recorder := httptest.NewRecorder()
+	server.engine.ServeHTTP(recorder, request)
+
+	if recorder.Code != http.StatusOK {
+		t.Fatalf("status = %d, want %d", recorder.Code, http.StatusOK)
+	}
+	if got := recorder.Header().Get("Content-Encoding"); got != "zstd" {
+		t.Fatalf("Content-Encoding = %q, want zstd; response bytes=%d", got, recorder.Body.Len())
+	}
+	reader, errReader := zstd.NewReader(bytes.NewReader(recorder.Body.Bytes()))
+	if errReader != nil {
+		t.Fatalf("zstd.NewReader: %v", errReader)
+	}
+	decoded, errRead := io.ReadAll(reader)
+	reader.Close()
+	if errRead != nil {
+		t.Fatalf("read zstd response: %v", errRead)
+	}
+	if !json.Valid(decoded) {
+		t.Fatalf("decoded response is not valid JSON: %q", decoded)
 	}
 }
 

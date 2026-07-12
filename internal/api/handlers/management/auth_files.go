@@ -500,7 +500,6 @@ func (h *Handler) buildAuthFileEntry(auth *coreauth.Auth) gin.H {
 		"unavailable":    auth.Unavailable,
 		"runtime_only":   runtimeOnly,
 		"source":         "memory",
-		"size":           int64(0),
 	}
 	entry["success"] = auth.Success
 	entry["failed"] = auth.Failed
@@ -535,18 +534,6 @@ func (h *Handler) buildAuthFileEntry(auth *coreauth.Auth) gin.H {
 	if path != "" {
 		entry["path"] = path
 		entry["source"] = "file"
-		if info, err := os.Stat(path); err == nil {
-			entry["size"] = info.Size()
-			entry["modtime"] = info.ModTime()
-		} else if os.IsNotExist(err) {
-			// Hide credentials removed from disk but still lingering in memory.
-			if !runtimeOnly && (auth.Disabled || auth.Status == coreauth.StatusDisabled || strings.EqualFold(strings.TrimSpace(auth.StatusMessage), "removed via management api")) {
-				return nil
-			}
-			entry["source"] = "memory"
-		} else {
-			log.WithError(err).Warnf("failed to stat auth file %s", path)
-		}
 	}
 	if claims := extractCodexIDTokenClaims(auth); claims != nil {
 		entry["id_token"] = claims

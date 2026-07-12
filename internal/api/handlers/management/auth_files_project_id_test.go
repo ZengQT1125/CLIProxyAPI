@@ -8,6 +8,7 @@ import (
 	"os"
 	"path/filepath"
 	"testing"
+	"time"
 
 	"github.com/gin-gonic/gin"
 	"github.com/router-for-me/CLIProxyAPI/v7/internal/config"
@@ -120,6 +121,59 @@ func TestListAuthFilesFromDisk_IncludesWebsockets(t *testing.T) {
 	entry := firstAuthFileEntry(t, h)
 	if got := entry["websockets"]; got != false {
 		t.Fatalf("expected websockets false, got %#v", got)
+	}
+}
+
+func TestListAuthFiles_UsesAuthUpdatedAtAndOmitsSize(t *testing.T) {
+	t.Setenv("MANAGEMENT_PASSWORD", "")
+
+	authDir := t.TempDir()
+	fileName := "xai-user@example.com.json"
+	filePath := filepath.Join(authDir, fileName)
+	if errWrite := os.WriteFile(filePath, []byte(`{"type":"xai","email":"user@example.com"}`), 0o600); errWrite != nil {
+		t.Fatalf("failed to write auth file: %v", errWrite)
+	}
+	fileModTime := time.Date(2025, time.January, 2, 3, 4, 5, 0, time.UTC)
+	if errChtimes := os.Chtimes(filePath, fileModTime, fileModTime); errChtimes != nil {
+		t.Fatalf("failed to set auth file modtime: %v", errChtimes)
+	}
+
+	updatedAt := time.Date(2026, time.July, 12, 13, 14, 15, 0, time.UTC)
+	manager := coreauth.NewManager(nil, nil, nil)
+	record := &coreauth.Auth{
+		ID:        fileName,
+		FileName:  fileName,
+		Provider:  "xai",
+		Status:    coreauth.StatusActive,
+		UpdatedAt: updatedAt,
+		Attributes: map[string]string{
+			"path": filePath,
+		},
+		Metadata: map[string]any{
+			"type":  "xai",
+			"email": "user@example.com",
+		},
+	}
+	if _, errRegister := manager.Register(context.Background(), record); errRegister != nil {
+		t.Fatalf("failed to register auth record: %v", errRegister)
+	}
+
+	h := NewHandlerWithoutConfigFilePath(&config.Config{AuthDir: authDir}, manager)
+	h.tokenStore = &memoryAuthStore{}
+
+	entry := firstAuthFileEntry(t, h)
+	wantTimestamp := updatedAt.Format(time.RFC3339)
+	if got := entry["updated_at"]; got != wantTimestamp {
+		t.Fatalf("expected updated_at %q, got %#v", wantTimestamp, got)
+	}
+	if got := entry["modtime"]; got != wantTimestamp {
+		t.Fatalf("expected modtime from auth updated_at %q, got %#v", wantTimestamp, got)
+	}
+	if _, ok := entry["size"]; ok {
+		t.Fatalf("expected manager-backed entry to omit size, got %#v", entry["size"])
+	}
+	if got := entry["source"]; got != "file" {
+		t.Fatalf("expected source %q, got %#v", "file", got)
 	}
 }
 
