@@ -2,11 +2,11 @@
 
 ## Goal
 
-Make the existing Claude Code `/github-release` command available to Codex as a project skill without maintaining duplicate release instructions.
+Make the existing Claude Code `/github-release` command available to Codex as a project skill without duplicate instructions, and make semantic-version selection automatic for recognizable and unrecognized commit messages.
 
 ## Root Cause
 
-Claude Code and Codex discover reusable instructions through different paths. Copying the command into both paths would create two sources of truth that can drift.
+Claude Code and Codex discover reusable instructions through different paths, so copying the command would create two sources of truth. The existing version rule also equates non-Conventional Commit messages with ambiguity even when their intent is inferable, causing unnecessary user prompts.
 
 ## Design
 
@@ -16,6 +16,16 @@ Claude Code and Codex discover reusable instructions through different paths. Co
 - Keep the existing `fork/v*` tag requirement and rollback workflow unchanged.
 - Replace Claude-specific tool wording with platform-neutral instructions so both agents can execute the same workflow.
 - Do not add scripts, references, assets, or UI metadata; the workflow is small and self-contained.
+
+## Automatic Version Inference
+
+- Read commit subjects and bodies after the latest `fork/v*` tag while excluding merge commits from classification.
+- Select `major` when any commit contains an explicit breaking marker such as `type!:` or `BREAKING CHANGE:`, or clearly describes an incompatible public behavior or protocol change.
+- Otherwise select `minor` when any commit uses `feat:` or clearly describes adding, introducing, enabling, or supporting a new capability.
+- Classify fixes, performance work, refactors, documentation, tests, dependencies, build changes, CI changes, and unrecognized messages as `patch`.
+- Select the highest inferred level across all commits: `major` over `minor` over `patch`.
+- Print the selected level, decisive commit evidence, and resulting `fork/vX.Y.Z` tag, then continue with tag creation and push without asking the user to choose a version.
+- Stop instead of guessing when there are no commits to release, the target tag already exists, or repository state prevents a safe release.
 
 ## Compatibility
 
@@ -29,7 +39,8 @@ Claude Code and Codex discover reusable instructions through different paths. Co
 - Confirm both paths return identical content.
 - Run the Codex skill validator against `.agents/skills/github-release`.
 - Inspect the final files to ensure the `fork/v*` rule remains explicit.
+- Check representative commit sets for breaking, feature, patch-only, mixed, and unrecognized-message classification.
 
 ## Scope
 
-This change only shares and normalizes the existing release workflow. It does not execute a release, alter Git configuration, or change release semantics.
+This change shares the release workflow and replaces interactive version selection with automatic inference. It does not execute a release or alter Git configuration.
