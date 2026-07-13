@@ -1068,10 +1068,7 @@ func filteredAuthFileName(auth *coreauth.Auth) (string, bool) {
 	if path == "" {
 		return "", false
 	}
-	name := strings.TrimSpace(auth.FileName)
-	if name == "" {
-		name = filepath.Base(path)
-	}
+	name := filepath.Base(path)
 	if isUnsafeAuthFileName(name) {
 		return "", false
 	}

@@ -110,6 +110,49 @@ func TestDeleteAuthFilesFiltered_SkipsHiddenAuthWithoutPath(t *testing.T) {
 	}
 }
 
+func TestDeleteAuthFilesFiltered_UsesPhysicalPathForAbsoluteFileName(t *testing.T) {
+	authDir := t.TempDir()
+	filePath := filepath.Join(authDir, "absolute-name.json")
+	if errWrite := os.WriteFile(filePath, []byte(`{"type":"codex"}`), 0o600); errWrite != nil {
+		t.Fatal(errWrite)
+	}
+	manager := coreauth.NewManager(nil, nil, nil)
+	if _, errRegister := manager.Register(context.Background(), &coreauth.Auth{
+		ID:       "absolute-name.json",
+		FileName: filePath,
+		Provider: "codex",
+		Attributes: map[string]string{
+			"path": filePath,
+		},
+	}); errRegister != nil {
+		t.Fatal(errRegister)
+	}
+	h := NewHandlerWithoutConfigFilePath(&config.Config{AuthDir: authDir}, manager)
+	h.tokenStore = &memoryAuthStore{}
+
+	recorder := httptest.NewRecorder()
+	ginCtx, _ := gin.CreateTestContext(recorder)
+	ginCtx.Request = httptest.NewRequest(http.MethodDelete, "/v0/management/auth-files?all=true&type=codex", nil)
+	h.DeleteAuthFile(ginCtx)
+
+	if recorder.Code != http.StatusOK {
+		t.Fatalf("status = %d, body = %s", recorder.Code, recorder.Body.String())
+	}
+	var response struct {
+		Deleted int      `json:"deleted"`
+		Files   []string `json:"files"`
+	}
+	if errDecode := json.Unmarshal(recorder.Body.Bytes(), &response); errDecode != nil {
+		t.Fatal(errDecode)
+	}
+	if response.Deleted != 1 || len(response.Files) != 1 || response.Files[0] != "absolute-name.json" {
+		t.Fatalf("unexpected absolute filename delete response: %#v", response)
+	}
+	if _, errStat := os.Stat(filePath); !os.IsNotExist(errStat) {
+		t.Fatalf("physical auth file must be deleted, stat error = %v", errStat)
+	}
+}
+
 func TestDeleteAuthFilesFiltered_PartialFailure(t *testing.T) {
 	authDir := t.TempDir()
 	manager := coreauth.NewManager(nil, nil, nil)
