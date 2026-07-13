@@ -1141,7 +1141,7 @@ func (h *Handler) deleteFilteredAuthFile(ctx context.Context, candidate filtered
 	if errDeleteRecord := h.deleteTokenRecord(ctx, candidate.path); errDeleteRecord != nil {
 		return name, http.StatusInternalServerError, errDeleteRecord
 	}
-	h.removeAuth(ctx, candidate.authID)
+	h.removeAuthsForPath(ctx, candidate.path, candidate.authID)
 	return name, http.StatusOK, nil
 }
 
@@ -2145,7 +2145,11 @@ func cleanAuthFilePath(path string) string {
 	if abs, errAbs := filepath.Abs(path); errAbs == nil && strings.TrimSpace(abs) != "" {
 		path = abs
 	}
-	return filepath.Clean(path)
+	path = filepath.Clean(path)
+	if parentReal, errParentReal := filepath.EvalSymlinks(filepath.Dir(path)); errParentReal == nil {
+		return filepath.Join(filepath.Clean(parentReal), filepath.Base(path))
+	}
+	return path
 }
 
 func (h *Handler) deleteTokenRecord(ctx context.Context, path string) error {

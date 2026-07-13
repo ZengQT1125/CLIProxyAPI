@@ -346,6 +346,46 @@ func TestDeleteAuthFilesFiltered_DeletesExactNestedPath(t *testing.T) {
 	}
 }
 
+func TestDeleteAuthFilesFiltered_RemovesAllAuthsForSamePath(t *testing.T) {
+	authDir := t.TempDir()
+	filePath := filepath.Join(authDir, "shared-source.json")
+	if errWrite := os.WriteFile(filePath, []byte(`{"type":"codex"}`), 0o600); errWrite != nil {
+		t.Fatal(errWrite)
+	}
+	manager := coreauth.NewManager(nil, nil, nil)
+	for _, authID := range []string{"shared-auth-a", "shared-auth-b"} {
+		if _, errRegister := manager.Register(context.Background(), &coreauth.Auth{
+			ID:       authID,
+			FileName: filePath,
+			Provider: "codex",
+			Attributes: map[string]string{
+				"path": filePath,
+			},
+		}); errRegister != nil {
+			t.Fatal(errRegister)
+		}
+	}
+	h := NewHandlerWithoutConfigFilePath(&config.Config{AuthDir: authDir}, manager)
+	h.tokenStore = &memoryAuthStore{}
+
+	recorder := httptest.NewRecorder()
+	ginCtx, _ := gin.CreateTestContext(recorder)
+	ginCtx.Request = httptest.NewRequest(http.MethodDelete, "/v0/management/auth-files?all=true&type=codex", nil)
+	h.DeleteAuthFile(ginCtx)
+
+	if recorder.Code != http.StatusOK {
+		t.Fatalf("status = %d, body = %s", recorder.Code, recorder.Body.String())
+	}
+	if _, errStat := os.Stat(filePath); !os.IsNotExist(errStat) {
+		t.Fatalf("shared auth file must be deleted, stat error = %v", errStat)
+	}
+	for _, authID := range []string{"shared-auth-a", "shared-auth-b"} {
+		if _, ok := manager.GetByID(authID); ok {
+			t.Fatalf("auth %q for deleted path must be removed", authID)
+		}
+	}
+}
+
 func TestDeleteAuthFilesFiltered_PartialFailure(t *testing.T) {
 	authDir := t.TempDir()
 	manager := coreauth.NewManager(nil, nil, nil)
