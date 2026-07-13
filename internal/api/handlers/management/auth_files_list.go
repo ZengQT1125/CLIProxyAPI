@@ -157,11 +157,11 @@ func buildAuthFileListPage(auths []*coreauth.Auth, query authFileListQuery) auth
 
 	page.Total = len(filtered)
 	sortAuthFileList(filtered, query.Sort)
-	start := (query.Page - 1) * query.PageSize
-	if start >= len(filtered) {
+	if len(filtered) == 0 || query.Page-1 > (len(filtered)-1)/query.PageSize {
 		page.Auths = []*coreauth.Auth{}
 		return page
 	}
+	start := (query.Page - 1) * query.PageSize
 	end := start + query.PageSize
 	if end > len(filtered) {
 		end = len(filtered)

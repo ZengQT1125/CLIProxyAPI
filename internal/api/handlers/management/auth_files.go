@@ -934,7 +934,7 @@ func (h *Handler) DeleteAuthFile(c *gin.Context) {
 			c.JSON(http.StatusBadRequest, gin.H{"error": errQuery.Error()})
 			return
 		}
-		if query.Search != "" {
+		if _, hasSearch := c.GetQuery("search"); hasSearch {
 			c.JSON(http.StatusBadRequest, gin.H{"error": "search is not supported when deleting all auth files"})
 			return
 		}
@@ -1022,14 +1022,11 @@ func hasAuthFileDeleteFilters(query authFileListQuery) bool {
 func (h *Handler) deleteFilteredAuthFiles(c *gin.Context, ctx context.Context, query authFileListQuery) {
 	names := make([]string, 0)
 	for _, auth := range h.authManager.List() {
-		if auth == nil || isRuntimeOnlyAuth(auth) || !authMatchesListStatusFilters(auth, query) {
+		if auth == nil || isRuntimeOnlyAuth(auth) || !authFileListVisible(auth) || !authMatchesListStatusFilters(auth, query) {
 			continue
 		}
-		name := strings.TrimSpace(auth.FileName)
-		if name == "" {
-			name = filepath.Base(strings.TrimSpace(authAttribute(auth, "path")))
-		}
-		if isUnsafeAuthFileName(name) {
+		name, okName := filteredAuthFileName(auth)
+		if !okName {
 			continue
 		}
 		names = append(names, name)
@@ -1061,6 +1058,24 @@ func (h *Handler) deleteFilteredAuthFiles(c *gin.Context, ctx context.Context, q
 		"files":   deletedFiles,
 		"failed":  failed,
 	})
+}
+
+func filteredAuthFileName(auth *coreauth.Auth) (string, bool) {
+	if auth == nil {
+		return "", false
+	}
+	path := strings.TrimSpace(authAttribute(auth, "path"))
+	if path == "" {
+		return "", false
+	}
+	name := strings.TrimSpace(auth.FileName)
+	if name == "" {
+		name = filepath.Base(path)
+	}
+	if isUnsafeAuthFileName(name) {
+		return "", false
+	}
+	return name, true
 }
 
 func (h *Handler) multipartAuthFileHeaders(c *gin.Context) ([]*multipart.FileHeader, error) {

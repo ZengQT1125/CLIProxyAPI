@@ -161,6 +161,24 @@ func TestBuildAuthFileListPage(t *testing.T) {
 	})
 }
 
+func TestBuildAuthFileListPage_MaxIntPageReturnsEmpty(t *testing.T) {
+	maxInt := int(^uint(0) >> 1)
+	auth := &coreauth.Auth{
+		ID:       "visible.json",
+		FileName: "visible.json",
+		Provider: "codex",
+		Attributes: map[string]string{
+			"path": "/auth/visible.json",
+		},
+	}
+	page := buildAuthFileListPage([]*coreauth.Auth{auth}, authFileListQuery{
+		Page: maxInt, PageSize: 40, Sort: authFileSortDefault,
+	})
+	if page.Total != 1 || len(page.Auths) != 0 || page.Page != maxInt || page.PageSize != 40 {
+		t.Fatalf("unexpected oversized page: %#v", page)
+	}
+}
+
 func TestListAuthFiles_Paginated(t *testing.T) {
 	manager := coreauth.NewManager(nil, nil, nil)
 	authDir := t.TempDir()
@@ -189,13 +207,51 @@ func TestListAuthFiles_Paginated(t *testing.T) {
 	if errDecode := json.Unmarshal(recorder.Body.Bytes(), &response); errDecode != nil {
 		t.Fatal(errDecode)
 	}
-	if len(response.Files) != 3 || response.Total != 3 || response.Page != 1 || response.PageSize != 3 {
+	if len(response.Files) != 3 || response.Total != 4 || response.Page != 1 || response.PageSize != 3 {
 		t.Fatalf("unexpected paginated response: %#v", response)
 	}
 	for _, file := range response.Files {
 		if _, ok := file["success"]; !ok {
 			t.Fatalf("expected full auth file entry, got %#v", file)
 		}
+	}
+}
+
+func TestListAuthFiles_PaginatedMaxIntPage(t *testing.T) {
+	maxInt := int(^uint(0) >> 1)
+	manager := coreauth.NewManager(nil, nil, nil)
+	auth := &coreauth.Auth{
+		ID:       "visible.json",
+		FileName: "visible.json",
+		Provider: "codex",
+		Attributes: map[string]string{
+			"path": filepath.Join(t.TempDir(), "visible.json"),
+		},
+	}
+	if _, errRegister := manager.Register(context.Background(), auth); errRegister != nil {
+		t.Fatal(errRegister)
+	}
+	h := NewHandlerWithoutConfigFilePath(&config.Config{AuthDir: t.TempDir()}, manager)
+	recorder := httptest.NewRecorder()
+	ginCtx, _ := gin.CreateTestContext(recorder)
+	ginCtx.Request = httptest.NewRequest(http.MethodGet,
+		fmt.Sprintf("/v0/management/auth-files?page=%d&page_size=40", maxInt), nil)
+	h.ListAuthFiles(ginCtx)
+
+	if recorder.Code != http.StatusOK {
+		t.Fatalf("status = %d, body = %s", recorder.Code, recorder.Body.String())
+	}
+	var response struct {
+		Files    []map[string]any `json:"files"`
+		Total    int              `json:"total"`
+		Page     int              `json:"page"`
+		PageSize int              `json:"page_size"`
+	}
+	if errDecode := json.Unmarshal(recorder.Body.Bytes(), &response); errDecode != nil {
+		t.Fatal(errDecode)
+	}
+	if response.Total != 1 || len(response.Files) != 0 || response.Page != maxInt || response.PageSize != 40 {
+		t.Fatalf("unexpected oversized page response: %#v", response)
 	}
 }
 
@@ -260,7 +316,7 @@ func TestListAuthFiles_PaginatedFromDisk(t *testing.T) {
 	if errDecode := json.Unmarshal(recorder.Body.Bytes(), &response); errDecode != nil {
 		t.Fatal(errDecode)
 	}
-	if len(response.Files) != 3 || response.Total != 3 || response.Page != 1 || response.PageSize != 3 {
+	if len(response.Files) != 3 || response.Total != 4 || response.Page != 1 || response.PageSize != 3 {
 		t.Fatalf("unexpected disk-backed paginated response: %#v", response)
 	}
 }
@@ -306,6 +362,7 @@ func authFileListTestAuths() []*coreauth.Auth {
 		{ID: "codex-b.json", FileName: "codex-b.json", Provider: "codex", Attributes: map[string]string{"priority": "1"}},
 		{ID: "codex-a.json", FileName: "codex-a.json", Provider: "codex", Disabled: true, StatusMessage: "expired", Attributes: map[string]string{"priority": "20"}},
 		{ID: "claude-a.json", FileName: "claude-a.json", Provider: "claude", Attributes: map[string]string{"priority": "5"}},
+		{ID: "gemini-a.json", FileName: "gemini-a.json", Provider: "gemini", Attributes: map[string]string{"priority": "3"}},
 	}
 }
 

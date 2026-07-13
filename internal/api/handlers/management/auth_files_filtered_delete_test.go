@@ -48,21 +48,107 @@ func TestDeleteAuthFilesFiltered(t *testing.T) {
 }
 
 func TestDeleteAuthFilesFiltered_RejectsSearch(t *testing.T) {
-	h, paths := newFilteredDeleteHandler(t)
+	for _, rawQuery := range []string{"search=*codex*", "search=", "search=%20"} {
+		t.Run(rawQuery, func(t *testing.T) {
+			h, paths := newFilteredDeleteHandler(t)
+
+			recorder := httptest.NewRecorder()
+			ginCtx, _ := gin.CreateTestContext(recorder)
+			ginCtx.Request = httptest.NewRequest(http.MethodDelete,
+				"/v0/management/auth-files?all=true&"+rawQuery, nil)
+			h.DeleteAuthFile(ginCtx)
+
+			if recorder.Code != http.StatusBadRequest {
+				t.Fatalf("status = %d, body = %s", recorder.Code, recorder.Body.String())
+			}
+			for name, path := range paths {
+				if _, errStat := os.Stat(path); errStat != nil {
+					t.Fatalf("auth %q must remain after rejected search delete, stat error = %v", name, errStat)
+				}
+			}
+		})
+	}
+}
+
+func TestDeleteAuthFilesFiltered_SkipsHiddenAuthWithoutPath(t *testing.T) {
+	authDir := t.TempDir()
+	fileName := "hidden.json"
+	filePath := filepath.Join(authDir, fileName)
+	if errWrite := os.WriteFile(filePath, []byte(`{"type":"codex"}`), 0o600); errWrite != nil {
+		t.Fatal(errWrite)
+	}
+	manager := coreauth.NewManager(nil, nil, nil)
+	if _, errRegister := manager.Register(context.Background(), &coreauth.Auth{
+		ID: fileName, FileName: fileName, Provider: "codex", Disabled: true, Status: coreauth.StatusDisabled,
+	}); errRegister != nil {
+		t.Fatal(errRegister)
+	}
+	h := NewHandlerWithoutConfigFilePath(&config.Config{AuthDir: authDir}, manager)
+	h.tokenStore = &memoryAuthStore{}
 
 	recorder := httptest.NewRecorder()
 	ginCtx, _ := gin.CreateTestContext(recorder)
 	ginCtx.Request = httptest.NewRequest(http.MethodDelete,
-		"/v0/management/auth-files?all=true&search=*codex*", nil)
+		"/v0/management/auth-files?all=true&type=codex&disabled_only=true", nil)
 	h.DeleteAuthFile(ginCtx)
 
-	if recorder.Code != http.StatusBadRequest {
+	if recorder.Code != http.StatusOK {
 		t.Fatalf("status = %d, body = %s", recorder.Code, recorder.Body.String())
 	}
-	for name, path := range paths {
-		if _, errStat := os.Stat(path); errStat != nil {
-			t.Fatalf("auth %q must remain after rejected search delete, stat error = %v", name, errStat)
+	var response struct {
+		Deleted int      `json:"deleted"`
+		Files   []string `json:"files"`
+	}
+	if errDecode := json.Unmarshal(recorder.Body.Bytes(), &response); errDecode != nil {
+		t.Fatal(errDecode)
+	}
+	if response.Deleted != 0 || len(response.Files) != 0 {
+		t.Fatalf("hidden auth must not be a delete candidate: %#v", response)
+	}
+	if _, errStat := os.Stat(filePath); errStat != nil {
+		t.Fatalf("hidden auth file must remain, stat error = %v", errStat)
+	}
+}
+
+func TestDeleteAuthFilesFiltered_PartialFailure(t *testing.T) {
+	authDir := t.TempDir()
+	manager := coreauth.NewManager(nil, nil, nil)
+	existingPath := filepath.Join(authDir, "existing.json")
+	if errWrite := os.WriteFile(existingPath, []byte(`{"type":"codex"}`), 0o600); errWrite != nil {
+		t.Fatal(errWrite)
+	}
+	for _, auth := range []*coreauth.Auth{
+		{ID: "existing.json", FileName: "existing.json", Provider: "codex", Attributes: map[string]string{"path": existingPath}},
+		{ID: "missing.json", FileName: "missing.json", Provider: "codex", Attributes: map[string]string{"path": filepath.Join(authDir, "missing.json")}},
+	} {
+		if _, errRegister := manager.Register(context.Background(), auth); errRegister != nil {
+			t.Fatal(errRegister)
 		}
+	}
+	h := NewHandlerWithoutConfigFilePath(&config.Config{AuthDir: authDir}, manager)
+	h.tokenStore = &memoryAuthStore{}
+
+	recorder := httptest.NewRecorder()
+	ginCtx, _ := gin.CreateTestContext(recorder)
+	ginCtx.Request = httptest.NewRequest(http.MethodDelete, "/v0/management/auth-files?all=true&type=codex", nil)
+	h.DeleteAuthFile(ginCtx)
+
+	if recorder.Code != http.StatusMultiStatus {
+		t.Fatalf("status = %d, body = %s", recorder.Code, recorder.Body.String())
+	}
+	var response struct {
+		Deleted int      `json:"deleted"`
+		Files   []string `json:"files"`
+		Failed  []struct {
+			Name  string `json:"name"`
+			Error string `json:"error"`
+		} `json:"failed"`
+	}
+	if errDecode := json.Unmarshal(recorder.Body.Bytes(), &response); errDecode != nil {
+		t.Fatal(errDecode)
+	}
+	if response.Deleted != 1 || len(response.Files) != 1 || response.Files[0] != "existing.json" || len(response.Failed) != 1 || response.Failed[0].Name != "missing.json" || response.Failed[0].Error == "" {
+		t.Fatalf("unexpected partial delete response: %#v", response)
 	}
 }
 
