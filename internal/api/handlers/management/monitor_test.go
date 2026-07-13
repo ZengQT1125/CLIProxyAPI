@@ -578,7 +578,6 @@ func TestGetMonitorServiceHealth_EmptySnapshot(t *testing.T) {
 	}
 }
 
-
 func TestGetMonitorDashboard_ReturnsOverviewSections(t *testing.T) {
 	gin.SetMode(gin.TestMode)
 
@@ -614,7 +613,6 @@ func TestGetMonitorDashboard_ReturnsOverviewSections(t *testing.T) {
 		t.Fatalf("kpi total_requests=%d want 2", kpi.TotalRequests)
 	}
 }
-
 
 func TestGetMonitorProviderMap_FromConfigAndAuths(t *testing.T) {
 	gin.SetMode(gin.TestMode)

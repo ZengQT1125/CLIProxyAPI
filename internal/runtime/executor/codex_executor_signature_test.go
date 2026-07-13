@@ -51,6 +51,7 @@ func TestCodexExecutorDropsInvalidReasoningItemsFromFinalRequest(t *testing.T) {
 		Payload: []byte(`{"model":"gpt-5.4","input":[` +
 			`{"id":"rs_bad","type":"reasoning","encrypted_content":"gAAAAABqFTIa\u2026abc","summary":[]},` +
 			`{"id":"rs_non_string","type":"reasoning","encrypted_content":123,"summary":[]},` +
+			`{"id":"rs_orphan","type":"reasoning","summary":[]},` +
 			`{"id":"rs_good","type":"reasoning","encrypted_content":"` + validEncryptedContent + `","summary":[]},` +
 			`{"role":"user","content":"hello","encrypted_content":"leave-message-alone"}` +
 			`]}`),

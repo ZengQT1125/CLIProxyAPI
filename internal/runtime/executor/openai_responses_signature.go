@@ -12,8 +12,8 @@ import (
 )
 
 func sanitizeOpenAIResponsesReasoningEncryptedContent(ctx context.Context, provider string, body []byte) []byte {
-	input := gjson.GetBytes(body, "input")
-	if !input.Exists() || !input.IsArray() {
+	inputResult := gjson.GetBytes(body, "input")
+	if !inputResult.Exists() || !inputResult.IsArray() {
 		return body
 	}
 	provider = strings.TrimSpace(provider)
@@ -21,14 +21,36 @@ func sanitizeOpenAIResponsesReasoningEncryptedContent(ctx context.Context, provi
 		provider = "openai responses upstream"
 	}
 
-	type invalidReasoningItem struct {
-		index  int
-		id     string
-		reason string
+	items := inputResult.Array()
+
+	// rebuilt stays nil until the first invalid item, preserving the original
+	// body on the common no-op path while rebuilding the array only once.
+	var rebuilt []byte
+	itemsWritten := 0
+	keep := func(raw string) {
+		if rebuilt == nil {
+			return
+		}
+		if itemsWritten > 0 {
+			rebuilt = append(rebuilt, ',')
+		}
+		rebuilt = append(rebuilt, raw...)
+		itemsWritten++
 	}
-	var invalidItems []invalidReasoningItem
-	for index, item := range input.Array() {
+	startRebuild := func(index int) {
+		if rebuilt != nil {
+			return
+		}
+		rebuilt = make([]byte, 0, len(inputResult.Raw))
+		rebuilt = append(rebuilt, '[')
+		for i := range index {
+			keep(items[i].Raw)
+		}
+	}
+
+	for index, item := range items {
 		if strings.TrimSpace(item.Get("type").String()) != "reasoning" {
+			keep(item.Raw)
 			continue
 		}
 
@@ -52,6 +74,7 @@ func sanitizeOpenAIResponsesReasoningEncryptedContent(ctx context.Context, provi
 			}
 		}
 		if reason == "" {
+			keep(item.Raw)
 			continue
 		}
 
@@ -59,24 +82,19 @@ func sanitizeOpenAIResponsesReasoningEncryptedContent(ctx context.Context, provi
 		if itemID == "" {
 			itemID = fmt.Sprintf("input[%d]", index)
 		}
-		invalidItems = append(invalidItems, invalidReasoningItem{
-			index:  index,
-			id:     itemID,
-			reason: reason,
-		})
+		startRebuild(index)
+		helps.LogWithRequestID(ctx).Debugf("%s: dropped invalid reasoning item at input[%d] item_id=%q reason=%s", provider, index, itemID, reason)
 	}
 
-	updated := body
-	for i := len(invalidItems) - 1; i >= 0; i-- {
-		item := invalidItems[i]
-		path := fmt.Sprintf("input.%d", item.index)
-		next, err := sjson.DeleteBytes(updated, path)
-		if err != nil {
-			helps.LogWithRequestID(ctx).Debugf("%s: failed to drop invalid reasoning item at input[%d]: %v", provider, item.index, err)
-			continue
-		}
-		updated = next
-		helps.LogWithRequestID(ctx).Debugf("%s: dropped invalid reasoning item at input[%d] item_id=%q reason=%s", provider, item.index, item.id, item.reason)
+	if rebuilt == nil {
+		return body
+	}
+	rebuilt = append(rebuilt, ']')
+
+	updated, err := sjson.SetRawBytes(body, "input", rebuilt)
+	if err != nil {
+		helps.LogWithRequestID(ctx).Debugf("%s: failed to rebuild input array while sanitizing reasoning items: %v", provider, err)
+		return body
 	}
 	return updated
 }
