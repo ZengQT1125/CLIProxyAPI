@@ -339,23 +339,36 @@ func (h *Handler) ListAuthFiles(c *gin.Context) {
 		c.JSON(500, gin.H{"error": "handler not initialized"})
 		return
 	}
+	query, paginated, errQuery := parseAuthFileListQuery(c)
+	if errQuery != nil {
+		c.JSON(http.StatusBadRequest, gin.H{"error": errQuery.Error()})
+		return
+	}
 	if h.authManager == nil {
-		h.listAuthFilesFromDisk(c)
+		h.listAuthFilesFromDisk(c, query, paginated)
 		return
 	}
 	auths := h.authManager.List()
-	files := make([]gin.H, 0, len(auths))
-	for _, auth := range auths {
+	if !paginated {
+		h.writeFullAuthFileList(c, auths)
+		return
+	}
+	page := buildAuthFileListPage(auths, query)
+	files := make([]gin.H, 0, len(page.Auths))
+	for _, auth := range page.Auths {
 		if entry := h.buildAuthFileEntry(auth); entry != nil {
 			files = append(files, entry)
 		}
 	}
-	sort.Slice(files, func(i, j int) bool {
-		nameI, _ := files[i]["name"].(string)
-		nameJ, _ := files[j]["name"].(string)
-		return strings.ToLower(nameI) < strings.ToLower(nameJ)
+	c.JSON(http.StatusOK, gin.H{
+		"files":               files,
+		"total":               page.Total,
+		"page":                page.Page,
+		"page_size":           page.PageSize,
+		"types":               page.Types,
+		"type_counts":         page.TypeCounts,
+		"enabled_type_counts": page.EnabledTypeCounts,
 	})
-	c.JSON(200, gin.H{"files": files})
 }
 
 // GetAuthFileModels returns the models supported by a specific auth file
@@ -407,13 +420,15 @@ func (h *Handler) GetAuthFileModels(c *gin.Context) {
 }
 
 // List auth files from disk when the auth manager is unavailable.
-func (h *Handler) listAuthFilesFromDisk(c *gin.Context) {
+func (h *Handler) listAuthFilesFromDisk(c *gin.Context, query authFileListQuery, paginated bool) {
 	entries, err := os.ReadDir(h.cfg.AuthDir)
 	if err != nil {
 		c.JSON(500, gin.H{"error": fmt.Sprintf("failed to read auth dir: %v", err)})
 		return
 	}
 	files := make([]gin.H, 0)
+	diskAuths := make([]*coreauth.Auth, 0)
+	diskEntries := make(map[*coreauth.Auth]gin.H)
 	for _, e := range entries {
 		if e.IsDir() {
 			continue
@@ -427,11 +442,24 @@ func (h *Handler) listAuthFilesFromDisk(c *gin.Context) {
 
 			// Read file to get type field
 			full := filepath.Join(h.cfg.AuthDir, name)
+			diskAuth := &coreauth.Auth{
+				ID:       name,
+				FileName: name,
+				Attributes: map[string]string{
+					"path": full,
+				},
+			}
 			if data, errRead := os.ReadFile(full); errRead == nil {
 				typeValue := gjson.GetBytes(data, "type").String()
 				emailValue := gjson.GetBytes(data, "email").String()
 				fileData["type"] = typeValue
 				fileData["email"] = emailValue
+				diskAuth.Provider = typeValue
+				diskAuth.Disabled = gjson.GetBytes(data, "disabled").Bool()
+				diskAuth.StatusMessage = strings.TrimSpace(gjson.GetBytes(data, "status_message").String())
+				if strings.EqualFold(strings.TrimSpace(gjson.GetBytes(data, "status").String()), string(coreauth.StatusDisabled)) {
+					diskAuth.Status = coreauth.StatusDisabled
+				}
 				if projectID := strings.TrimSpace(gjson.GetBytes(data, "project_id").String()); projectID != "" {
 					fileData["project_id"] = projectID
 				}
@@ -444,6 +472,9 @@ func (h *Handler) listAuthFilesFromDisk(c *gin.Context) {
 							fileData["priority"] = parsed
 						}
 					}
+				}
+				if priority, ok := fileData["priority"].(int); ok {
+					diskAuth.Attributes["priority"] = strconv.Itoa(priority)
 				}
 				if nv := gjson.GetBytes(data, "note"); nv.Exists() && nv.Type == gjson.String {
 					if trimmed := strings.TrimSpace(nv.String()); trimmed != "" {
@@ -465,9 +496,28 @@ func (h *Handler) listAuthFilesFromDisk(c *gin.Context) {
 			}
 
 			files = append(files, fileData)
+			diskAuths = append(diskAuths, diskAuth)
+			diskEntries[diskAuth] = fileData
 		}
 	}
-	c.JSON(200, gin.H{"files": files})
+	if !paginated {
+		c.JSON(200, gin.H{"files": files})
+		return
+	}
+	page := buildAuthFileListPage(diskAuths, query)
+	pageFiles := make([]gin.H, 0, len(page.Auths))
+	for _, auth := range page.Auths {
+		pageFiles = append(pageFiles, diskEntries[auth])
+	}
+	c.JSON(http.StatusOK, gin.H{
+		"files":               pageFiles,
+		"total":               page.Total,
+		"page":                page.Page,
+		"page_size":           page.PageSize,
+		"types":               page.Types,
+		"type_counts":         page.TypeCounts,
+		"enabled_type_counts": page.EnabledTypeCounts,
+	})
 }
 
 func (h *Handler) buildAuthFileEntry(auth *coreauth.Auth) gin.H {
@@ -475,14 +525,11 @@ func (h *Handler) buildAuthFileEntry(auth *coreauth.Auth) gin.H {
 		return nil
 	}
 	auth.EnsureIndex()
+	if !authFileListVisible(auth) {
+		return nil
+	}
 	runtimeOnly := isRuntimeOnlyAuth(auth)
-	if runtimeOnly && (auth.Disabled || auth.Status == coreauth.StatusDisabled) {
-		return nil
-	}
 	path := strings.TrimSpace(authAttribute(auth, "path"))
-	if path == "" && !runtimeOnly {
-		return nil
-	}
 	name := strings.TrimSpace(auth.FileName)
 	if name == "" {
 		name = auth.ID
@@ -537,25 +584,8 @@ func (h *Handler) buildAuthFileEntry(auth *coreauth.Auth) gin.H {
 	if claims := extractCodexIDTokenClaims(auth); claims != nil {
 		entry["id_token"] = claims
 	}
-	// Expose priority from Attributes (set by synthesizer from JSON "priority" field).
-	// Fall back to Metadata for auths registered via UploadAuthFile (no synthesizer).
-	if p := strings.TrimSpace(authAttribute(auth, "priority")); p != "" {
-		if parsed, err := strconv.Atoi(p); err == nil {
-			entry["priority"] = parsed
-		}
-	} else if auth.Metadata != nil {
-		if rawPriority, ok := auth.Metadata["priority"]; ok {
-			switch v := rawPriority.(type) {
-			case float64:
-				entry["priority"] = int(v)
-			case int:
-				entry["priority"] = v
-			case string:
-				if parsed, err := strconv.Atoi(strings.TrimSpace(v)); err == nil {
-					entry["priority"] = parsed
-				}
-			}
-		}
+	if priority, ok := authFilePriority(auth); ok {
+		entry["priority"] = priority
 	}
 	// Expose note from Attributes (set by synthesizer from JSON "note" field).
 	// Fall back to Metadata for auths registered via UploadAuthFile (no synthesizer).
