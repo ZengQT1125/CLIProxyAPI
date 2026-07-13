@@ -164,29 +164,32 @@ func TestSQLiteUsageStoreQueryMonitorKeyStatsBlocksAuthIndexFilter(t *testing.T)
 		UsageRecord{APIKey: "api-a", Model: "model-a", Source: "source-a", AuthIndex: "auth-a", RequestedAt: base.Add(-19 * time.Minute)},
 		UsageRecord{APIKey: "api-a", Model: "model-a", Source: "source-a", AuthIndex: "auth-a", RequestedAt: base.Add(-9 * time.Minute), Failed: true},
 		UsageRecord{APIKey: "api-b", Model: "model-b", Source: "source-b", AuthIndex: "auth-b", RequestedAt: base.Add(-8 * time.Minute)},
-		UsageRecord{APIKey: "api-empty", Model: "model-empty", Source: "source-empty", RequestedAt: base.Add(-7 * time.Minute)},
+		UsageRecord{APIKey: "api-c", Model: "model-c", Source: "source-c", AuthIndex: "auth-c", RequestedAt: base.Add(-7 * time.Minute)},
 	)
 
-	rows, err := store.QueryMonitorKeyStatsBlocks(ctx, base.Add(-20*time.Minute).Unix(), base.Unix(), int((10 * time.Minute).Seconds()), " auth-a ")
+	rows, err := store.QueryMonitorKeyStatsBlocks(ctx, base.Add(-20*time.Minute).Unix(), base.Unix(), int((10 * time.Minute).Seconds()), []string{"auth-a", "auth-b"})
 	if err != nil {
 		t.Fatalf("QueryMonitorKeyStatsBlocks failed: %v", err)
 	}
 
-	if len(rows) != 2 {
-		t.Fatalf("unexpected row count: got %d want 2 rows=%#v", len(rows), rows)
+	if len(rows) != 3 {
+		t.Fatalf("unexpected row count: got %d want 3 rows=%#v", len(rows), rows)
 	}
 	var successCount, failureCount int64
 	for _, row := range rows {
-		if row.AuthIndex != "auth-a" {
+		if row.AuthIndex == "auth-c" {
 			t.Fatalf("unexpected auth index in filtered rows: %+v", row)
 		}
-		if row.Source != "source-a" {
+		if row.AuthIndex != "auth-a" && row.AuthIndex != "auth-b" {
+			t.Fatalf("unexpected auth index in filtered rows: %+v", row)
+		}
+		if row.Source != "source-a" && row.Source != "source-b" {
 			t.Fatalf("unexpected source in filtered rows: %+v", row)
 		}
 		successCount += row.Success
 		failureCount += row.Failure
 	}
-	if successCount != 1 || failureCount != 1 {
+	if successCount != 2 || failureCount != 1 {
 		t.Fatalf("unexpected filtered totals: success=%d failure=%d", successCount, failureCount)
 	}
 }

@@ -1121,6 +1121,26 @@ func setToSortedSlice(items map[string]struct{}) []string {
 	return out
 }
 
+func normalizeAuthIndexes(values []string) []string {
+	if len(values) == 0 {
+		return []string{}
+	}
+	seen := make(map[string]struct{}, len(values))
+	authIndexes := make([]string, 0, len(values))
+	for _, value := range values {
+		value = strings.TrimSpace(value)
+		if value == "" {
+			continue
+		}
+		if _, exists := seen[value]; exists {
+			continue
+		}
+		seen[value] = struct{}{}
+		authIndexes = append(authIndexes, value)
+	}
+	return authIndexes
+}
+
 func calcRate(success, total int64) float64 {
 	if total <= 0 {
 		return 0
@@ -1926,7 +1946,11 @@ func (h *Handler) GetMonitorKeyStats(c *gin.Context) {
 
 	now := time.Now()
 	windowStart := now.Add(-windowDuration)
-	authIndexFilter := strings.TrimSpace(c.Query("auth_index"))
+	authIndexes := normalizeAuthIndexes(c.QueryArray("auth_index"))
+	authIndexSet := make(map[string]struct{}, len(authIndexes))
+	for _, authIndex := range authIndexes {
+		authIndexSet[authIndex] = struct{}{}
+	}
 
 	type blockStats struct {
 		Success int64 `json:"success"`
@@ -1952,14 +1976,16 @@ func (h *Handler) GetMonitorKeyStats(c *gin.Context) {
 	}
 
 	if dbPlugin := usage.GetDatabasePlugin(); dbPlugin != nil {
-		rows, queryErr := dbPlugin.QueryMonitorKeyStatsBlocks(c.Request.Context(), windowStart.Unix(), now.Unix(), int(blockDuration.Seconds()), authIndexFilter)
+		rows, queryErr := dbPlugin.QueryMonitorKeyStatsBlocks(c.Request.Context(), windowStart.Unix(), now.Unix(), int(blockDuration.Seconds()), authIndexes)
 		if queryErr == nil {
 			for _, row := range rows {
 				if row.BlockIndex < 0 || row.BlockIndex >= blockCount {
 					continue
 				}
-				if authIndexFilter != "" && row.AuthIndex != authIndexFilter {
-					continue
+				if len(authIndexSet) > 0 {
+					if _, exists := authIndexSet[row.AuthIndex]; !exists {
+						continue
+					}
 				}
 				srcStats := ensureEntry(bySource, row.Source)
 				srcStats.Success += row.Success
@@ -1990,8 +2016,10 @@ func (h *Handler) GetMonitorKeyStats(c *gin.Context) {
 		if authIdx == "" {
 			authIdx = "unknown"
 		}
-		if authIndexFilter != "" && authIdx != authIndexFilter {
-			return
+		if len(authIndexSet) > 0 {
+			if _, exists := authIndexSet[authIdx]; !exists {
+				return
+			}
 		}
 
 		source := record.Source
@@ -2033,8 +2061,8 @@ buildKeyStatsResponse:
 			"window_start_ms": windowStart.UnixMilli(),
 		},
 	}
-	if authIndexFilter != "" {
-		response["filter"] = gin.H{"auth_index": authIndexFilter}
+	if len(authIndexes) > 0 {
+		response["filter"] = gin.H{"auth_indexes": authIndexes}
 	}
 
 	c.JSON(http.StatusOK, response)

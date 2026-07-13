@@ -6,6 +6,7 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"net/url"
+	"slices"
 	"sort"
 	"strings"
 	"testing"
@@ -339,6 +340,23 @@ func TestGetMonitorRequestLogs_DatabasePluginPath(t *testing.T) {
 	}
 }
 
+func TestGetMonitorKeyStatsWithoutAuthIndexOmitsFilter(t *testing.T) {
+	gin.SetMode(gin.TestMode)
+
+	rr := executeMonitorRequest(newMonitorTestHandler().GetMonitorKeyStats, "/monitor/key-stats")
+	if rr.Code != http.StatusOK {
+		t.Fatalf("unexpected status: %d, body=%s", rr.Code, rr.Body.String())
+	}
+
+	var resp map[string]json.RawMessage
+	if err := json.Unmarshal(rr.Body.Bytes(), &resp); err != nil {
+		t.Fatalf("decode response failed: %v", err)
+	}
+	if _, exists := resp["filter"]; exists {
+		t.Fatalf("unexpected filter in unfiltered response: %s", rr.Body.String())
+	}
+}
+
 func TestGetMonitorKeyStats_AuthIndexFilter(t *testing.T) {
 	gin.SetMode(gin.TestMode)
 
@@ -352,7 +370,7 @@ func TestGetMonitorKeyStats_AuthIndexFilter(t *testing.T) {
 
 	h := newMonitorTestHandler(authA, authAFail, authB)
 
-	rr := executeMonitorRequest(h.GetMonitorKeyStats, "/monitor/key-stats?auth_index=auth-a")
+	rr := executeMonitorRequest(h.GetMonitorKeyStats, "/monitor/key-stats?auth_index=auth-a&auth_index=auth-b")
 	if rr.Code != http.StatusOK {
 		t.Fatalf("unexpected status: %d, body=%s", rr.Code, rr.Body.String())
 	}
@@ -374,36 +392,36 @@ func TestGetMonitorKeyStats_AuthIndexFilter(t *testing.T) {
 			Count int `json:"count"`
 		} `json:"block_config"`
 		Filter struct {
-			AuthIndex string `json:"auth_index"`
+			AuthIndexes []string `json:"auth_indexes"`
 		} `json:"filter"`
 	}
 	if err := json.Unmarshal(rr.Body.Bytes(), &resp); err != nil {
 		t.Fatalf("decode response failed: %v", err)
 	}
 
-	if len(resp.ByAuthIndex) != 1 {
+	if len(resp.ByAuthIndex) != 2 {
 		t.Fatalf("unexpected auth index entries: %#v", resp.ByAuthIndex)
 	}
 	if got := resp.ByAuthIndex["auth-a"]; got.Success != 1 || got.Failure != 1 || len(got.Blocks) != 20 {
 		t.Fatalf("unexpected auth-a stats: %+v", got)
 	}
-	if _, ok := resp.ByAuthIndex["auth-b"]; ok {
-		t.Fatalf("unexpected auth-b stats in filtered response: %#v", resp.ByAuthIndex)
+	if got := resp.ByAuthIndex["auth-b"]; got.Success != 1 || got.Failure != 0 || len(got.Blocks) != 20 {
+		t.Fatalf("unexpected auth-b stats: %+v", got)
 	}
-	if len(resp.BySource) != 1 {
+	if len(resp.BySource) != 2 {
 		t.Fatalf("unexpected source entries: %#v", resp.BySource)
 	}
 	if got := resp.BySource["source-a"]; got.Success != 1 || got.Failure != 1 {
 		t.Fatalf("unexpected source-a stats: %+v", got)
 	}
-	if _, ok := resp.BySource["source-b"]; ok {
-		t.Fatalf("unexpected source-b stats in filtered response: %#v", resp.BySource)
+	if got := resp.BySource["source-b"]; got.Success != 1 || got.Failure != 0 {
+		t.Fatalf("unexpected source-b stats: %+v", got)
 	}
 	if resp.BlockConfig.Count != 20 {
 		t.Fatalf("unexpected block count: got %d want 20", resp.BlockConfig.Count)
 	}
-	if resp.Filter.AuthIndex != "auth-a" {
-		t.Fatalf("unexpected filter auth index: got %q want auth-a", resp.Filter.AuthIndex)
+	if !slices.Equal(resp.Filter.AuthIndexes, []string{"auth-a", "auth-b"}) {
+		t.Fatalf("unexpected filter auth indexes: got %q want %q", resp.Filter.AuthIndexes, []string{"auth-a", "auth-b"})
 	}
 }
 

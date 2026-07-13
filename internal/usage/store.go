@@ -364,6 +364,7 @@ func (s *pgUsageStore) EnsureSchema(ctx context.Context) error {
 		fmt.Sprintf("CREATE INDEX IF NOT EXISTS idx_usage_source_model_requested_id ON %s(source, model, requested_at DESC, id DESC)", table),
 		fmt.Sprintf("CREATE INDEX IF NOT EXISTS idx_usage_source_norm_requested ON %s((COALESCE(NULLIF(source, ''), 'unknown')), requested_at DESC)", table),
 		fmt.Sprintf("CREATE INDEX IF NOT EXISTS idx_usage_source_norm_model_requested ON %s((COALESCE(NULLIF(source, ''), 'unknown')), model, requested_at DESC)", table),
+		fmt.Sprintf("CREATE INDEX IF NOT EXISTS idx_usage_auth_index_norm_requested ON %s((COALESCE(NULLIF(auth_index, ''), 'unknown')), requested_at DESC)", table),
 	}
 	for _, idx := range indexes {
 		if _, err := s.db.ExecContext(ctx, idx); err != nil {
@@ -831,6 +832,7 @@ func (s *sqliteUsageStore) EnsureSchema(ctx context.Context) error {
 		"CREATE INDEX IF NOT EXISTS idx_usage_source_model_requested ON usage_records(source, model, requested_at DESC)",
 		"CREATE INDEX IF NOT EXISTS idx_usage_source_norm_requested ON usage_records((COALESCE(NULLIF(source, ''), 'unknown')), requested_at DESC)",
 		"CREATE INDEX IF NOT EXISTS idx_usage_source_norm_model_requested ON usage_records((COALESCE(NULLIF(source, ''), 'unknown')), model, requested_at DESC)",
+		"CREATE INDEX IF NOT EXISTS idx_usage_auth_index_norm_requested ON usage_records((COALESCE(NULLIF(auth_index, ''), 'unknown')), requested_at DESC)",
 	}
 	for _, idx := range indexes {
 		if _, err := s.db.ExecContext(ctx, idx); err != nil {
