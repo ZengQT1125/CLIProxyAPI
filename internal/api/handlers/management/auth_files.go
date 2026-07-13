@@ -1103,7 +1103,28 @@ func authFilePathWithinDir(authDir, path string) (string, bool) {
 	if isUnsafeAuthFileName(filepath.Base(pathAbs)) {
 		return "", false
 	}
-	return pathAbs, true
+	authDirReal, errAuthDirReal := filepath.EvalSymlinks(authDirAbs)
+	if errAuthDirReal != nil {
+		return "", false
+	}
+	parentReal, errParentReal := filepath.EvalSymlinks(filepath.Dir(pathAbs))
+	if errParentReal != nil {
+		return "", false
+	}
+	authDirReal = filepath.Clean(authDirReal)
+	parentReal = filepath.Clean(parentReal)
+	realRel, errRealRel := filepath.Rel(authDirReal, parentReal)
+	if errRealRel != nil || realRel == ".." || strings.HasPrefix(realRel, ".."+string(os.PathSeparator)) || filepath.IsAbs(realRel) {
+		return "", false
+	}
+	if info, errLstat := os.Lstat(pathAbs); errLstat != nil {
+		if !os.IsNotExist(errLstat) {
+			return "", false
+		}
+	} else if info.Mode()&os.ModeSymlink != 0 {
+		return "", false
+	}
+	return filepath.Join(parentReal, filepath.Base(pathAbs)), true
 }
 
 func (h *Handler) deleteFilteredAuthFile(ctx context.Context, candidate filteredAuthFileCandidate) (string, int, error) {

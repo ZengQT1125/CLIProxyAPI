@@ -198,6 +198,108 @@ func TestDeleteAuthFilesFiltered_SkipsPathOutsideAuthDir(t *testing.T) {
 	}
 }
 
+func TestDeleteAuthFilesFiltered_SkipsDirectorySymlinkEscape(t *testing.T) {
+	authDir := t.TempDir()
+	externalDir := t.TempDir()
+	externalPath := filepath.Join(externalDir, "external.json")
+	if errWrite := os.WriteFile(externalPath, []byte(`{"type":"codex"}`), 0o600); errWrite != nil {
+		t.Fatal(errWrite)
+	}
+	linkPath := filepath.Join(authDir, "linked")
+	if errLink := os.Symlink(externalDir, linkPath); errLink != nil {
+		t.Skipf("create directory symlink: %v", errLink)
+	}
+	manager := coreauth.NewManager(nil, nil, nil)
+	if _, errRegister := manager.Register(context.Background(), &coreauth.Auth{
+		ID:       "external.json",
+		FileName: filepath.Join(linkPath, "external.json"),
+		Provider: "codex",
+		Attributes: map[string]string{
+			"path": filepath.Join(linkPath, "external.json"),
+		},
+	}); errRegister != nil {
+		t.Fatal(errRegister)
+	}
+	h := NewHandlerWithoutConfigFilePath(&config.Config{AuthDir: authDir}, manager)
+	h.tokenStore = &memoryAuthStore{}
+
+	recorder := httptest.NewRecorder()
+	ginCtx, _ := gin.CreateTestContext(recorder)
+	ginCtx.Request = httptest.NewRequest(http.MethodDelete, "/v0/management/auth-files?all=true&type=codex", nil)
+	h.DeleteAuthFile(ginCtx)
+
+	if recorder.Code != http.StatusOK {
+		t.Fatalf("status = %d, body = %s", recorder.Code, recorder.Body.String())
+	}
+	var response struct {
+		Deleted int `json:"deleted"`
+	}
+	if errDecode := json.Unmarshal(recorder.Body.Bytes(), &response); errDecode != nil {
+		t.Fatal(errDecode)
+	}
+	if response.Deleted != 0 {
+		t.Fatalf("directory symlink escape must not be deleted: %#v", response)
+	}
+	if _, errStat := os.Stat(externalPath); errStat != nil {
+		t.Fatalf("external auth file must remain, stat error = %v", errStat)
+	}
+	if _, ok := manager.GetByID("external.json"); !ok {
+		t.Fatal("directory symlink escape auth must remain")
+	}
+}
+
+func TestDeleteAuthFilesFiltered_SkipsFileSymlink(t *testing.T) {
+	authDir := t.TempDir()
+	externalPath := filepath.Join(t.TempDir(), "external.json")
+	if errWrite := os.WriteFile(externalPath, []byte(`{"type":"codex"}`), 0o600); errWrite != nil {
+		t.Fatal(errWrite)
+	}
+	linkPath := filepath.Join(authDir, "link.json")
+	if errLink := os.Symlink(externalPath, linkPath); errLink != nil {
+		t.Skipf("create file symlink: %v", errLink)
+	}
+	manager := coreauth.NewManager(nil, nil, nil)
+	if _, errRegister := manager.Register(context.Background(), &coreauth.Auth{
+		ID:       "link.json",
+		FileName: linkPath,
+		Provider: "codex",
+		Attributes: map[string]string{
+			"path": linkPath,
+		},
+	}); errRegister != nil {
+		t.Fatal(errRegister)
+	}
+	h := NewHandlerWithoutConfigFilePath(&config.Config{AuthDir: authDir}, manager)
+	h.tokenStore = &memoryAuthStore{}
+
+	recorder := httptest.NewRecorder()
+	ginCtx, _ := gin.CreateTestContext(recorder)
+	ginCtx.Request = httptest.NewRequest(http.MethodDelete, "/v0/management/auth-files?all=true&type=codex", nil)
+	h.DeleteAuthFile(ginCtx)
+
+	if recorder.Code != http.StatusOK {
+		t.Fatalf("status = %d, body = %s", recorder.Code, recorder.Body.String())
+	}
+	var response struct {
+		Deleted int `json:"deleted"`
+	}
+	if errDecode := json.Unmarshal(recorder.Body.Bytes(), &response); errDecode != nil {
+		t.Fatal(errDecode)
+	}
+	if response.Deleted != 0 {
+		t.Fatalf("file symlink must not be deleted: %#v", response)
+	}
+	if _, errStat := os.Lstat(linkPath); errStat != nil {
+		t.Fatalf("auth symlink must remain, stat error = %v", errStat)
+	}
+	if _, errStat := os.Stat(externalPath); errStat != nil {
+		t.Fatalf("external auth file must remain, stat error = %v", errStat)
+	}
+	if _, ok := manager.GetByID("link.json"); !ok {
+		t.Fatal("file symlink auth must remain")
+	}
+}
+
 func TestDeleteAuthFilesFiltered_DeletesExactNestedPath(t *testing.T) {
 	authDir := t.TempDir()
 	targetPath := filepath.Join(authDir, "a", "shared.json")
