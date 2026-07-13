@@ -1855,6 +1855,721 @@ func (e *monitorValidationError) Error() string {
 	return e.msg
 }
 
+// GetMonitorDashboard returns the first-screen monitor overview in one response.
+// Sections run sequentially against SQLite so the management UI no longer storms
+// the usage DB with parallel KPI/trend/distribution/health queries.
+func (h *Handler) GetMonitorDashboard(c *gin.Context) {
+	start, end, err := parseMonitorTimeRange(c)
+	if err != nil {
+		c.JSON(http.StatusBadRequest, gin.H{"error": err.Error()})
+		return
+	}
+
+	hours, err := parseBoundedInt(firstQuery(c, "hours"), 12, 1, 168)
+	if err != nil {
+		c.JSON(http.StatusBadRequest, gin.H{"error": err.Error()})
+		return
+	}
+	hourlyModelLimit, err := parseBoundedInt(firstQuery(c, "hourly_model_limit", "hourlyModelLimit"), 6, 1, 20)
+	if err != nil {
+		c.JSON(http.StatusBadRequest, gin.H{"error": err.Error()})
+		return
+	}
+	channelLimit, err := parseBoundedInt(firstQuery(c, "channel_limit", "channelLimit"), 100, 1, monitorMaxTopLimit)
+	if err != nil {
+		c.JSON(http.StatusBadRequest, gin.H{"error": err.Error()})
+		return
+	}
+
+	dbPlugin := usage.GetDatabasePlugin()
+	if dbPlugin != nil && !isExplicitAllTimeRange(c) {
+		start, end = applyDefaultTimeRange(start, end, 7)
+	}
+
+	filter := monitorRecordFilter{
+		APIKey:      firstQuery(c, "api", "api_key"),
+		APIContains: firstQuery(c, "api_filter", "apiFilter", "api_like", "apiLike", "q"),
+		Model:       firstQuery(c, "model"),
+		Source:      firstQuery(c, "source", "channel"),
+		Start:       start,
+		End:         end,
+	}
+	timeRange := monitorTimeRange{Start: start, End: end}
+
+	resp := gin.H{
+		"time_range": timeRange,
+		"kpi":        h.buildMonitorKpi(c, filter, start, end),
+		"daily_trend": gin.H{
+			"items":      h.buildMonitorDailyTrendItems(c, filter),
+			"time_range": timeRange,
+		},
+		"hourly_models":  h.buildMonitorHourlyModels(c, filter, hours, hourlyModelLimit, start, end),
+		"hourly_tokens":  h.buildMonitorHourlyTokens(c, filter, hours, start, end),
+		"channel_stats":  h.buildMonitorChannelStatsPayload(c, filter, channelLimit, start, end),
+		"service_health": h.buildMonitorServiceHealth(c),
+	}
+
+	c.JSON(http.StatusOK, resp)
+}
+
+func (h *Handler) buildMonitorKpi(c *gin.Context, filter monitorRecordFilter, start, end *time.Time) monitorKpiResponse {
+	if dbPlugin := usage.GetDatabasePlugin(); dbPlugin != nil {
+		result, queryErr := dbPlugin.QueryMonitorKpi(c.Request.Context(), toUsageMonitorFilter(filter))
+		if queryErr == nil {
+			resp := monitorKpiResponse{
+				TotalRequests:    result.TotalRequests,
+				SuccessRequests:  result.SuccessRequests,
+				FailedRequests:   result.FailedRequests,
+				TotalTokens:      result.TotalTokens,
+				InputTokens:      result.InputTokens,
+				OutputTokens:     result.OutputTokens,
+				ReasoningTokens:  result.ReasoningTokens,
+				CachedTokens:     result.CachedTokens,
+				CacheWriteTokens: result.CacheWriteTokens,
+				SuccessRate:      calcRate(result.SuccessRequests, result.TotalRequests),
+				TimeRange:        monitorTimeRange{Start: start, End: end},
+			}
+			if resp.TotalRequests > 0 && result.MinTimestamp != nil && result.MaxTimestamp != nil {
+				spanMinutes := result.MaxTimestamp.Sub(*result.MinTimestamp).Minutes()
+				if spanMinutes < 1 {
+					spanMinutes = 1
+				}
+				spanDays := spanMinutes / (60 * 24)
+				if spanDays < 1 {
+					spanDays = 1
+				}
+				resp.AvgTpm = math.Round(float64(resp.TotalTokens)/spanMinutes*10) / 10
+				resp.AvgRpm = math.Round(float64(resp.TotalRequests)/spanMinutes*10) / 10
+				resp.AvgRpd = math.Round(float64(resp.TotalRequests)/spanDays*10) / 10
+			}
+			return resp
+		}
+	}
+
+	var resp monitorKpiResponse
+	var minTs, maxTs time.Time
+	visitSnapshotRecords(h.usageSnapshot(), func(record monitorRecord) {
+		if !filter.matches(record) {
+			return
+		}
+		resp.TotalRequests++
+		if record.Failed {
+			resp.FailedRequests++
+		} else {
+			resp.SuccessRequests++
+			resp.TotalTokens += record.TotalTokens
+			resp.InputTokens += record.InputTokens
+			resp.OutputTokens += record.OutputTokens
+			resp.ReasoningTokens += record.ReasoningTokens
+			resp.CachedTokens += record.CachedTokens
+			resp.CacheWriteTokens += record.CacheWriteTokens
+		}
+		if minTs.IsZero() || record.Timestamp.Before(minTs) {
+			minTs = record.Timestamp
+		}
+		if maxTs.IsZero() || record.Timestamp.After(maxTs) {
+			maxTs = record.Timestamp
+		}
+	})
+	resp.SuccessRate = calcRate(resp.SuccessRequests, resp.TotalRequests)
+	if resp.TotalRequests > 0 && !minTs.IsZero() && !maxTs.IsZero() {
+		spanMinutes := maxTs.Sub(minTs).Minutes()
+		if spanMinutes < 1 {
+			spanMinutes = 1
+		}
+		spanDays := spanMinutes / (60 * 24)
+		if spanDays < 1 {
+			spanDays = 1
+		}
+		resp.AvgTpm = math.Round(float64(resp.TotalTokens)/spanMinutes*10) / 10
+		resp.AvgRpm = math.Round(float64(resp.TotalRequests)/spanMinutes*10) / 10
+		resp.AvgRpd = math.Round(float64(resp.TotalRequests)/spanDays*10) / 10
+	}
+	resp.TimeRange = monitorTimeRange{Start: start, End: end}
+	return resp
+}
+
+func (h *Handler) buildMonitorDailyTrendItems(c *gin.Context, filter monitorRecordFilter) []monitorDailyTrendItem {
+	if dbPlugin := usage.GetDatabasePlugin(); dbPlugin != nil {
+		result, queryErr := dbPlugin.QueryMonitorDailyTrend(c.Request.Context(), toUsageMonitorFilter(filter))
+		if queryErr == nil {
+			items := make([]monitorDailyTrendItem, 0, len(result))
+			for _, row := range result {
+				items = append(items, monitorDailyTrendItem{
+					Date:             row.Date,
+					Requests:         row.Requests,
+					SuccessRequests:  row.SuccessRequests,
+					FailedRequests:   row.FailedRequests,
+					InputTokens:      row.InputTokens,
+					OutputTokens:     row.OutputTokens,
+					ReasoningTokens:  row.ReasoningTokens,
+					CachedTokens:     row.CachedTokens,
+					CacheWriteTokens: row.CacheWriteTokens,
+				})
+			}
+			return items
+		}
+	}
+
+	type dayAcc struct {
+		Requests         int64
+		SuccessRequests  int64
+		FailedRequests   int64
+		InputTokens      int64
+		OutputTokens     int64
+		ReasoningTokens  int64
+		CachedTokens     int64
+		CacheWriteTokens int64
+	}
+	dayMap := make(map[string]*dayAcc)
+	visitSnapshotRecords(h.usageSnapshot(), func(record monitorRecord) {
+		if !filter.matches(record) {
+			return
+		}
+		dateKey := record.Timestamp.Local().Format("2006-01-02")
+		acc, ok := dayMap[dateKey]
+		if !ok {
+			acc = &dayAcc{}
+			dayMap[dateKey] = acc
+		}
+		acc.Requests++
+		if record.Failed {
+			acc.FailedRequests++
+		} else {
+			acc.SuccessRequests++
+			acc.InputTokens += record.InputTokens
+			acc.OutputTokens += record.OutputTokens
+			acc.ReasoningTokens += record.ReasoningTokens
+			acc.CachedTokens += record.CachedTokens
+			acc.CacheWriteTokens += record.CacheWriteTokens
+		}
+	})
+	items := make([]monitorDailyTrendItem, 0, len(dayMap))
+	for date, acc := range dayMap {
+		items = append(items, monitorDailyTrendItem{
+			Date:             date,
+			Requests:         acc.Requests,
+			SuccessRequests:  acc.SuccessRequests,
+			FailedRequests:   acc.FailedRequests,
+			InputTokens:      acc.InputTokens,
+			OutputTokens:     acc.OutputTokens,
+			ReasoningTokens:  acc.ReasoningTokens,
+			CachedTokens:     acc.CachedTokens,
+			CacheWriteTokens: acc.CacheWriteTokens,
+		})
+	}
+	sort.Slice(items, func(i, j int) bool { return items[i].Date < items[j].Date })
+	return items
+}
+
+func (h *Handler) buildMonitorHourlyModels(
+	c *gin.Context,
+	filter monitorRecordFilter,
+	hours, limit int,
+	start, end *time.Time,
+) monitorHourlyModelsResponse {
+	now := time.Now()
+	cutoff := now.Truncate(time.Hour).Add(-time.Duration(hours-1) * time.Hour)
+	hourSlots := make([]string, 0, hours)
+	hourIndex := make(map[string]int, hours)
+	for t := cutoff; !t.After(now.Truncate(time.Hour)); t = t.Add(time.Hour) {
+		key := t.Local().Format("2006-01-02T15:04:05-07:00")
+		hourIndex[key] = len(hourSlots)
+		hourSlots = append(hourSlots, key)
+	}
+	slotCount := len(hourSlots)
+	empty := monitorHourlyModelsResponse{
+		Hours:        hourSlots,
+		Models:       []string{},
+		ModelData:    map[string][]int64{},
+		SuccessRates: make([]float64, slotCount),
+		TimeRange:    monitorTimeRange{Start: start, End: end},
+	}
+
+	if dbPlugin := usage.GetDatabasePlugin(); dbPlugin != nil {
+		slots, queryErr := dbPlugin.QueryMonitorHourlySlots(c.Request.Context(), toUsageMonitorFilter(filter), cutoff.Unix(), now.Unix(), 3600)
+		if queryErr == nil {
+			modelTotals := make(map[string]int64)
+			type slotModelKey struct {
+				slot  int
+				model string
+			}
+			slotModelCounts := make(map[slotModelKey]int64)
+			hourSuccess := make([]int64, slotCount)
+			hourTotal := make([]int64, slotCount)
+			for _, slot := range slots {
+				if slot.SlotIndex < 0 || slot.SlotIndex >= slotCount {
+					continue
+				}
+				modelTotals[slot.Model] += slot.Total
+				slotModelCounts[slotModelKey{slot: slot.SlotIndex, model: slot.Model}] = slot.Total
+				hourTotal[slot.SlotIndex] += slot.Total
+				hourSuccess[slot.SlotIndex] += slot.Success
+			}
+			type modelCount struct {
+				model string
+				count int64
+			}
+			mc := make([]modelCount, 0, len(modelTotals))
+			for m, cnt := range modelTotals {
+				mc = append(mc, modelCount{model: m, count: cnt})
+			}
+			sort.Slice(mc, func(i, j int) bool {
+				if mc[i].count == mc[j].count {
+					return mc[i].model < mc[j].model
+				}
+				return mc[i].count > mc[j].count
+			})
+			if len(mc) > limit {
+				mc = mc[:limit]
+			}
+			topModels := make([]string, len(mc))
+			modelData := make(map[string][]int64, len(mc))
+			for i, m := range mc {
+				topModels[i] = m.model
+				data := make([]int64, slotCount)
+				for si := range hourSlots {
+					data[si] = slotModelCounts[slotModelKey{slot: si, model: m.model}]
+				}
+				modelData[m.model] = data
+			}
+			successRates := make([]float64, slotCount)
+			for i := range hourSlots {
+				successRates[i] = calcRate(hourSuccess[i], hourTotal[i])
+			}
+			return monitorHourlyModelsResponse{
+				Hours:        hourSlots,
+				Models:       topModels,
+				ModelData:    modelData,
+				SuccessRates: successRates,
+				TimeRange:    monitorTimeRange{Start: start, End: end},
+			}
+		}
+	}
+
+	type hourModelKey struct {
+		hour  string
+		model string
+	}
+	hmCounts := make(map[hourModelKey]int64)
+	modelTotals := make(map[string]int64)
+	hourSuccess := make([]int64, slotCount)
+	hourTotal := make([]int64, slotCount)
+	visitSnapshotRecords(h.usageSnapshot(), func(record monitorRecord) {
+		if record.Timestamp.Before(cutoff) || !filter.matches(record) {
+			return
+		}
+		hourKey := record.Timestamp.Local().Truncate(time.Hour).Format("2006-01-02T15:04:05-07:00")
+		idx, ok := hourIndex[hourKey]
+		if !ok {
+			return
+		}
+		hmCounts[hourModelKey{hour: hourKey, model: record.Model}]++
+		modelTotals[record.Model]++
+		hourTotal[idx]++
+		if !record.Failed {
+			hourSuccess[idx]++
+		}
+	})
+	type modelCount struct {
+		model string
+		count int64
+	}
+	mc := make([]modelCount, 0, len(modelTotals))
+	for m, cnt := range modelTotals {
+		mc = append(mc, modelCount{model: m, count: cnt})
+	}
+	sort.Slice(mc, func(i, j int) bool {
+		if mc[i].count == mc[j].count {
+			return mc[i].model < mc[j].model
+		}
+		return mc[i].count > mc[j].count
+	})
+	if len(mc) > limit {
+		mc = mc[:limit]
+	}
+	if len(mc) == 0 {
+		return empty
+	}
+	topModels := make([]string, len(mc))
+	modelData := make(map[string][]int64, len(mc))
+	for i, m := range mc {
+		topModels[i] = m.model
+		data := make([]int64, slotCount)
+		for si, slot := range hourSlots {
+			data[si] = hmCounts[hourModelKey{hour: slot, model: m.model}]
+		}
+		modelData[m.model] = data
+	}
+	successRates := make([]float64, slotCount)
+	for i := range hourSlots {
+		successRates[i] = calcRate(hourSuccess[i], hourTotal[i])
+	}
+	return monitorHourlyModelsResponse{
+		Hours:        hourSlots,
+		Models:       topModels,
+		ModelData:    modelData,
+		SuccessRates: successRates,
+		TimeRange:    monitorTimeRange{Start: start, End: end},
+	}
+}
+
+func (h *Handler) buildMonitorHourlyTokens(
+	c *gin.Context,
+	filter monitorRecordFilter,
+	hours int,
+	start, end *time.Time,
+) monitorHourlyTokensResponse {
+	now := time.Now()
+	cutoff := now.Truncate(time.Hour).Add(-time.Duration(hours-1) * time.Hour)
+	hourSlots := make([]string, 0, hours)
+	hourIndex := make(map[string]int, hours)
+	for t := cutoff; !t.After(now.Truncate(time.Hour)); t = t.Add(time.Hour) {
+		key := t.Local().Format("2006-01-02T15:04:05-07:00")
+		hourIndex[key] = len(hourSlots)
+		hourSlots = append(hourSlots, key)
+	}
+	slotCount := len(hourSlots)
+
+	if dbPlugin := usage.GetDatabasePlugin(); dbPlugin != nil {
+		tokenSlots, queryErr := dbPlugin.QueryMonitorHourlyTokenSlots(c.Request.Context(), toUsageMonitorFilter(filter), cutoff.Unix(), now.Unix(), 3600)
+		if queryErr == nil {
+			totalTokens := make([]int64, slotCount)
+			inputTokens := make([]int64, slotCount)
+			outputTokens := make([]int64, slotCount)
+			reasoningTokens := make([]int64, slotCount)
+			cachedTokens := make([]int64, slotCount)
+			cacheWriteTokens := make([]int64, slotCount)
+			for _, slot := range tokenSlots {
+				if slot.SlotIndex < 0 || slot.SlotIndex >= slotCount {
+					continue
+				}
+				totalTokens[slot.SlotIndex] = slot.TotalTokens
+				inputTokens[slot.SlotIndex] = slot.InputTokens
+				outputTokens[slot.SlotIndex] = slot.OutputTokens
+				reasoningTokens[slot.SlotIndex] = slot.ReasoningTokens
+				cachedTokens[slot.SlotIndex] = slot.CachedTokens
+				cacheWriteTokens[slot.SlotIndex] = slot.CacheWriteTokens
+			}
+			return monitorHourlyTokensResponse{
+				Hours:            hourSlots,
+				TotalTokens:      totalTokens,
+				InputTokens:      inputTokens,
+				OutputTokens:     outputTokens,
+				ReasoningTokens:  reasoningTokens,
+				CachedTokens:     cachedTokens,
+				CacheWriteTokens: cacheWriteTokens,
+				TimeRange:        monitorTimeRange{Start: start, End: end},
+			}
+		}
+	}
+
+	totalTokens := make([]int64, slotCount)
+	inputTokens := make([]int64, slotCount)
+	outputTokens := make([]int64, slotCount)
+	reasoningTokens := make([]int64, slotCount)
+	cachedTokens := make([]int64, slotCount)
+	cacheWriteTokens := make([]int64, slotCount)
+	visitSnapshotRecords(h.usageSnapshot(), func(record monitorRecord) {
+		if record.Timestamp.Before(cutoff) || !filter.matches(record) || record.Failed {
+			return
+		}
+		hourKey := record.Timestamp.Local().Truncate(time.Hour).Format("2006-01-02T15:04:05-07:00")
+		idx, ok := hourIndex[hourKey]
+		if !ok {
+			return
+		}
+		totalTokens[idx] += record.TotalTokens
+		inputTokens[idx] += record.InputTokens
+		outputTokens[idx] += record.OutputTokens
+		reasoningTokens[idx] += record.ReasoningTokens
+		cachedTokens[idx] += record.CachedTokens
+		cacheWriteTokens[idx] += record.CacheWriteTokens
+	})
+	return monitorHourlyTokensResponse{
+		Hours:            hourSlots,
+		TotalTokens:      totalTokens,
+		InputTokens:      inputTokens,
+		OutputTokens:     outputTokens,
+		ReasoningTokens:  reasoningTokens,
+		CachedTokens:     cachedTokens,
+		CacheWriteTokens: cacheWriteTokens,
+		TimeRange:        monitorTimeRange{Start: start, End: end},
+	}
+}
+
+func (h *Handler) buildMonitorChannelStatsPayload(
+	c *gin.Context,
+	filter monitorRecordFilter,
+	limit int,
+	start, end *time.Time,
+) gin.H {
+	empty := gin.H{
+		"items":   []monitorChannelStatsItem{},
+		"total":   0,
+		"limit":   limit,
+		"filters": monitorFilterOptions{},
+		"time_range": monitorTimeRange{
+			Start: start,
+			End:   end,
+		},
+	}
+
+	if dbPlugin := usage.GetDatabasePlugin(); dbPlugin != nil {
+		queryResult, queryErr := dbPlugin.QueryMonitorChannelStats(c.Request.Context(), toUsageMonitorFilter(filter), limit, monitorRecentLimit)
+		if queryErr == nil {
+			items := make([]monitorChannelStatsItem, 0, len(queryResult.Items))
+			for _, channel := range queryResult.Items {
+				models := make([]monitorModelStats, 0, len(channel.Models))
+				for _, model := range channel.Models {
+					models = append(models, monitorModelStats{
+						Model:            model.Model,
+						Requests:         model.Requests,
+						Success:          model.Success,
+						Failed:           model.Failed,
+						InputTokens:      model.InputTokens,
+						OutputTokens:     model.OutputTokens,
+						CachedTokens:     model.CachedTokens,
+						CacheWriteTokens: model.CacheWriteTokens,
+						SuccessRate:      calcRate(model.Success, model.Requests),
+						LastRequestAt:    cloneTimePointer(model.LastRequestAt),
+						Recent:           fromUsageRecentRequests(model.Recent),
+					})
+				}
+				items = append(items, monitorChannelStatsItem{
+					Source:           channel.Source,
+					TotalRequests:    channel.TotalRequests,
+					SuccessRequests:  channel.SuccessRequests,
+					FailedRequests:   channel.FailedRequests,
+					InputTokens:      channel.InputTokens,
+					OutputTokens:     channel.OutputTokens,
+					CachedTokens:     channel.CachedTokens,
+					CacheWriteTokens: channel.CacheWriteTokens,
+					SuccessRate:      calcRate(channel.SuccessRequests, channel.TotalRequests),
+					LastRequestAt:    cloneTimePointer(channel.LastRequestAt),
+					Recent:           fromUsageRecentRequests(channel.Recent),
+					Models:           models,
+				})
+			}
+			return gin.H{
+				"items": items,
+				"total": len(items),
+				"limit": limit,
+				"filters": monitorFilterOptions{
+					Models:  queryResult.Filters.Models,
+					Sources: queryResult.Filters.Sources,
+				},
+				"time_range": monitorTimeRange{Start: start, End: end},
+			}
+		}
+	}
+
+	// Snapshot fallback mirrors GetMonitorChannelStats for consistency when DB is unavailable.
+	channelMap := make(map[string]*monitorChannelAggregate)
+	modelSet := make(map[string]struct{})
+	sourceSet := make(map[string]struct{})
+	visitSnapshotRecords(h.usageSnapshot(), func(record monitorRecord) {
+		if !filter.matches(record) {
+			return
+		}
+		source := record.Source
+		if source == "" {
+			source = "unknown"
+		}
+		agg, ok := channelMap[source]
+		if !ok {
+			agg = &monitorChannelAggregate{
+				Source: source,
+				Models: make(map[string]*monitorModelAggregate),
+			}
+			channelMap[source] = agg
+		}
+		agg.TotalRequests++
+		if record.Failed {
+			agg.FailedRequests++
+		} else {
+			agg.SuccessRequests++
+			agg.InputTokens += record.InputTokens
+			agg.OutputTokens += record.OutputTokens
+			agg.CachedTokens += record.CachedTokens
+			agg.CacheWriteTokens += record.CacheWriteTokens
+		}
+		if record.Timestamp.After(agg.LastRequestAt) {
+			agg.LastRequestAt = record.Timestamp
+		}
+		agg.Recent = append(agg.Recent, monitorRecentRequest{Failed: record.Failed, Timestamp: record.Timestamp})
+		modelAgg, ok := agg.Models[record.Model]
+		if !ok {
+			modelAgg = &monitorModelAggregate{Model: record.Model}
+			agg.Models[record.Model] = modelAgg
+		}
+		modelAgg.Requests++
+		if record.Failed {
+			modelAgg.Failed++
+		} else {
+			modelAgg.Success++
+			modelAgg.InputTokens += record.InputTokens
+			modelAgg.OutputTokens += record.OutputTokens
+			modelAgg.CachedTokens += record.CachedTokens
+			modelAgg.CacheWriteTokens += record.CacheWriteTokens
+		}
+		if record.Timestamp.After(modelAgg.LastRequestAt) {
+			modelAgg.LastRequestAt = record.Timestamp
+		}
+		modelAgg.Recent = append(modelAgg.Recent, monitorRecentRequest{Failed: record.Failed, Timestamp: record.Timestamp})
+		sourceSet[source] = struct{}{}
+		if record.Model != "" {
+			modelSet[record.Model] = struct{}{}
+		}
+	})
+
+	items := make([]monitorChannelStatsItem, 0, len(channelMap))
+	for _, agg := range channelMap {
+		models := make([]monitorModelStats, 0, len(agg.Models))
+		for _, modelAgg := range agg.Models {
+			models = append(models, monitorModelStats{
+				Model:            modelAgg.Model,
+				Requests:         modelAgg.Requests,
+				Success:          modelAgg.Success,
+				Failed:           modelAgg.Failed,
+				InputTokens:      modelAgg.InputTokens,
+				OutputTokens:     modelAgg.OutputTokens,
+				CachedTokens:     modelAgg.CachedTokens,
+				CacheWriteTokens: modelAgg.CacheWriteTokens,
+				SuccessRate:      calcRate(modelAgg.Success, modelAgg.Requests),
+				LastRequestAt:    timePointer(modelAgg.LastRequestAt),
+				Recent:           normalizeRecentRequests(modelAgg.Recent),
+			})
+		}
+		sort.Slice(models, func(i, j int) bool {
+			if models[i].Requests == models[j].Requests {
+				return models[i].Model < models[j].Model
+			}
+			return models[i].Requests > models[j].Requests
+		})
+		items = append(items, monitorChannelStatsItem{
+			Source:           agg.Source,
+			TotalRequests:    agg.TotalRequests,
+			SuccessRequests:  agg.SuccessRequests,
+			FailedRequests:   agg.FailedRequests,
+			InputTokens:      agg.InputTokens,
+			OutputTokens:     agg.OutputTokens,
+			CachedTokens:     agg.CachedTokens,
+			CacheWriteTokens: agg.CacheWriteTokens,
+			SuccessRate:      calcRate(agg.SuccessRequests, agg.TotalRequests),
+			LastRequestAt:    timePointer(agg.LastRequestAt),
+			Recent:           normalizeRecentRequests(agg.Recent),
+			Models:           models,
+		})
+	}
+	sort.Slice(items, func(i, j int) bool {
+		if items[i].TotalRequests == items[j].TotalRequests {
+			return items[i].Source < items[j].Source
+		}
+		return items[i].TotalRequests > items[j].TotalRequests
+	})
+	if len(items) > limit {
+		items = items[:limit]
+	}
+	models := make([]string, 0, len(modelSet))
+	for m := range modelSet {
+		models = append(models, m)
+	}
+	sort.Strings(models)
+	sources := make([]string, 0, len(sourceSet))
+	for s := range sourceSet {
+		sources = append(sources, s)
+	}
+	sort.Strings(sources)
+	if len(items) == 0 {
+		return empty
+	}
+	return gin.H{
+		"items": items,
+		"total": len(items),
+		"limit": limit,
+		"filters": monitorFilterOptions{
+			Models:  models,
+			Sources: sources,
+		},
+		"time_range": monitorTimeRange{Start: start, End: end},
+	}
+}
+
+func (h *Handler) buildMonitorServiceHealth(c *gin.Context) gin.H {
+	const (
+		rows            = 7
+		cols            = 96
+		totalBlocks     = rows * cols
+		blockDurationMs = 900000
+		blockDuration   = 15 * time.Minute
+		windowDuration  = 7 * 24 * time.Hour
+	)
+	now := time.Now()
+	windowStart := now.Add(-windowDuration)
+	type healthBlock struct {
+		Success int64 `json:"success"`
+		Failure int64 `json:"failure"`
+	}
+	if dbPlugin := usage.GetDatabasePlugin(); dbPlugin != nil {
+		healthBlocks, queryErr := dbPlugin.QueryMonitorHealthBlocks(c.Request.Context(), windowStart.Unix(), now.Unix(), int(blockDuration.Seconds()))
+		if queryErr == nil {
+			blocks := make([]healthBlock, totalBlocks)
+			var totalSuccess, totalFailure int64
+			for _, hb := range healthBlocks {
+				if hb.BlockIndex < 0 || hb.BlockIndex >= totalBlocks {
+					continue
+				}
+				blocks[hb.BlockIndex].Success = hb.Success
+				blocks[hb.BlockIndex].Failure = hb.Failure
+				totalSuccess += hb.Success
+				totalFailure += hb.Failure
+			}
+			total := totalSuccess + totalFailure
+			return gin.H{
+				"rows":              rows,
+				"cols":              cols,
+				"block_duration_ms": blockDurationMs,
+				"blocks":            blocks,
+				"total_success":     totalSuccess,
+				"total_failure":     totalFailure,
+				"success_rate":      calcRate(totalSuccess, total),
+			}
+		}
+	}
+	blocks := make([]healthBlock, totalBlocks)
+	var totalSuccess, totalFailure int64
+	visitSnapshotRecords(h.usageSnapshot(), func(record monitorRecord) {
+		if record.Timestamp.Before(windowStart) || record.Timestamp.After(now) {
+			return
+		}
+		idx := int(record.Timestamp.Sub(windowStart) / blockDuration)
+		if idx >= totalBlocks {
+			idx = totalBlocks - 1
+		}
+		if idx < 0 {
+			return
+		}
+		if record.Failed {
+			blocks[idx].Failure++
+			totalFailure++
+		} else {
+			blocks[idx].Success++
+			totalSuccess++
+		}
+	})
+	total := totalSuccess + totalFailure
+	return gin.H{
+		"rows":              rows,
+		"cols":              cols,
+		"block_duration_ms": blockDurationMs,
+		"blocks":            blocks,
+		"total_success":     totalSuccess,
+		"total_failure":     totalFailure,
+		"success_rate":      calcRate(totalSuccess, total),
+	}
+}
+
 // GetMonitorServiceHealth returns a 7-day health grid with 15-minute granularity.
 func (h *Handler) GetMonitorServiceHealth(c *gin.Context) {
 	const (

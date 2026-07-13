@@ -776,13 +776,19 @@ func newSQLiteUsageStoreAtPath(dbPath string) (*sqliteUsageStore, error) {
 	if err != nil {
 		return nil, fmt.Errorf("usage store: open sqlite: %w", err)
 	}
+	// modernc sqlite is safer with a single connection; WAL + busy_timeout still
+	// lets readers wait instead of failing under monitor-page query storms.
+	db.SetMaxOpenConns(1)
+	db.SetMaxIdleConns(1)
 	// Enable WAL mode for better concurrent access
 	if _, err = db.Exec("PRAGMA journal_mode=WAL"); err != nil {
 		_ = db.Close()
 		return nil, fmt.Errorf("usage store: enable WAL: %w", err)
 	}
 	// Read performance PRAGMAs: 64MB cache, mmap disabled, temp tables in memory.
+	// busy_timeout avoids immediate SQLITE_BUSY failures when writers/readers contend.
 	for _, pragma := range []string{
+		"PRAGMA busy_timeout=5000",
 		"PRAGMA cache_size=-64000",
 		"PRAGMA mmap_size=0",
 		"PRAGMA temp_store=MEMORY",

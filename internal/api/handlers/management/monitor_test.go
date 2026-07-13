@@ -13,7 +13,9 @@ import (
 	"time"
 
 	"github.com/gin-gonic/gin"
+	"github.com/router-for-me/CLIProxyAPI/v7/internal/config"
 	"github.com/router-for-me/CLIProxyAPI/v7/internal/usage"
+	coreauth "github.com/router-for-me/CLIProxyAPI/v7/sdk/cliproxy/auth"
 	coreusage "github.com/router-for-me/CLIProxyAPI/v7/sdk/cliproxy/usage"
 )
 
@@ -573,5 +575,155 @@ func TestGetMonitorServiceHealth_EmptySnapshot(t *testing.T) {
 	}
 	if resp.SuccessRate != 0 {
 		t.Fatalf("expected 0 success rate for empty data, got %f", resp.SuccessRate)
+	}
+}
+
+
+func TestGetMonitorDashboard_ReturnsOverviewSections(t *testing.T) {
+	gin.SetMode(gin.TestMode)
+
+	// Use relative timestamps so default 7-day window includes them.
+	now := time.Now()
+	h := newMonitorTestHandler(
+		testUsageRecord(now.Add(-1*time.Hour), "api-1", "model-1", "source-1", false),
+		testUsageRecord(now.Add(-2*time.Hour), "api-1", "model-2", "source-2", true),
+	)
+
+	rr := executeMonitorRequest(h.GetMonitorDashboard, "/monitor/dashboard?time_range=7&hours=12")
+	if rr.Code != http.StatusOK {
+		t.Fatalf("unexpected status: %d body=%s", rr.Code, rr.Body.String())
+	}
+
+	var resp map[string]json.RawMessage
+	if err := json.Unmarshal(rr.Body.Bytes(), &resp); err != nil {
+		t.Fatalf("unmarshal: %v", err)
+	}
+	for _, key := range []string{"kpi", "daily_trend", "hourly_models", "hourly_tokens", "channel_stats", "service_health", "time_range"} {
+		if _, ok := resp[key]; !ok {
+			t.Fatalf("missing section %q in %v", key, resp)
+		}
+	}
+
+	var kpi struct {
+		TotalRequests int64 `json:"total_requests"`
+	}
+	if err := json.Unmarshal(resp["kpi"], &kpi); err != nil {
+		t.Fatalf("kpi unmarshal: %v", err)
+	}
+	if kpi.TotalRequests != 2 {
+		t.Fatalf("kpi total_requests=%d want 2", kpi.TotalRequests)
+	}
+}
+
+
+func TestGetMonitorProviderMap_FromConfigAndAuths(t *testing.T) {
+	gin.SetMode(gin.TestMode)
+
+	manager := coreauth.NewManager(nil, nil, nil)
+	if _, err := manager.Register(context.Background(), &coreauth.Auth{
+		ID:       "oauth-claude-1",
+		Provider: "claude",
+		FileName: "user@example.com.json",
+		Attributes: map[string]string{
+			"path": "/tmp/user@example.com.json",
+		},
+	}); err != nil {
+		t.Fatalf("register auth: %v", err)
+	}
+	// Runtime-only disabled auth should be invisible (not mapped).
+	if _, err := manager.Register(context.Background(), &coreauth.Auth{
+		ID:       "runtime-hidden",
+		Provider: "codex",
+		FileName: "hidden-runtime.json",
+		Disabled: true,
+	}); err != nil {
+		t.Fatalf("register hidden auth: %v", err)
+	}
+
+	h := &Handler{
+		cfg: &config.Config{
+			OpenAICompatibility: []config.OpenAICompatibility{{
+				Name: "openrouter",
+				Headers: map[string]string{
+					"X-Provider": "OpenRouter",
+				},
+				APIKeyEntries: []config.OpenAICompatibilityAPIKey{{
+					APIKey: "sk-or-1",
+				}},
+				Models: []config.OpenAICompatibilityModel{{
+					Name:  "gpt-4o",
+					Alias: "or-gpt-4o",
+				}},
+			}},
+			GeminiKey: []config.GeminiKey{{
+				APIKey: "gem-key-1",
+				Prefix: "MyGemini",
+			}},
+			ClaudeKey: []config.ClaudeKey{{
+				APIKey: "claude-key-1",
+				Models: []config.ClaudeModel{{
+					Name:  "claude-sonnet-4",
+					Alias: "sonnet",
+				}},
+			}},
+			CodexKey: []config.CodexKey{{
+				APIKey: "codex-key-1",
+				Prefix: "MyCodex",
+				Models: []config.CodexModel{{
+					Name: "gpt-5",
+				}},
+			}},
+			VertexCompatAPIKey: []config.VertexCompatKey{{
+				APIKey: "vertex-key-1",
+				Models: []config.VertexCompatModel{{
+					Name:  "gemini-2.0",
+					Alias: "v-gemini",
+				}},
+			}},
+		},
+		authManager: manager,
+	}
+
+	rr := executeMonitorRequest(h.GetMonitorProviderMap, "/monitor/provider-map")
+	if rr.Code != http.StatusOK {
+		t.Fatalf("unexpected status: %d body=%s", rr.Code, rr.Body.String())
+	}
+
+	var resp struct {
+		Providers map[string]string   `json:"providers"`
+		Models    map[string][]string `json:"models"`
+	}
+	if err := json.Unmarshal(rr.Body.Bytes(), &resp); err != nil {
+		t.Fatalf("unmarshal: %v", err)
+	}
+
+	assertProvider := func(key, want string) {
+		t.Helper()
+		if got := resp.Providers[key]; got != want {
+			t.Fatalf("providers[%q]=%q want %q (all=%v)", key, got, want, resp.Providers)
+		}
+	}
+	assertProvider("sk-or-1", "OpenRouter")
+	assertProvider("openrouter", "OpenRouter")
+	assertProvider("gem-key-1", "MyGemini")
+	assertProvider("claude-key-1", "Claude")
+	assertProvider("codex-key-1", "MyCodex")
+	assertProvider("vertex-key-1", "Vertex")
+	assertProvider("user@example.com.json", "Claude")
+
+	if _, ok := resp.Providers["hidden-runtime.json"]; ok {
+		t.Fatalf("disabled runtime-only auth should not appear: %v", resp.Providers)
+	}
+
+	orModels := resp.Models["sk-or-1"]
+	if !slices.Contains(orModels, "or-gpt-4o") || !slices.Contains(orModels, "gpt-4o") {
+		t.Fatalf("openai models missing alias/name: %v", orModels)
+	}
+	claudeModels := resp.Models["claude-key-1"]
+	if !slices.Contains(claudeModels, "sonnet") || !slices.Contains(claudeModels, "claude-sonnet-4") {
+		t.Fatalf("claude models missing: %v", claudeModels)
+	}
+	if _, ok := resp.Models["gem-key-1"]; ok {
+		t.Fatalf("gemini keys should not populate models map, got %v", resp.Models["gem-key-1"])
 	}
 }

@@ -780,6 +780,8 @@ func (s *Server) registerManagementRoutes() {
 	mgmt.Use(s.managementAvailabilityMiddleware(), s.mgmt.Middleware())
 	{
 		mgmt.GET("/usage", s.mgmt.GetUsageStatistics)
+		mgmt.GET("/custom/monitor/dashboard", s.mgmt.GetMonitorDashboard)
+		mgmt.GET("/custom/monitor/provider-map", s.mgmt.GetMonitorProviderMap)
 		mgmt.GET("/custom/monitor/request-logs", s.mgmt.GetMonitorRequestLogs)
 		mgmt.GET("/custom/monitor/channel-stats", s.mgmt.GetMonitorChannelStats)
 		mgmt.GET("/custom/monitor/failure-analysis", s.mgmt.GetMonitorFailureAnalysis)
