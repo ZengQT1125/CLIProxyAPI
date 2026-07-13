@@ -1394,6 +1394,79 @@ func TestXAIExecutorComposerReusesClaudeCodeSession(t *testing.T) {
 	}
 }
 
+// grok-4.5 is not a composer model, but Claude Code still sends a stable session.
+// Without injecting prompt_cache_key, multi-turn Claude→xAI traffic never hits prompt cache
+// and clients never see cache_read_input_tokens.
+func TestXAIExecutorGrok45ReusesClaudeCodeSession(t *testing.T) {
+	exec := NewXAIExecutor(&config.Config{})
+	auth := &cliproxyauth.Auth{
+		Provider: "xai",
+		Metadata: map[string]any{"access_token": "xai-token"},
+	}
+
+	// docs/1.txt shape: session in header + metadata.user_id JSON, model grok-4.5
+	payload := []byte(`{"model":"grok-4.5","metadata":{"user_id":"{\"device_id\":\"dev\",\"account_uuid\":\"\",\"session_id\":\"5783440d-3c2c-4f75-83b9-1f70df9e9b98\"}"},"messages":[{"role":"user","content":"hello"}],"stream":true}`)
+	req := cliproxyexecutor.Request{Model: "grok-4.5", Payload: payload}
+	opts := cliproxyexecutor.Options{
+		SourceFormat: sdktranslator.FormatClaude,
+		Stream:       true,
+		Headers: http.Header{
+			"X-Claude-Code-Session-Id": []string{"5783440d-3c2c-4f75-83b9-1f70df9e9b98"},
+		},
+	}
+
+	first, err := exec.prepareResponsesRequest(context.Background(), req, opts, true)
+	if err != nil {
+		t.Fatalf("prepareResponsesRequest first error: %v", err)
+	}
+	second, err := exec.prepareResponsesRequest(context.Background(), req, opts, true)
+	if err != nil {
+		t.Fatalf("prepareResponsesRequest second error: %v", err)
+	}
+
+	firstKey := gjson.GetBytes(first.body, "prompt_cache_key").String()
+	secondKey := gjson.GetBytes(second.body, "prompt_cache_key").String()
+	if firstKey == "" {
+		t.Fatalf("first prompt_cache_key is empty for grok-4.5 Claude session; body=%s", string(first.body))
+	}
+	if secondKey != firstKey {
+		t.Fatalf("same Claude Code session produced different prompt_cache_key: first=%q second=%q", firstKey, secondKey)
+	}
+	if first.sessionID != firstKey {
+		t.Fatalf("sessionID = %q, want prompt_cache_key %q", first.sessionID, firstKey)
+	}
+
+	httpReq, errRequest := http.NewRequest(http.MethodPost, "https://example.test/responses", bytes.NewReader(first.body))
+	if errRequest != nil {
+		t.Fatalf("NewRequest() error = %v", errRequest)
+	}
+	applyXAIHeaders(httpReq, auth, "xai-token", true, first.sessionID)
+	if got := httpReq.Header.Get("x-grok-conv-id"); got != firstKey {
+		t.Fatalf("x-grok-conv-id = %q, want %q", got, firstKey)
+	}
+}
+
+func TestXAIExecutorGrok45WithoutClaudeSessionStaysStateless(t *testing.T) {
+	exec := NewXAIExecutor(&config.Config{})
+	payload := []byte(`{"model":"grok-4.5","messages":[{"role":"user","content":"hello"}],"stream":true}`)
+	prepared, err := exec.prepareResponsesRequest(context.Background(), cliproxyexecutor.Request{
+		Model:   "grok-4.5",
+		Payload: payload,
+	}, cliproxyexecutor.Options{
+		SourceFormat: sdktranslator.FormatClaude,
+		Stream:       true,
+	}, true)
+	if err != nil {
+		t.Fatalf("prepareResponsesRequest() error = %v", err)
+	}
+	if prepared.sessionID != "" {
+		t.Fatalf("sessionID = %q, want empty without Claude session", prepared.sessionID)
+	}
+	if got := gjson.GetBytes(prepared.body, "prompt_cache_key").String(); got != "" {
+		t.Fatalf("prompt_cache_key = %q, want empty without Claude session; body=%s", got, string(prepared.body))
+	}
+}
+
 func TestSanitizeXAIInputEncryptedContent_DropsInvalidReasoningBlob(t *testing.T) {
 	body := []byte(`{"model":"grok-4.3","input":[{"type":"reasoning","summary":[],"encrypted_content":"bad"},{"type":"reasoning","summary":[],"encrypted_content":"gAAAAABinvalid-gpt-shape"},{"role":"user","content":"hi"}]}`)
 	got := sanitizeXAIInputEncryptedContent(body)

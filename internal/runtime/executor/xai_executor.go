@@ -1060,9 +1060,10 @@ func xaiResolveComposerSessionID(ctx context.Context, req cliproxyexecutor.Reque
 	if sessionID := xaiExecutionSessionID(req, opts); sessionID != "" {
 		return sessionID, nil
 	}
-	if !xaiRequiresIsolatedConversation(baseModel) {
-		return "", nil
-	}
+	// Prefer a stable Claude Code session for prompt_cache_key on any model.
+	// Composer models used to be the only path that did this; grok-4.5 Claude
+	// traffic otherwise never set prompt_cache_key, so multi-turn cache never hit
+	// and clients never saw cache_read_input_tokens.
 	cached, ok, errCache := helps.ClaudeCodePromptCache(ctx, req.Model, req.Payload, opts.Headers)
 	if errCache != nil {
 		return "", errCache
@@ -1070,7 +1071,11 @@ func xaiResolveComposerSessionID(ctx context.Context, req cliproxyexecutor.Reque
 	if ok {
 		return cached.ID, nil
 	}
-	return uuid.NewString(), nil
+	// Composer still needs an isolated conversation even without a Claude session.
+	if xaiRequiresIsolatedConversation(baseModel) {
+		return uuid.NewString(), nil
+	}
+	return "", nil
 }
 
 func xaiExecutionSessionID(req cliproxyexecutor.Request, opts cliproxyexecutor.Options) string {
