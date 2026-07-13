@@ -922,6 +922,12 @@ func (h *Handler) UploadAuthFile(c *gin.Context) {
 }
 
 // Delete auth files: single by name or all
+//
+// When all=true, the response is an NDJSON stream (application/x-ndjson):
+//
+//	{"type":"start","total":N}
+//	{"type":"progress","index":1,"total":N,"name":"...","deleted":true}
+//	{"type":"done","total":N,"deleted":M,"failed":K,"files":[...],"failed_items":[...]}
 func (h *Handler) DeleteAuthFile(c *gin.Context) {
 	if h.authManager == nil {
 		c.JSON(http.StatusServiceUnavailable, gin.H{"error": "core auth manager unavailable"})
@@ -939,39 +945,15 @@ func (h *Handler) DeleteAuthFile(c *gin.Context) {
 			return
 		}
 		if hasAuthFileDeleteFilters(query) {
-			h.deleteFilteredAuthFiles(c, ctx, query)
+			h.streamDeleteAuthFileCandidates(c, ctx, h.collectFilteredAuthFileCandidates(query))
 			return
 		}
-		entries, err := os.ReadDir(h.cfg.AuthDir)
-		if err != nil {
-			c.JSON(500, gin.H{"error": fmt.Sprintf("failed to read auth dir: %v", err)})
+		candidates, errCollect := h.collectUnfilteredAuthFileCandidates()
+		if errCollect != nil {
+			c.JSON(http.StatusInternalServerError, gin.H{"error": fmt.Sprintf("failed to read auth dir: %v", errCollect)})
 			return
 		}
-		deleted := 0
-		for _, e := range entries {
-			if e.IsDir() {
-				continue
-			}
-			name := e.Name()
-			if !strings.HasSuffix(strings.ToLower(name), ".json") {
-				continue
-			}
-			full := filepath.Join(h.cfg.AuthDir, name)
-			if !filepath.IsAbs(full) {
-				if abs, errAbs := filepath.Abs(full); errAbs == nil {
-					full = abs
-				}
-			}
-			if err = os.Remove(full); err == nil {
-				if errDel := h.deleteTokenRecord(ctx, full); errDel != nil {
-					c.JSON(500, gin.H{"error": errDel.Error()})
-					return
-				}
-				deleted++
-				h.removeAuth(ctx, full)
-			}
-		}
-		c.JSON(200, gin.H{"status": "ok", "deleted": deleted})
+		h.streamDeleteAuthFileCandidates(c, ctx, candidates)
 		return
 	}
 
@@ -1024,8 +1006,11 @@ type filteredAuthFileCandidate struct {
 	path   string
 }
 
-func (h *Handler) deleteFilteredAuthFiles(c *gin.Context, ctx context.Context, query authFileListQuery) {
+func (h *Handler) collectFilteredAuthFileCandidates(query authFileListQuery) []filteredAuthFileCandidate {
 	candidates := make([]filteredAuthFileCandidate, 0)
+	if h == nil || h.authManager == nil {
+		return candidates
+	}
 	seenPaths := make(map[string]struct{})
 	for _, auth := range h.authManager.List() {
 		if auth == nil || isRuntimeOnlyAuth(auth) || !authFileListVisible(auth) || !authMatchesListStatusFilters(auth, query) {
@@ -1041,31 +1026,93 @@ func (h *Handler) deleteFilteredAuthFiles(c *gin.Context, ctx context.Context, q
 		seenPaths[candidate.path] = struct{}{}
 		candidates = append(candidates, candidate)
 	}
+	return candidates
+}
 
-	deletedFiles := make([]string, 0, len(candidates))
-	failed := make([]gin.H, 0)
-	for _, candidate := range candidates {
-		deletedName, _, errDelete := h.deleteFilteredAuthFile(ctx, candidate)
-		if errDelete != nil {
-			failed = append(failed, gin.H{"name": filepath.Base(candidate.path), "error": errDelete.Error()})
+func (h *Handler) collectUnfilteredAuthFileCandidates() ([]filteredAuthFileCandidate, error) {
+	if h == nil || h.cfg == nil {
+		return nil, fmt.Errorf("auth config unavailable")
+	}
+	entries, err := os.ReadDir(h.cfg.AuthDir)
+	if err != nil {
+		return nil, err
+	}
+	candidates := make([]filteredAuthFileCandidate, 0, len(entries))
+	for _, entry := range entries {
+		if entry.IsDir() {
 			continue
 		}
+		name := entry.Name()
+		if !strings.HasSuffix(strings.ToLower(name), ".json") {
+			continue
+		}
+		full := filepath.Join(h.cfg.AuthDir, name)
+		if !filepath.IsAbs(full) {
+			if abs, errAbs := filepath.Abs(full); errAbs == nil {
+				full = abs
+			}
+		}
+		candidates = append(candidates, filteredAuthFileCandidate{path: full})
+	}
+	return candidates, nil
+}
+
+func writeAuthDeleteNDJSONEvent(c *gin.Context) func(any) {
+	c.Writer.Header().Set("Content-Type", "application/x-ndjson")
+	c.Writer.Header().Set("Cache-Control", "no-cache")
+	c.Writer.Header().Set("X-Accel-Buffering", "no")
+	c.Status(http.StatusOK)
+	return func(v any) {
+		data, errMarshal := json.Marshal(v)
+		if errMarshal != nil {
+			return
+		}
+		data = append(data, '\n')
+		_, _ = c.Writer.Write(data)
+		if flusher, ok := c.Writer.(http.Flusher); ok {
+			flusher.Flush()
+		}
+	}
+}
+
+func (h *Handler) streamDeleteAuthFileCandidates(c *gin.Context, ctx context.Context, candidates []filteredAuthFileCandidate) {
+	writeEvent := writeAuthDeleteNDJSONEvent(c)
+	total := len(candidates)
+	writeEvent(gin.H{"type": "start", "total": total})
+
+	deletedFiles := make([]string, 0, total)
+	failed := make([]gin.H, 0)
+	for index, candidate := range candidates {
+		if ctx.Err() != nil {
+			break
+		}
+		name := filepath.Base(candidate.path)
+		event := gin.H{
+			"type":  "progress",
+			"index": index + 1,
+			"total": total,
+			"name":  name,
+		}
+		deletedName, _, errDelete := h.deleteFilteredAuthFile(ctx, candidate)
+		if errDelete != nil {
+			event["deleted"] = false
+			event["error"] = errDelete.Error()
+			failed = append(failed, gin.H{"name": name, "error": errDelete.Error()})
+			writeEvent(event)
+			continue
+		}
+		event["deleted"] = true
 		deletedFiles = append(deletedFiles, deletedName)
+		writeEvent(event)
 	}
-	if len(failed) > 0 {
-		c.JSON(http.StatusMultiStatus, gin.H{
-			"status":  "partial",
-			"deleted": len(deletedFiles),
-			"files":   deletedFiles,
-			"failed":  failed,
-		})
-		return
-	}
-	c.JSON(http.StatusOK, gin.H{
-		"status":  "ok",
-		"deleted": len(deletedFiles),
-		"files":   deletedFiles,
-		"failed":  failed,
+
+	writeEvent(gin.H{
+		"type":         "done",
+		"total":        total,
+		"deleted":      len(deletedFiles),
+		"failed":       len(failed),
+		"files":        deletedFiles,
+		"failed_items": failed,
 	})
 }
 

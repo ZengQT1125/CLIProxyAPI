@@ -1,18 +1,66 @@
 package management
 
 import (
+	"bufio"
+	"bytes"
 	"context"
 	"encoding/json"
 	"net/http"
 	"net/http/httptest"
 	"os"
 	"path/filepath"
+	"strings"
 	"testing"
 
 	"github.com/gin-gonic/gin"
 	"github.com/router-for-me/CLIProxyAPI/v7/internal/config"
 	coreauth "github.com/router-for-me/CLIProxyAPI/v7/sdk/cliproxy/auth"
 )
+
+type authDeleteDoneEvent struct {
+	Type        string   `json:"type"`
+	Total       int      `json:"total"`
+	Deleted     int      `json:"deleted"`
+	Failed      int      `json:"failed"`
+	Files       []string `json:"files"`
+	FailedItems []struct {
+		Name  string `json:"name"`
+		Error string `json:"error"`
+	} `json:"failed_items"`
+}
+
+func parseAuthDeleteDoneEvent(t *testing.T, body []byte) authDeleteDoneEvent {
+	t.Helper()
+	scanner := bufio.NewScanner(bytes.NewReader(body))
+	var done authDeleteDoneEvent
+	found := false
+	for scanner.Scan() {
+		line := strings.TrimSpace(scanner.Text())
+		if line == "" {
+			continue
+		}
+		var event struct {
+			Type string `json:"type"`
+		}
+		if errDecode := json.Unmarshal([]byte(line), &event); errDecode != nil {
+			t.Fatalf("invalid ndjson line %q: %v", line, errDecode)
+		}
+		if event.Type != "done" {
+			continue
+		}
+		if errDecode := json.Unmarshal([]byte(line), &done); errDecode != nil {
+			t.Fatalf("invalid done event %q: %v", line, errDecode)
+		}
+		found = true
+	}
+	if errScan := scanner.Err(); errScan != nil {
+		t.Fatal(errScan)
+	}
+	if !found {
+		t.Fatalf("missing done event in body: %s", string(body))
+	}
+	return done
+}
 
 func TestDeleteAuthFilesFiltered(t *testing.T) {
 	h, paths := newFilteredDeleteHandler(t)
@@ -26,15 +74,11 @@ func TestDeleteAuthFilesFiltered(t *testing.T) {
 	if recorder.Code != http.StatusOK {
 		t.Fatalf("status = %d, body = %s", recorder.Code, recorder.Body.String())
 	}
-	var response struct {
-		Deleted int      `json:"deleted"`
-		Files   []string `json:"files"`
-		Failed  []any    `json:"failed"`
+	if contentType := recorder.Header().Get("Content-Type"); !strings.Contains(contentType, "application/x-ndjson") {
+		t.Fatalf("content-type = %q, want application/x-ndjson", contentType)
 	}
-	if errDecode := json.Unmarshal(recorder.Body.Bytes(), &response); errDecode != nil {
-		t.Fatal(errDecode)
-	}
-	if response.Deleted != 1 || len(response.Files) != 1 || response.Files[0] != "codex-disabled.json" || len(response.Failed) != 0 {
+	response := parseAuthDeleteDoneEvent(t, recorder.Body.Bytes())
+	if response.Deleted != 1 || len(response.Files) != 1 || response.Files[0] != "codex-disabled.json" || response.Failed != 0 || len(response.FailedItems) != 0 {
 		t.Fatalf("unexpected filtered delete response: %#v", response)
 	}
 	if _, errStat := os.Stat(paths["codex-disabled.json"]); !os.IsNotExist(errStat) {
@@ -95,13 +139,7 @@ func TestDeleteAuthFilesFiltered_SkipsHiddenAuthWithoutPath(t *testing.T) {
 	if recorder.Code != http.StatusOK {
 		t.Fatalf("status = %d, body = %s", recorder.Code, recorder.Body.String())
 	}
-	var response struct {
-		Deleted int      `json:"deleted"`
-		Files   []string `json:"files"`
-	}
-	if errDecode := json.Unmarshal(recorder.Body.Bytes(), &response); errDecode != nil {
-		t.Fatal(errDecode)
-	}
+	response := parseAuthDeleteDoneEvent(t, recorder.Body.Bytes())
 	if response.Deleted != 0 || len(response.Files) != 0 {
 		t.Fatalf("hidden auth must not be a delete candidate: %#v", response)
 	}
@@ -138,13 +176,7 @@ func TestDeleteAuthFilesFiltered_UsesPhysicalPathForAbsoluteFileName(t *testing.
 	if recorder.Code != http.StatusOK {
 		t.Fatalf("status = %d, body = %s", recorder.Code, recorder.Body.String())
 	}
-	var response struct {
-		Deleted int      `json:"deleted"`
-		Files   []string `json:"files"`
-	}
-	if errDecode := json.Unmarshal(recorder.Body.Bytes(), &response); errDecode != nil {
-		t.Fatal(errDecode)
-	}
+	response := parseAuthDeleteDoneEvent(t, recorder.Body.Bytes())
 	if response.Deleted != 1 || len(response.Files) != 1 || response.Files[0] != "absolute-name.json" {
 		t.Fatalf("unexpected absolute filename delete response: %#v", response)
 	}
@@ -181,12 +213,7 @@ func TestDeleteAuthFilesFiltered_SkipsPathOutsideAuthDir(t *testing.T) {
 	if recorder.Code != http.StatusOK {
 		t.Fatalf("status = %d, body = %s", recorder.Code, recorder.Body.String())
 	}
-	var response struct {
-		Deleted int `json:"deleted"`
-	}
-	if errDecode := json.Unmarshal(recorder.Body.Bytes(), &response); errDecode != nil {
-		t.Fatal(errDecode)
-	}
+	response := parseAuthDeleteDoneEvent(t, recorder.Body.Bytes())
 	if response.Deleted != 0 {
 		t.Fatalf("outside auth path must not be deleted: %#v", response)
 	}
@@ -231,12 +258,7 @@ func TestDeleteAuthFilesFiltered_SkipsDirectorySymlinkEscape(t *testing.T) {
 	if recorder.Code != http.StatusOK {
 		t.Fatalf("status = %d, body = %s", recorder.Code, recorder.Body.String())
 	}
-	var response struct {
-		Deleted int `json:"deleted"`
-	}
-	if errDecode := json.Unmarshal(recorder.Body.Bytes(), &response); errDecode != nil {
-		t.Fatal(errDecode)
-	}
+	response := parseAuthDeleteDoneEvent(t, recorder.Body.Bytes())
 	if response.Deleted != 0 {
 		t.Fatalf("directory symlink escape must not be deleted: %#v", response)
 	}
@@ -280,12 +302,7 @@ func TestDeleteAuthFilesFiltered_SkipsFileSymlink(t *testing.T) {
 	if recorder.Code != http.StatusOK {
 		t.Fatalf("status = %d, body = %s", recorder.Code, recorder.Body.String())
 	}
-	var response struct {
-		Deleted int `json:"deleted"`
-	}
-	if errDecode := json.Unmarshal(recorder.Body.Bytes(), &response); errDecode != nil {
-		t.Fatal(errDecode)
-	}
+	response := parseAuthDeleteDoneEvent(t, recorder.Body.Bytes())
 	if response.Deleted != 0 {
 		t.Fatalf("file symlink must not be deleted: %#v", response)
 	}
@@ -409,21 +426,11 @@ func TestDeleteAuthFilesFiltered_PartialFailure(t *testing.T) {
 	ginCtx.Request = httptest.NewRequest(http.MethodDelete, "/v0/management/auth-files?all=true&type=codex", nil)
 	h.DeleteAuthFile(ginCtx)
 
-	if recorder.Code != http.StatusMultiStatus {
+	if recorder.Code != http.StatusOK {
 		t.Fatalf("status = %d, body = %s", recorder.Code, recorder.Body.String())
 	}
-	var response struct {
-		Deleted int      `json:"deleted"`
-		Files   []string `json:"files"`
-		Failed  []struct {
-			Name  string `json:"name"`
-			Error string `json:"error"`
-		} `json:"failed"`
-	}
-	if errDecode := json.Unmarshal(recorder.Body.Bytes(), &response); errDecode != nil {
-		t.Fatal(errDecode)
-	}
-	if response.Deleted != 1 || len(response.Files) != 1 || response.Files[0] != "existing.json" || len(response.Failed) != 1 || response.Failed[0].Name != "missing.json" || response.Failed[0].Error == "" {
+	response := parseAuthDeleteDoneEvent(t, recorder.Body.Bytes())
+	if response.Deleted != 1 || len(response.Files) != 1 || response.Files[0] != "existing.json" || response.Failed != 1 || len(response.FailedItems) != 1 || response.FailedItems[0].Name != "missing.json" || response.FailedItems[0].Error == "" {
 		t.Fatalf("unexpected partial delete response: %#v", response)
 	}
 }
