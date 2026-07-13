@@ -135,8 +135,10 @@ func buildAuthFileListPage(auths []*coreauth.Auth, query authFileListQuery) auth
 	page.Types = sortedAuthFileTypes(types)
 
 	filtered := make([]*coreauth.Auth, 0, len(auths))
+	statusQuery := query
+	statusQuery.Type = ""
 	for _, auth := range auths {
-		if !authFileListVisible(auth) || !authMatchesListStatusFilters(auth, query) {
+		if !authFileListVisible(auth) || !authMatchesListStatusFilters(auth, statusQuery) {
 			continue
 		}
 		typeName := normalizeAuthFileType(auth.Provider)
@@ -144,7 +146,7 @@ func buildAuthFileListPage(auths []*coreauth.Auth, query authFileListQuery) auth
 		if typeName != "" {
 			page.TypeCounts[typeName]++
 		}
-		if query.Type != "" && typeName != query.Type {
+		if !authMatchesListStatusFilters(auth, query) {
 			continue
 		}
 		if query.Search != "" && !authMatchesAuthFileSearch(auth, query.Search) {
@@ -185,6 +187,9 @@ func normalizeAuthFileListQuery(query authFileListQuery) authFileListQuery {
 
 func authMatchesListStatusFilters(auth *coreauth.Auth, query authFileListQuery) bool {
 	if auth == nil {
+		return false
+	}
+	if query.Type != "" && normalizeAuthFileType(auth.Provider) != normalizeAuthFileType(query.Type) {
 		return false
 	}
 	if query.ProblemOnly && strings.TrimSpace(auth.StatusMessage) == "" {

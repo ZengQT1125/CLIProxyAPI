@@ -929,6 +929,19 @@ func (h *Handler) DeleteAuthFile(c *gin.Context) {
 	}
 	ctx := c.Request.Context()
 	if queryRequestsAll(c.Query("all")) {
+		query, _, errQuery := parseAuthFileListQuery(c)
+		if errQuery != nil {
+			c.JSON(http.StatusBadRequest, gin.H{"error": errQuery.Error()})
+			return
+		}
+		if query.Search != "" {
+			c.JSON(http.StatusBadRequest, gin.H{"error": "search is not supported when deleting all auth files"})
+			return
+		}
+		if hasAuthFileDeleteFilters(query) {
+			h.deleteFilteredAuthFiles(c, ctx, query)
+			return
+		}
 		entries, err := os.ReadDir(h.cfg.AuthDir)
 		if err != nil {
 			c.JSON(500, gin.H{"error": fmt.Sprintf("failed to read auth dir: %v", err)})
@@ -1000,6 +1013,54 @@ func (h *Handler) DeleteAuthFile(c *gin.Context) {
 		return
 	}
 	c.JSON(http.StatusOK, gin.H{"status": "ok", "deleted": len(deletedFiles), "files": deletedFiles})
+}
+
+func hasAuthFileDeleteFilters(query authFileListQuery) bool {
+	return query.Type != "" || query.ProblemOnly || query.DisabledOnly || query.EnabledOnly
+}
+
+func (h *Handler) deleteFilteredAuthFiles(c *gin.Context, ctx context.Context, query authFileListQuery) {
+	names := make([]string, 0)
+	for _, auth := range h.authManager.List() {
+		if auth == nil || isRuntimeOnlyAuth(auth) || !authMatchesListStatusFilters(auth, query) {
+			continue
+		}
+		name := strings.TrimSpace(auth.FileName)
+		if name == "" {
+			name = filepath.Base(strings.TrimSpace(authAttribute(auth, "path")))
+		}
+		if isUnsafeAuthFileName(name) {
+			continue
+		}
+		names = append(names, name)
+	}
+	names = uniqueAuthFileNames(names)
+
+	deletedFiles := make([]string, 0, len(names))
+	failed := make([]gin.H, 0)
+	for _, name := range names {
+		deletedName, _, errDelete := h.deleteAuthFileByName(ctx, name)
+		if errDelete != nil {
+			failed = append(failed, gin.H{"name": name, "error": errDelete.Error()})
+			continue
+		}
+		deletedFiles = append(deletedFiles, deletedName)
+	}
+	if len(failed) > 0 {
+		c.JSON(http.StatusMultiStatus, gin.H{
+			"status":  "partial",
+			"deleted": len(deletedFiles),
+			"files":   deletedFiles,
+			"failed":  failed,
+		})
+		return
+	}
+	c.JSON(http.StatusOK, gin.H{
+		"status":  "ok",
+		"deleted": len(deletedFiles),
+		"files":   deletedFiles,
+		"failed":  failed,
+	})
 }
 
 func (h *Handler) multipartAuthFileHeaders(c *gin.Context) ([]*multipart.FileHeader, error) {
