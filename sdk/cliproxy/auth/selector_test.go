@@ -1400,3 +1400,26 @@ func TestSessionAffinitySelector_Concurrent(t *testing.T) {
 	default:
 	}
 }
+
+func TestSequentialFillSelectorPick_ModelSuffixSharesSticky(t *testing.T) {
+	t.Parallel()
+
+	selector := &SequentialFillSelector{}
+	auths := []*Auth{
+		{ID: "a", Provider: "xai"},
+		{ID: "b", Provider: "xai"},
+		{ID: "c", Provider: "xai"},
+	}
+
+	first, err := selector.Pick(context.Background(), "xai", "grok-4.5", cliproxyexecutor.Options{}, auths)
+	if err != nil {
+		t.Fatalf("Pick() base error = %v", err)
+	}
+	second, err := selector.Pick(context.Background(), "xai", "grok-4.5(high)", cliproxyexecutor.Options{}, auths)
+	if err != nil {
+		t.Fatalf("Pick() suffix error = %v", err)
+	}
+	if second.ID != first.ID {
+		t.Fatalf("Pick() with thinking suffix auth.ID = %q, want sticky %q", second.ID, first.ID)
+	}
+}

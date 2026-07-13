@@ -1372,19 +1372,26 @@ func finishForceMappedStreamChunks(rewriter *StreamRewriter) []byte {
 }
 
 func (m *Manager) availableAuthsForRouteModel(auths []*Auth, provider, routeModel string, now time.Time) ([]*Auth, error) {
+	ready, err := m.readyAuthsForRouteModel(auths, provider, routeModel, now)
+	if err != nil {
+		return nil, err
+	}
+	return highestPriorityAuths(ready), nil
+}
+
+func (m *Manager) readyAuthsForRouteModel(auths []*Auth, provider, routeModel string, now time.Time) ([]*Auth, error) {
 	if len(auths) == 0 {
 		return nil, &Error{Code: "auth_not_found", Message: "no auth candidates"}
 	}
 
-	availableByPriority := make(map[int][]*Auth)
+	ready := make([]*Auth, 0, len(auths))
 	cooldownCount := 0
 	var earliest time.Time
 	for _, candidate := range auths {
 		checkModel := m.selectionModelForAuth(candidate, routeModel)
 		blocked, reason, next := isAuthBlockedForModel(candidate, checkModel, now)
 		if !blocked {
-			priority := authPriority(candidate)
-			availableByPriority[priority] = append(availableByPriority[priority], candidate)
+			ready = append(ready, candidate)
 			continue
 		}
 		if reason == blockReasonCooldown {
@@ -1395,7 +1402,7 @@ func (m *Manager) availableAuthsForRouteModel(auths []*Auth, provider, routeMode
 		}
 	}
 
-	if len(availableByPriority) == 0 {
+	if len(ready) == 0 {
 		if cooldownCount == len(auths) && !earliest.IsZero() {
 			providerForError := provider
 			if providerForError == "mixed" {
@@ -1410,20 +1417,10 @@ func (m *Manager) availableAuthsForRouteModel(auths []*Auth, provider, routeMode
 		return nil, &Error{Code: "auth_unavailable", Message: "no auth available"}
 	}
 
-	bestPriority := 0
-	found := false
-	for priority := range availableByPriority {
-		if !found || priority > bestPriority {
-			bestPriority = priority
-			found = true
-		}
+	if len(ready) > 1 {
+		sort.Slice(ready, func(i, j int) bool { return ready[i].ID < ready[j].ID })
 	}
-
-	available := availableByPriority[bestPriority]
-	if len(available) > 1 {
-		sort.Slice(available, func(i, j int) bool { return available[i].ID < available[j].ID })
-	}
-	return available, nil
+	return ready, nil
 }
 
 func selectionArgForSelector(selector Selector, routeModel string) string {
@@ -4667,6 +4664,7 @@ func (m *Manager) pickNextLegacy(ctx context.Context, provider, model string, op
 		}
 	}
 	registryRef := registry.GetGlobalRegistry()
+	_, retryAware := selector.(retryAwareSelector)
 	for _, candidate := range m.auths {
 		if candidate == nil || executorKeyFromAuth(candidate) != provider || candidate.Disabled {
 			continue
@@ -4677,8 +4675,10 @@ func (m *Manager) pickNextLegacy(ctx context.Context, provider, model string, op
 		if disallowFreeAuth && isFreeCodexAuth(candidate) {
 			continue
 		}
-		if _, used := tried[candidate.ID]; used {
-			continue
+		if !retryAware {
+			if _, used := tried[candidate.ID]; used {
+				continue
+			}
 		}
 		if modelKey != "" && !m.authSupportsRouteModel(registryRef, candidate, model) {
 			continue
@@ -4689,7 +4689,13 @@ func (m *Manager) pickNextLegacy(ctx context.Context, provider, model string, op
 		m.mu.RUnlock()
 		return nil, nil, &Error{Code: "auth_not_found", Message: "no auth available"}
 	}
-	available, errAvailable := m.availableAuthsForRouteModel(candidates, provider, model, time.Now())
+	var available []*Auth
+	var errAvailable error
+	if retryAware {
+		available, errAvailable = m.readyAuthsForRouteModel(candidates, provider, model, time.Now())
+	} else {
+		available, errAvailable = m.availableAuthsForRouteModel(candidates, provider, model, time.Now())
+	}
 	if errAvailable != nil {
 		m.mu.RUnlock()
 		return nil, nil, errAvailable
@@ -4697,12 +4703,17 @@ func (m *Manager) pickNextLegacy(ctx context.Context, provider, model string, op
 	available = cloneAuthSlice(available)
 	m.mu.RUnlock()
 
-	selected, handled, errPick := m.pickViaPluginScheduler(ctx, pluginScheduler, provider, []string{provider}, model, opts, tried, available)
+	selectable := available
+	if retryAware {
+		selectable = filterUntriedAuths(available, tried)
+	}
+	schedulerCandidates := highestPriorityAuths(selectable)
+	selected, handled, errPick := m.pickViaPluginScheduler(ctx, pluginScheduler, provider, []string{provider}, model, opts, tried, schedulerCandidates)
 	if errPick != nil {
 		return nil, nil, errPick
 	}
 	if !handled {
-		selected, errPick = selector.Pick(ctx, provider, selectionArgForSelector(selector, model), opts, available)
+		selected, errPick = pickSelectorWithRetry(ctx, selector, provider, selectionArgForSelector(selector, model), opts, available, selectable)
 		if errPick != nil {
 			return nil, nil, errPick
 		}
@@ -4827,6 +4838,7 @@ func (m *Manager) pickNextMixedLegacy(ctx context.Context, providers []string, m
 		}
 	}
 	registryRef := registry.GetGlobalRegistry()
+	_, retryAware := selector.(retryAwareSelector)
 	for _, candidate := range m.auths {
 		if candidate == nil || candidate.Disabled {
 			continue
@@ -4844,8 +4856,10 @@ func (m *Manager) pickNextMixedLegacy(ctx context.Context, providers []string, m
 		if _, ok := providerSet[providerKey]; !ok {
 			continue
 		}
-		if _, used := tried[candidate.ID]; used {
-			continue
+		if !retryAware {
+			if _, used := tried[candidate.ID]; used {
+				continue
+			}
 		}
 		if _, ok := m.executors[providerKey]; !ok {
 			continue
@@ -4859,7 +4873,13 @@ func (m *Manager) pickNextMixedLegacy(ctx context.Context, providers []string, m
 		m.mu.RUnlock()
 		return nil, nil, "", &Error{Code: "auth_not_found", Message: "no auth available"}
 	}
-	available, errAvailable := m.availableAuthsForRouteModel(candidates, "mixed", model, time.Now())
+	var available []*Auth
+	var errAvailable error
+	if retryAware {
+		available, errAvailable = m.readyAuthsForRouteModel(candidates, "mixed", model, time.Now())
+	} else {
+		available, errAvailable = m.availableAuthsForRouteModel(candidates, "mixed", model, time.Now())
+	}
 	if errAvailable != nil {
 		m.mu.RUnlock()
 		return nil, nil, "", errAvailable
@@ -4867,12 +4887,17 @@ func (m *Manager) pickNextMixedLegacy(ctx context.Context, providers []string, m
 	available = cloneAuthSlice(available)
 	m.mu.RUnlock()
 
-	selected, handled, errPick := m.pickViaPluginScheduler(ctx, pluginScheduler, "mixed", providers, model, opts, tried, available)
+	selectable := available
+	if retryAware {
+		selectable = filterUntriedAuths(available, tried)
+	}
+	schedulerCandidates := highestPriorityAuths(selectable)
+	selected, handled, errPick := m.pickViaPluginScheduler(ctx, pluginScheduler, "mixed", providers, model, opts, tried, schedulerCandidates)
 	if errPick != nil {
 		return nil, nil, "", errPick
 	}
 	if !handled {
-		selected, errPick = selector.Pick(ctx, "mixed", selectionArgForSelector(selector, model), opts, available)
+		selected, errPick = pickSelectorWithRetry(ctx, selector, "mixed", selectionArgForSelector(selector, model), opts, available, selectable)
 		if errPick != nil {
 			return nil, nil, "", errPick
 		}

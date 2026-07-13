@@ -157,11 +157,12 @@ func (e *credentialRetryLimitExecutor) Calls() int {
 type authFallbackExecutor struct {
 	id string
 
-	mu                sync.Mutex
-	executeCalls      []string
-	streamCalls       []string
-	executeErrors     map[string]error
-	streamFirstErrors map[string]error
+	mu                 sync.Mutex
+	executeCalls       []string
+	streamCalls        []string
+	executeErrors      map[string]error
+	executeErrorBudget map[string]int
+	streamFirstErrors  map[string]error
 }
 
 func (e *authFallbackExecutor) Identifier() string {
@@ -172,6 +173,13 @@ func (e *authFallbackExecutor) Execute(_ context.Context, auth *Auth, _ cliproxy
 	e.mu.Lock()
 	e.executeCalls = append(e.executeCalls, auth.ID)
 	err := e.executeErrors[auth.ID]
+	if remaining, limited := e.executeErrorBudget[auth.ID]; limited {
+		if remaining <= 0 {
+			err = nil
+		} else {
+			e.executeErrorBudget[auth.ID] = remaining - 1
+		}
+	}
 	e.mu.Unlock()
 	if err != nil {
 		return cliproxyexecutor.Response{}, err
@@ -222,6 +230,216 @@ func (e *authFallbackExecutor) StreamCalls() []string {
 	out := make([]string, len(e.streamCalls))
 	copy(out, e.streamCalls)
 	return out
+}
+
+func TestManager_Execute_SequentialFillFallsBackAcrossPrioritiesWithoutBurningSticky(t *testing.T) {
+	prev := quotaCooldownDisabled.Load()
+	quotaCooldownDisabled.Store(false)
+	t.Cleanup(func() { quotaCooldownDisabled.Store(prev) })
+
+	const (
+		provider = "claude"
+		model    = "sequential-fill-priority-retry-model"
+		highID   = "sequential-fill-priority-high"
+		lowID    = "sequential-fill-priority-low"
+	)
+
+	m := NewManager(nil, &SequentialFillSelector{}, nil)
+	m.SetRetryConfig(0, 0, 2)
+	executor := &authFallbackExecutor{
+		id: provider,
+		executeErrors: map[string]error{
+			highID: &Error{HTTPStatus: http.StatusInternalServerError, Message: "boom"},
+		},
+	}
+	m.RegisterExecutor(executor)
+
+	auths := []*Auth{
+		{
+			ID:         highID,
+			Provider:   provider,
+			Attributes: map[string]string{"priority": "10"},
+			Metadata:   map[string]any{"disable_cooling": true},
+		},
+		{
+			ID:         lowID,
+			Provider:   provider,
+			Attributes: map[string]string{"priority": "0"},
+		},
+	}
+	registryRef := registry.GetGlobalRegistry()
+	for _, auth := range auths {
+		registryRef.RegisterClient(auth.ID, provider, []*registry.ModelInfo{{ID: model}})
+		if _, errRegister := m.Register(context.Background(), auth); errRegister != nil {
+			t.Fatalf("register auth %q: %v", auth.ID, errRegister)
+		}
+	}
+	t.Cleanup(func() {
+		for _, auth := range auths {
+			registryRef.UnregisterClient(auth.ID)
+		}
+	})
+
+	req := cliproxyexecutor.Request{Model: model}
+	resp, errExecute := m.Execute(context.Background(), []string{provider}, req, cliproxyexecutor.Options{})
+	if errExecute != nil {
+		t.Fatalf("Execute() error = %v", errExecute)
+	}
+	if got := string(resp.Payload); got != lowID {
+		t.Fatalf("Execute() payload = %q, want %q", got, lowID)
+	}
+	if calls := executor.ExecuteCalls(); len(calls) != 2 || calls[0] != highID || calls[1] != lowID {
+		t.Fatalf("Execute() auth calls = %v, want [%s %s]", calls, highID, lowID)
+	}
+
+	delete(executor.executeErrors, highID)
+	resp, errExecute = m.Execute(context.Background(), []string{provider}, req, cliproxyexecutor.Options{})
+	if errExecute != nil {
+		t.Fatalf("Execute() after retry error = %v", errExecute)
+	}
+	if got := string(resp.Payload); got != highID {
+		t.Fatalf("Execute() after retry payload = %q, want sticky %q", got, highID)
+	}
+}
+
+func TestManager_Execute_SequentialFillMixedRetryDoesNotAdvanceProvider(t *testing.T) {
+	prev := quotaCooldownDisabled.Load()
+	quotaCooldownDisabled.Store(false)
+	t.Cleanup(func() { quotaCooldownDisabled.Store(prev) })
+
+	const (
+		model   = "sequential-fill-mixed-retry-model"
+		alphaID = "sequential-fill-mixed-alpha"
+		betaID  = "sequential-fill-mixed-beta"
+	)
+
+	m := NewManager(nil, &SequentialFillSelector{}, nil)
+	m.SetRetryConfig(0, 0, 2)
+	alphaExecutor := &authFallbackExecutor{
+		id: "alpha",
+		executeErrors: map[string]error{
+			alphaID: &Error{HTTPStatus: http.StatusInternalServerError, Message: "boom"},
+		},
+	}
+	betaExecutor := &authFallbackExecutor{id: "beta"}
+	m.RegisterExecutor(alphaExecutor)
+	m.RegisterExecutor(betaExecutor)
+
+	auths := []*Auth{
+		{ID: alphaID, Provider: "alpha", Metadata: map[string]any{"disable_cooling": true}},
+		{ID: betaID, Provider: "beta"},
+	}
+	registryRef := registry.GetGlobalRegistry()
+	for _, auth := range auths {
+		registryRef.RegisterClient(auth.ID, auth.Provider, []*registry.ModelInfo{{ID: model}})
+		if _, errRegister := m.Register(context.Background(), auth); errRegister != nil {
+			t.Fatalf("register auth %q: %v", auth.ID, errRegister)
+		}
+	}
+	t.Cleanup(func() {
+		for _, auth := range auths {
+			registryRef.UnregisterClient(auth.ID)
+		}
+	})
+
+	req := cliproxyexecutor.Request{Model: model}
+	resp, errExecute := m.Execute(context.Background(), []string{"alpha", "beta"}, req, cliproxyexecutor.Options{})
+	if errExecute != nil {
+		t.Fatalf("Execute() error = %v", errExecute)
+	}
+	if got := string(resp.Payload); got != betaID {
+		t.Fatalf("Execute() payload = %q, want temporary provider failover %q", got, betaID)
+	}
+	if calls := alphaExecutor.ExecuteCalls(); len(calls) != 1 || calls[0] != alphaID {
+		t.Fatalf("alpha Execute() calls = %v, want [%s]", calls, alphaID)
+	}
+	if calls := betaExecutor.ExecuteCalls(); len(calls) != 1 || calls[0] != betaID {
+		t.Fatalf("beta Execute() calls = %v, want [%s]", calls, betaID)
+	}
+
+	delete(alphaExecutor.executeErrors, alphaID)
+	resp, errExecute = m.Execute(context.Background(), []string{"alpha", "beta"}, req, cliproxyexecutor.Options{})
+	if errExecute != nil {
+		t.Fatalf("Execute() after retry error = %v", errExecute)
+	}
+	if got := string(resp.Payload); got != alphaID {
+		t.Fatalf("Execute() after retry payload = %q, want sticky provider auth %q", got, alphaID)
+	}
+}
+
+func TestManager_Execute_SessionAffinitySequentialFillRetryIsTemporary(t *testing.T) {
+	prev := quotaCooldownDisabled.Load()
+	quotaCooldownDisabled.Store(false)
+	t.Cleanup(func() { quotaCooldownDisabled.Store(prev) })
+
+	const (
+		provider = "claude"
+		model    = "session-affinity-sequential-fill-retry-model"
+	)
+
+	selector := NewSessionAffinitySelectorWithConfig(SessionAffinityConfig{
+		Fallback: &SequentialFillSelector{},
+		TTL:      time.Minute,
+	})
+	t.Cleanup(selector.Stop)
+	m := NewManager(nil, selector, nil)
+	m.SetRetryConfig(0, 0, 2)
+	executor := &authFallbackExecutor{
+		id:                 provider,
+		executeErrors:      make(map[string]error),
+		executeErrorBudget: make(map[string]int),
+	}
+	m.RegisterExecutor(executor)
+
+	auths := []*Auth{
+		{ID: "session-affinity-retry-a", Provider: provider, Metadata: map[string]any{"disable_cooling": true}},
+		{ID: "session-affinity-retry-b", Provider: provider, Metadata: map[string]any{"disable_cooling": true}},
+	}
+	registryRef := registry.GetGlobalRegistry()
+	for _, auth := range auths {
+		registryRef.RegisterClient(auth.ID, provider, []*registry.ModelInfo{{ID: model}})
+		if _, errRegister := m.Register(context.Background(), auth); errRegister != nil {
+			t.Fatalf("register auth %q: %v", auth.ID, errRegister)
+		}
+	}
+	t.Cleanup(func() {
+		for _, auth := range auths {
+			registryRef.UnregisterClient(auth.ID)
+		}
+	})
+
+	req := cliproxyexecutor.Request{Model: model}
+	opts := cliproxyexecutor.Options{OriginalRequest: []byte(`{"metadata":{"user_id":"user_account__session_11111111-1111-1111-1111-111111111111"}}`)}
+	firstResp, errExecute := m.Execute(context.Background(), []string{provider}, req, opts)
+	if errExecute != nil {
+		t.Fatalf("Execute() initial binding error = %v", errExecute)
+	}
+	boundID := string(firstResp.Payload)
+	if boundID == "" {
+		t.Fatal("Execute() initial binding returned empty auth ID")
+	}
+
+	executor.mu.Lock()
+	executor.executeErrors[boundID] = &Error{HTTPStatus: http.StatusInternalServerError, Message: "boom"}
+	executor.executeErrorBudget[boundID] = 1
+	executor.mu.Unlock()
+
+	retryResp, errExecute := m.Execute(context.Background(), []string{provider}, req, opts)
+	if errExecute != nil {
+		t.Fatalf("Execute() retry error = %v", errExecute)
+	}
+	retryID := string(retryResp.Payload)
+	if retryID == boundID {
+		t.Fatalf("Execute() retry auth = %q, want temporary failover", retryID)
+	}
+
+	afterResp, errExecute := m.Execute(context.Background(), []string{provider}, req, opts)
+	if errExecute != nil {
+		t.Fatalf("Execute() after retry error = %v", errExecute)
+	}
+	if got := string(afterResp.Payload); got != boundID {
+		t.Fatalf("Execute() after retry auth = %q, want original binding %q", got, boundID)
+	}
 }
 
 func TestManager_WrapStreamResult_PreservesRetryAfterOnChunkError(t *testing.T) {

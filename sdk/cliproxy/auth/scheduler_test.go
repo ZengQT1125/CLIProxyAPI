@@ -427,6 +427,84 @@ func TestManagerPluginSchedulerSelectsAuthID(t *testing.T) {
 	}
 }
 
+func TestManagerExecutePluginSchedulerExcludesTriedSequentialFillCandidates(t *testing.T) {
+	prev := quotaCooldownDisabled.Load()
+	quotaCooldownDisabled.Store(false)
+	t.Cleanup(func() { quotaCooldownDisabled.Store(prev) })
+
+	const (
+		provider = "gemini"
+		model    = "plugin-scheduler-sequential-fill-retry-model"
+		firstID  = "plugin-scheduler-retry-a"
+		secondID = "plugin-scheduler-retry-b"
+	)
+
+	manager := NewManager(nil, &SequentialFillSelector{}, nil)
+	manager.SetRetryConfig(0, 0, 2)
+	executor := &authFallbackExecutor{
+		id: provider,
+		executeErrors: map[string]error{
+			firstID: &Error{HTTPStatus: http.StatusInternalServerError, Message: "boom"},
+		},
+		executeErrorBudget: map[string]int{firstID: 1},
+	}
+	manager.RegisterExecutor(executor)
+
+	auths := []*Auth{
+		{ID: firstID, Provider: provider, Metadata: map[string]any{"disable_cooling": true}},
+		{ID: secondID, Provider: provider},
+	}
+	registryRef := registry.GetGlobalRegistry()
+	for _, auth := range auths {
+		registryRef.RegisterClient(auth.ID, provider, []*registry.ModelInfo{{ID: model}})
+		if _, errRegister := manager.Register(context.Background(), auth); errRegister != nil {
+			t.Fatalf("Register(%s) error = %v", auth.ID, errRegister)
+		}
+	}
+	t.Cleanup(func() {
+		for _, auth := range auths {
+			registryRef.UnregisterClient(auth.ID)
+		}
+	})
+
+	scheduler := &fakePluginScheduler{pick: func(_ context.Context, req pluginapi.SchedulerPickRequest) (pluginapi.SchedulerPickResponse, bool, error) {
+		if len(req.Candidates) == 0 {
+			return pluginapi.SchedulerPickResponse{}, true, errors.New("scheduler received no candidates")
+		}
+		return pluginapi.SchedulerPickResponse{Handled: true, AuthID: req.Candidates[0].ID}, true, nil
+	}}
+	manager.SetPluginScheduler(scheduler)
+
+	resp, errExecute := manager.Execute(context.Background(), []string{provider}, cliproxyexecutor.Request{Model: model}, cliproxyexecutor.Options{})
+	if errExecute != nil {
+		t.Fatalf("Execute() error = %v", errExecute)
+	}
+	if got := string(resp.Payload); got != secondID {
+		t.Fatalf("Execute() payload = %q, want %q", got, secondID)
+	}
+	if len(scheduler.requests) != 2 {
+		t.Fatalf("scheduler request count = %d, want 2", len(scheduler.requests))
+	}
+	assertSchedulerCandidateIDs(t, scheduler.requests[0], []string{firstID, secondID})
+	assertSchedulerCandidateIDs(t, scheduler.requests[1], []string{secondID})
+}
+
+func assertSchedulerCandidateIDs(t *testing.T, request pluginapi.SchedulerPickRequest, want []string) {
+	t.Helper()
+	got := make([]string, 0, len(request.Candidates))
+	for _, candidate := range request.Candidates {
+		got = append(got, candidate.ID)
+	}
+	if len(got) != len(want) {
+		t.Fatalf("scheduler candidate IDs = %v, want %v", got, want)
+	}
+	for i := range want {
+		if got[i] != want[i] {
+			t.Fatalf("scheduler candidate IDs = %v, want %v", got, want)
+		}
+	}
+}
+
 func TestManagerPluginSchedulerSkippedWhenHomeEnabled(t *testing.T) {
 	manager := NewManager(nil, &RoundRobinSelector{}, nil)
 	manager.SetConfig(&internalconfig.Config{Home: internalconfig.HomeConfig{Enabled: true}})

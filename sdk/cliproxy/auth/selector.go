@@ -41,6 +41,14 @@ type FillFirstSelector struct{}
 // then advances to the next one. When a previously used credential recovers,
 // it won't jump back - ensuring balanced usage across all credentials.
 //
+// Request-scoped retries (tried auth IDs) only skip the sticky credential for the
+// current request. Sticky advances permanently only on real unavailability
+// (cooldown/disabled), so the current sticky credential stays sticky after a
+// same-request failover.
+//
+// Sticky keys use the canonical model name (thinking suffixes stripped) so
+// "grok-4.5" and "grok-4.5(high)" share the same sticky slot.
+//
 // For mixed-provider requests, a two-level sticky selection is used:
 // first stick to the current provider until all its credentials are
 // exhausted (in cooldown/unavailable), then advance to the next provider.
@@ -49,6 +57,22 @@ type SequentialFillSelector struct {
 	mu             sync.Mutex
 	current        map[string]string // actualProvider:model -> current auth ID
 	stickyProvider map[string]string // model -> current provider name (sticky)
+}
+
+// retryAwareSelector separates real readiness from request-scoped eligibility.
+// It is private so retry state cannot leak into the public selector contract.
+type retryAwareSelector interface {
+	pickWithRetry(ctx context.Context, provider, model string, opts cliproxyexecutor.Options, ready, selectable []*Auth) (*Auth, error)
+}
+
+func pickSelectorWithRetry(ctx context.Context, selector Selector, provider, model string, opts cliproxyexecutor.Options, ready, selectable []*Auth) (*Auth, error) {
+	if len(selectable) == 0 {
+		return nil, &Error{Code: "auth_not_found", Message: "no auth available"}
+	}
+	if aware, ok := selector.(retryAwareSelector); ok {
+		return aware.pickWithRetry(ctx, provider, model, opts, ready, selectable)
+	}
+	return selector.Pick(ctx, provider, model, opts, highestPriorityAuths(selectable))
 }
 
 type blockReason int
@@ -234,6 +258,14 @@ func collectAvailableByPriority(auths []*Auth, model string, now time.Time) (ava
 }
 
 func getAvailableAuths(auths []*Auth, provider, model string, now time.Time) ([]*Auth, error) {
+	ready, err := getReadyAuths(auths, provider, model, now)
+	if err != nil {
+		return nil, err
+	}
+	return highestPriorityAuths(ready), nil
+}
+
+func getReadyAuths(auths []*Auth, provider, model string, now time.Time) ([]*Auth, error) {
 	if len(auths) == 0 {
 		return nil, &Error{Code: "auth_not_found", Message: "no auth candidates"}
 	}
@@ -254,20 +286,36 @@ func getAvailableAuths(auths []*Auth, provider, model string, now time.Time) ([]
 		return nil, &Error{Code: "auth_unavailable", Message: "no auth available"}
 	}
 
-	bestPriority := 0
-	found := false
-	for priority := range availableByPriority {
-		if !found || priority > bestPriority {
+	ready := make([]*Auth, 0, len(auths))
+	for _, authsAtPriority := range availableByPriority {
+		ready = append(ready, authsAtPriority...)
+	}
+	if len(ready) > 1 {
+		sort.Slice(ready, func(i, j int) bool { return ready[i].ID < ready[j].ID })
+	}
+	return ready, nil
+}
+
+func highestPriorityAuths(auths []*Auth) []*Auth {
+	if len(auths) == 0 {
+		return nil
+	}
+	bestPriority := authPriority(auths[0])
+	for i := 1; i < len(auths); i++ {
+		if priority := authPriority(auths[i]); priority > bestPriority {
 			bestPriority = priority
-			found = true
 		}
 	}
-
-	available := availableByPriority[bestPriority]
+	available := make([]*Auth, 0, len(auths))
+	for _, auth := range auths {
+		if authPriority(auth) == bestPriority {
+			available = append(available, auth)
+		}
+	}
 	if len(available) > 1 {
 		sort.Slice(available, func(i, j int) bool { return available[i].ID < available[j].ID })
 	}
-	return available, nil
+	return available
 }
 
 // Pick selects the next available auth for the provider in a round-robin manner.
@@ -322,13 +370,27 @@ func (s *FillFirstSelector) Pick(ctx context.Context, provider, model string, op
 // Pick selects credentials sequentially without jumping back to earlier ones.
 // For mixed-provider requests, it sticks to the current provider until all its
 // credentials are exhausted, then advances to the next provider.
+//
+// Request-scoped retries only skip already-tried credentials for the current
+// request. They must not permanently advance the sticky pointer — otherwise a
+// single in-request failover burns sticky forever even when the original
+// credential remains available for the next request.
 func (s *SequentialFillSelector) Pick(ctx context.Context, provider, model string, opts cliproxyexecutor.Options, auths []*Auth) (*Auth, error) {
-	_ = ctx
-	_ = opts
-	now := time.Now()
-	available, err := getAvailableAuths(auths, provider, model, now)
+	ready, err := getReadyAuths(auths, provider, model, time.Now())
 	if err != nil {
 		return nil, err
+	}
+	return s.pickWithRetry(ctx, provider, model, opts, ready, ready)
+}
+
+func (s *SequentialFillSelector) pickWithRetry(ctx context.Context, provider, model string, opts cliproxyexecutor.Options, ready, selectable []*Auth) (*Auth, error) {
+	_ = ctx
+	_ = opts
+	modelKey := canonicalModelKey(model)
+	active := highestPriorityAuths(ready)
+	selectable = highestPriorityAuths(selectable)
+	if len(selectable) == 0 {
+		return nil, &Error{Code: "auth_not_found", Message: "no auth available"}
 	}
 
 	s.mu.Lock()
@@ -340,20 +402,22 @@ func (s *SequentialFillSelector) Pick(ctx context.Context, provider, model strin
 
 	// Single provider path: flat sticky selection.
 	if provider != "mixed" {
-		return s.pickSticky(provider, model, available), nil
-	}
-
-	// Mixed provider path: group by actual provider.
-	groups := make(map[string][]*Auth)
-	for _, auth := range available {
-		groups[auth.Provider] = append(groups[auth.Provider], auth)
-	}
-
-	// Single actual provider in the mix: no rotation needed.
-	if len(groups) == 1 {
-		for p := range groups {
-			return s.pickSticky(p, model, groups[p]), nil
+		picked := s.pickSticky(provider, modelKey, active, selectable)
+		if picked == nil {
+			return nil, &Error{Code: "auth_not_found", Message: "no auth available"}
 		}
+		return picked, nil
+	}
+
+	// Mixed provider path: keep real readiness separate from request-scoped
+	// selectability so retries never burn sticky state.
+	readyGroups := make(map[string][]*Auth)
+	for _, auth := range active {
+		readyGroups[auth.Provider] = append(readyGroups[auth.Provider], auth)
+	}
+	selectableGroups := make(map[string][]*Auth)
+	for _, auth := range selectable {
+		selectableGroups[auth.Provider] = append(selectableGroups[auth.Provider], auth)
 	}
 
 	// Sticky provider selection: stick to the current provider as long as it
@@ -364,65 +428,167 @@ func (s *SequentialFillSelector) Pick(ctx context.Context, provider, model strin
 	}
 
 	// Sort provider names for deterministic ordering.
-	providers := make([]string, 0, len(groups))
-	for p := range groups {
-		providers = append(providers, p)
+	readyProviders := make([]string, 0, len(readyGroups))
+	for p := range readyGroups {
+		readyProviders = append(readyProviders, p)
 	}
-	sort.Strings(providers)
+	sort.Strings(readyProviders)
+	selectableProviders := make([]string, 0, len(selectableGroups))
+	for p := range selectableGroups {
+		selectableProviders = append(selectableProviders, p)
+	}
+	sort.Strings(selectableProviders)
 
 	// If we have a sticky provider and it still has available credentials, use it.
-	if cp := s.stickyProvider[model]; cp != "" {
-		if auths, ok := groups[cp]; ok {
-			return s.pickSticky(cp, model, auths), nil
+	if cp := s.stickyProvider[modelKey]; cp != "" {
+		if group, ok := readyGroups[cp]; ok {
+			if pick := s.pickSticky(cp, modelKey, group, selectableGroups[cp]); pick != nil {
+				return pick, nil
+			}
+			// Sticky provider only has request-tried credentials left: temporary
+			// failover without permanently leaving the sticky provider.
+			if temporary := s.pickTemporaryMixed(selectableProviders, selectableGroups, cp); temporary != nil {
+				return temporary, nil
+			}
+			return nil, &Error{Code: "auth_not_found", Message: "no auth available"}
 		}
-		// Current provider exhausted, advance to the next one.
-		next := providers[0]
-		for _, p := range providers {
+		// Current provider exhausted (cooldown/unavailable), advance permanently.
+		next := readyProviders[0]
+		for _, p := range readyProviders {
 			if p > cp {
 				next = p
 				break
 			}
 		}
-		s.stickyProvider[model] = next
-		return s.pickSticky(next, model, groups[next]), nil
+		s.stickyProvider[modelKey] = next
+		if picked := s.pickSticky(next, modelKey, readyGroups[next], selectableGroups[next]); picked != nil {
+			return picked, nil
+		}
+		if temporary := s.pickTemporaryMixed(selectableProviders, selectableGroups, next); temporary != nil {
+			return temporary, nil
+		}
+		return nil, &Error{Code: "auth_not_found", Message: "no auth available"}
 	}
 
 	// First access: start with the first provider.
-	s.stickyProvider[model] = providers[0]
-	return s.pickSticky(providers[0], model, groups[providers[0]]), nil
+	firstProvider := readyProviders[0]
+	s.stickyProvider[modelKey] = firstProvider
+	if picked := s.pickSticky(firstProvider, modelKey, readyGroups[firstProvider], selectableGroups[firstProvider]); picked != nil {
+		return picked, nil
+	}
+	if temporary := s.pickTemporaryMixed(selectableProviders, selectableGroups, firstProvider); temporary != nil {
+		return temporary, nil
+	}
+	return nil, &Error{Code: "auth_not_found", Message: "no auth available"}
+}
+
+// pickTemporaryMixed returns an untried auth from a non-sticky provider without
+// updating stickyProvider. Must be called with s.mu held.
+func (s *SequentialFillSelector) pickTemporaryMixed(providers []string, groups map[string][]*Auth, stickyProvider string) *Auth {
+	for _, provider := range providers {
+		if provider == stickyProvider {
+			continue
+		}
+		group := groups[provider]
+		if len(group) == 0 {
+			continue
+		}
+		return group[0]
+	}
+	return nil
 }
 
 // pickSticky selects a credential from the given group with sticky sequential behavior.
 // Must be called with s.mu held.
-func (s *SequentialFillSelector) pickSticky(provider, model string, available []*Auth) *Auth {
+//
+// ready controls permanent sticky state. selectable contains credentials eligible
+// for this request after tried IDs and priority have been applied.
+func (s *SequentialFillSelector) pickSticky(provider, model string, ready, selectable []*Auth) *Auth {
+	if len(ready) == 0 || len(selectable) == 0 {
+		return nil
+	}
 	key := provider + ":" + model
 	currentID := s.current[key]
 
-	// First access: randomly select a starting credential.
+	// First access: establish sticky state from real readiness, not request retries.
 	if currentID == "" {
-		i := rand.IntN(len(available))
-		s.current[key] = available[i].ID
-		return available[i]
+		i := rand.IntN(len(ready))
+		current := ready[i]
+		s.current[key] = current.ID
+		if selected := authWithID(selectable, current.ID); selected != nil {
+			return selected
+		}
+		return nextAuthAfter(current.ID, selectable)
 	}
 
-	// Sticky: if current credential is still available, keep using it.
-	for _, auth := range available {
-		if auth.ID == currentID {
+	// Request-scoped failover keeps current sticky state unchanged.
+	if authWithID(ready, currentID) != nil {
+		if selected := authWithID(selectable, currentID); selected != nil {
+			return selected
+		}
+		return nextAuthAfter(currentID, selectable)
+	}
+
+	// Permanent advance only when sticky credential is truly unavailable.
+	advance := nextAuthAfter(currentID, ready)
+	if advance == nil {
+		return nil
+	}
+	s.current[key] = advance.ID
+	if selected := authWithID(selectable, advance.ID); selected != nil {
+		return selected
+	}
+	return nextAuthAfter(advance.ID, selectable)
+}
+
+func filterUntriedAuths(auths []*Auth, tried map[string]struct{}) []*Auth {
+	if len(auths) == 0 || len(tried) == 0 {
+		return auths
+	}
+	out := make([]*Auth, 0, len(auths))
+	for _, auth := range auths {
+		if auth == nil {
+			continue
+		}
+		if _, used := tried[auth.ID]; used {
+			continue
+		}
+		out = append(out, auth)
+	}
+	return out
+}
+
+func authWithID(auths []*Auth, id string) *Auth {
+	for _, auth := range auths {
+		if auth != nil && auth.ID == id {
 			return auth
 		}
 	}
+	return nil
+}
 
-	// Advance: find the first credential with ID > currentID.
-	for _, auth := range available {
-		if auth.ID > currentID {
-			s.current[key] = auth.ID
-			return auth
-		}
+// nextAuthAfter returns the first auth with ID greater than currentID, wrapping
+// around when needed. auths must be sorted by ID.
+func nextAuthAfter(currentID string, auths []*Auth) *Auth {
+	if len(auths) == 0 {
+		return nil
 	}
-
-	// Wrap around: all subsequent credentials unavailable, start from beginning.
-	s.current[key] = available[0].ID
-	return available[0]
+	for _, auth := range auths {
+		if auth == nil {
+			continue
+		}
+		if auth.ID <= currentID {
+			continue
+		}
+		return auth
+	}
+	for _, auth := range auths {
+		if auth == nil {
+			continue
+		}
+		return auth
+	}
+	return nil
 }
 
 func isAuthBlockedForModel(auth *Auth, model string, now time.Time) (bool, blockReason, time.Time) {
@@ -538,32 +704,46 @@ func NewSessionAffinitySelectorWithConfig(cfg SessionAffinityConfig) *SessionAff
 // a session uses multiple models (e.g., gemini-2.5-pro and gemini-3-flash-preview)
 // that may be supported by different auth credentials, and to avoid cross-provider conflicts.
 func (s *SessionAffinitySelector) Pick(ctx context.Context, provider, model string, opts cliproxyexecutor.Options, auths []*Auth) (*Auth, error) {
+	ready, err := getReadyAuths(auths, provider, model, time.Now())
+	if err != nil {
+		return nil, err
+	}
+	return s.pickWithRetry(ctx, provider, model, opts, ready, ready)
+}
+
+func (s *SessionAffinitySelector) pickWithRetry(ctx context.Context, provider, model string, opts cliproxyexecutor.Options, ready, selectable []*Auth) (*Auth, error) {
 	entry := selectorLogEntry(ctx)
 	primaryID, fallbackID := extractSessionIDs(opts.Headers, opts.OriginalRequest, opts.Metadata)
 	if primaryID == "" {
 		entry.Debugf("session-affinity: no session ID extracted, falling back to default selector | provider=%s model=%s", provider, model)
-		return s.fallback.Pick(ctx, provider, model, opts, auths)
+		return pickSelectorWithRetry(ctx, s.fallback, provider, model, opts, ready, selectable)
 	}
 
-	now := time.Now()
-	available, err := getAvailableAuths(auths, provider, model, now)
-	if err != nil {
-		return nil, err
+	available := highestPriorityAuths(ready)
+	eligible := highestPriorityAuths(selectable)
+	if len(eligible) == 0 {
+		return nil, &Error{Code: "auth_not_found", Message: "no auth available"}
 	}
 
 	cacheKey := provider + "::" + primaryID + "::" + model
 
 	if cachedAuthID, ok := s.cache.GetAndRefresh(cacheKey); ok {
-		for _, auth := range available {
-			if auth.ID == cachedAuthID {
-				entry.Infof("session-affinity: cache hit | session=%s auth=%s provider=%s model=%s", truncateSessionID(primaryID), auth.ID, provider, model)
-				return auth, nil
+		if auth := authWithID(available, cachedAuthID); auth != nil {
+			if authWithID(eligible, cachedAuthID) == nil {
+				temporary, errPick := pickSelectorWithRetry(ctx, s.fallback, provider, model, opts, ready, selectable)
+				if errPick != nil {
+					return nil, errPick
+				}
+				entry.Infof("session-affinity: cache hit but auth already tried, temporary failover | session=%s auth=%s provider=%s model=%s", truncateSessionID(primaryID), temporary.ID, provider, model)
+				return temporary, nil
 			}
+			entry.Infof("session-affinity: cache hit | session=%s auth=%s provider=%s model=%s", truncateSessionID(primaryID), auth.ID, provider, model)
+			return auth, nil
 		}
 		// Cached auth not available, reselect via fallback selector for even distribution
-		auth, err := s.fallback.Pick(ctx, provider, model, opts, auths)
-		if err != nil {
-			return nil, err
+		auth, errPick := pickSelectorWithRetry(ctx, s.fallback, provider, model, opts, ready, selectable)
+		if errPick != nil {
+			return nil, errPick
 		}
 		s.cache.Set(cacheKey, auth.ID)
 		entry.Infof("session-affinity: cache hit but auth unavailable, reselected | session=%s auth=%s provider=%s model=%s", truncateSessionID(primaryID), auth.ID, provider, model)
@@ -573,19 +753,17 @@ func (s *SessionAffinitySelector) Pick(ctx context.Context, provider, model stri
 	if fallbackID != "" && fallbackID != primaryID {
 		fallbackKey := provider + "::" + fallbackID + "::" + model
 		if cachedAuthID, ok := s.cache.Get(fallbackKey); ok {
-			for _, auth := range available {
-				if auth.ID == cachedAuthID {
-					s.cache.Set(cacheKey, auth.ID)
-					entry.Infof("session-affinity: fallback cache hit | session=%s fallback=%s auth=%s provider=%s model=%s", truncateSessionID(primaryID), truncateSessionID(fallbackID), auth.ID, provider, model)
-					return auth, nil
-				}
+			if auth := authWithID(eligible, cachedAuthID); auth != nil && authWithID(available, cachedAuthID) != nil {
+				s.cache.Set(cacheKey, auth.ID)
+				entry.Infof("session-affinity: fallback cache hit | session=%s fallback=%s auth=%s provider=%s model=%s", truncateSessionID(primaryID), truncateSessionID(fallbackID), auth.ID, provider, model)
+				return auth, nil
 			}
 		}
 	}
 
-	auth, err := s.fallback.Pick(ctx, provider, model, opts, auths)
-	if err != nil {
-		return nil, err
+	auth, errPick := pickSelectorWithRetry(ctx, s.fallback, provider, model, opts, ready, selectable)
+	if errPick != nil {
+		return nil, errPick
 	}
 	s.cache.Set(cacheKey, auth.ID)
 	entry.Infof("session-affinity: cache miss, new binding | session=%s auth=%s provider=%s model=%s", truncateSessionID(primaryID), auth.ID, provider, model)
