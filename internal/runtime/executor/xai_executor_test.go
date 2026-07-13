@@ -33,6 +33,289 @@ func testContextWithAPIKey(apiKey string) context.Context {
 	return context.WithValue(context.Background(), "gin", ginCtx)
 }
 
+type xaiTestRoundTripper func(*http.Request) (*http.Response, error)
+
+func (f xaiTestRoundTripper) RoundTrip(req *http.Request) (*http.Response, error) {
+	return f(req)
+}
+
+func captureXAIResponsesRequest(t *testing.T, auth *cliproxyauth.Auth, payload []byte, sourceFormat sdktranslator.Format, stream bool) (string, []byte) {
+	t.Helper()
+	var gotBaseURL string
+	var gotBody []byte
+	ctx := context.WithValue(context.Background(), "cliproxy.roundtripper", xaiTestRoundTripper(func(req *http.Request) (*http.Response, error) {
+		gotBaseURL = req.URL.Scheme + "://" + req.URL.Host + strings.TrimSuffix(req.URL.Path, "/responses")
+		var errRead error
+		gotBody, errRead = io.ReadAll(req.Body)
+		if errRead != nil {
+			t.Fatalf("read request body: %v", errRead)
+		}
+		return &http.Response{
+			StatusCode: http.StatusOK,
+			Header:     http.Header{"Content-Type": []string{"text/event-stream"}},
+			Body: io.NopCloser(strings.NewReader(
+				"data: {\"type\":\"response.completed\",\"response\":{\"id\":\"resp_1\",\"object\":\"response\",\"created_at\":0,\"status\":\"completed\",\"model\":\"grok-4.5\",\"output\":[],\"usage\":{\"input_tokens\":1,\"output_tokens\":1,\"total_tokens\":2}}}\n\n",
+			)),
+			Request: req,
+		}, nil
+	}))
+
+	exec := NewXAIExecutor(&config.Config{})
+	request := cliproxyexecutor.Request{Model: "grok-4.5", Payload: payload}
+	options := cliproxyexecutor.Options{SourceFormat: sourceFormat}
+	if !stream {
+		if _, errExecute := exec.Execute(ctx, auth, request, options); errExecute != nil {
+			t.Fatalf("Execute() error = %v", errExecute)
+		}
+		return gotBaseURL, gotBody
+	}
+
+	result, errExecute := exec.ExecuteStream(ctx, auth, request, options)
+	if errExecute != nil {
+		t.Fatalf("ExecuteStream() error = %v", errExecute)
+	}
+	for chunk := range result.Chunks {
+		if chunk.Err != nil {
+			t.Fatalf("stream chunk error = %v", chunk.Err)
+		}
+	}
+	return gotBaseURL, gotBody
+}
+
+func TestXAIExecutorExecuteInjectsNativeWebSearchOnlyForCLIChatProxy(t *testing.T) {
+	tests := []struct {
+		name            string
+		auth            *cliproxyauth.Auth
+		payload         []byte
+		wantBaseURL     string
+		wantNativeTools int
+		wantLookup      bool
+	}{
+		{
+			name: "OAuth default injects native web search",
+			auth: &cliproxyauth.Auth{
+				Provider: "xai",
+				Attributes: map[string]string{
+					"auth_kind": "oauth",
+					"base_url":  xaiauth.DefaultAPIBaseURL,
+				},
+				Metadata: map[string]any{"access_token": "xai-token"},
+			},
+			payload:         []byte(`{"model":"grok-4.5","input":[{"role":"user","content":"hello"}],"tools":[{"type":"function","name":"lookup","parameters":{"type":"object"}}]}`),
+			wantBaseURL:     xaiauth.CLIChatProxyBaseURL,
+			wantNativeTools: 1,
+			wantLookup:      true,
+		},
+		{
+			name: "existing native web search is not duplicated",
+			auth: &cliproxyauth.Auth{
+				Provider: "xai",
+				Attributes: map[string]string{
+					"auth_kind": "oauth",
+					"base_url":  xaiauth.DefaultAPIBaseURL,
+				},
+				Metadata: map[string]any{"access_token": "xai-token"},
+			},
+			payload:         []byte(`{"model":"grok-4.5","input":[{"role":"user","content":"hello"}],"tools":[{"type":"web_search"},{"type":"function","name":"lookup","parameters":{"type":"object"}}]}`),
+			wantBaseURL:     xaiauth.CLIChatProxyBaseURL,
+			wantNativeTools: 1,
+			wantLookup:      true,
+		},
+		{
+			name: "duplicate and named web search tools are removed",
+			auth: &cliproxyauth.Auth{
+				Provider: "xai",
+				Attributes: map[string]string{
+					"auth_kind": "oauth",
+					"base_url":  xaiauth.DefaultAPIBaseURL,
+				},
+				Metadata: map[string]any{"access_token": "xai-token"},
+			},
+			payload:         []byte(`{"model":"grok-4.5","input":[{"role":"user","content":"hello"}],"tools":[{"type":"web_search"},{"type":"web_search"},{"type":"function","name":"web_search","parameters":{"type":"object"}},{"type":"custom","name":"web_search"},{"type":"function","name":"lookup","parameters":{"type":"object"}}]}`),
+			wantBaseURL:     xaiauth.CLIChatProxyBaseURL,
+			wantNativeTools: 1,
+			wantLookup:      true,
+		},
+		{
+			name: "official API is unchanged",
+			auth: &cliproxyauth.Auth{
+				Provider: "xai",
+				Attributes: map[string]string{
+					"auth_kind":     "oauth",
+					xaiUsingAPIAttr: "true",
+					"base_url":      xaiauth.DefaultAPIBaseURL,
+				},
+				Metadata: map[string]any{"access_token": "xai-token"},
+			},
+			payload:         []byte(`{"model":"grok-4.5","input":[{"role":"user","content":"hello"}]}`),
+			wantBaseURL:     xaiauth.DefaultAPIBaseURL,
+			wantNativeTools: 0,
+		},
+		{
+			name: "custom gateway is unchanged",
+			auth: &cliproxyauth.Auth{
+				Provider: "xai",
+				Attributes: map[string]string{
+					"auth_kind":     "oauth",
+					xaiUsingAPIAttr: "false",
+					"base_url":      "https://gateway.example.test/v1",
+				},
+				Metadata: map[string]any{"access_token": "xai-token"},
+			},
+			payload:         []byte(`{"model":"grok-4.5","input":[{"role":"user","content":"hello"}]}`),
+			wantBaseURL:     "https://gateway.example.test/v1",
+			wantNativeTools: 0,
+		},
+		{
+			name: "non OAuth credential targeting CLI chat proxy is unchanged",
+			auth: &cliproxyauth.Auth{
+				Provider: "xai",
+				Attributes: map[string]string{
+					"auth_kind":     "api_key",
+					xaiUsingAPIAttr: "false",
+					"base_url":      xaiauth.CLIChatProxyBaseURL,
+				},
+				Metadata: map[string]any{"access_token": "xai-token"},
+			},
+			payload:         []byte(`{"model":"grok-4.5","input":[{"role":"user","content":"hello"}]}`),
+			wantBaseURL:     xaiauth.CLIChatProxyBaseURL,
+			wantNativeTools: 0,
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			gotBaseURL, gotBody := captureXAIResponsesRequest(t, tt.auth, tt.payload, sdktranslator.FormatOpenAIResponse, false)
+			if gotBaseURL != tt.wantBaseURL {
+				t.Fatalf("base URL = %q, want %q", gotBaseURL, tt.wantBaseURL)
+			}
+
+			nativeTools := 0
+			namedWebSearchTools := 0
+			lookupTools := 0
+			gjson.GetBytes(gotBody, "tools").ForEach(func(_, tool gjson.Result) bool {
+				if tool.Get("type").String() == xaiWebSearchToolType {
+					nativeTools++
+				}
+				if strings.EqualFold(tool.Get("name").String(), xaiWebSearchToolType) {
+					namedWebSearchTools++
+				}
+				if tool.Get("name").String() == "lookup" {
+					lookupTools++
+				}
+				return true
+			})
+			if nativeTools != tt.wantNativeTools {
+				t.Fatalf("native web_search tools = %d, want %d; body=%s", nativeTools, tt.wantNativeTools, gotBody)
+			}
+			if tt.wantNativeTools > 0 && namedWebSearchTools != 0 {
+				t.Fatalf("named web_search tools = %d, want 0; body=%s", namedWebSearchTools, gotBody)
+			}
+			if gotLookup := lookupTools == 1; gotLookup != tt.wantLookup {
+				t.Fatalf("lookup tool present = %v, want %v; body=%s", gotLookup, tt.wantLookup, gotBody)
+			}
+		})
+	}
+}
+
+func TestXAIExecutorExecuteRemovesConflictingWebSearchToolChoices(t *testing.T) {
+	tests := []struct {
+		name              string
+		payload           []byte
+		wantChoice        bool
+		wantChoiceType    string
+		wantNativeChoices int
+		wantNamedChoices  int
+		wantLookupChoices int
+	}{
+		{
+			name:       "direct named choice is removed",
+			payload:    []byte(`{"model":"grok-4.5","input":[{"role":"user","content":"hello"}],"tools":[{"type":"function","name":"web_search","parameters":{"type":"object"}}],"tool_choice":{"type":"function","name":"web_search"}}`),
+			wantChoice: false,
+		},
+		{
+			name:              "allowed choices remove named conflicts and duplicate native choices",
+			payload:           []byte(`{"model":"grok-4.5","input":[{"role":"user","content":"hello"}],"tools":[{"type":"function","name":"web_search","parameters":{"type":"object"}},{"type":"function","name":"lookup","parameters":{"type":"object"}}],"tool_choice":{"type":"allowed_tools","tools":[{"type":"function","name":"web_search"},{"type":"custom","name":"WEB_SEARCH"},{"type":"web_search"},{"type":"web_search"},{"type":"function","name":"lookup"}]}}`),
+			wantChoice:        true,
+			wantChoiceType:    "allowed_tools",
+			wantNativeChoices: 1,
+			wantLookupChoices: 1,
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			auth := &cliproxyauth.Auth{
+				Provider: "xai",
+				Attributes: map[string]string{
+					"auth_kind": "oauth",
+					"base_url":  xaiauth.DefaultAPIBaseURL,
+				},
+				Metadata: map[string]any{"access_token": "xai-token"},
+			}
+			_, gotBody := captureXAIResponsesRequest(t, auth, tt.payload, sdktranslator.FormatOpenAIResponse, false)
+
+			choice := gjson.GetBytes(gotBody, "tool_choice")
+			if choice.Exists() != tt.wantChoice {
+				t.Fatalf("tool_choice exists = %v, want %v; body=%s", choice.Exists(), tt.wantChoice, gotBody)
+			}
+			if !tt.wantChoice {
+				return
+			}
+			if gotType := choice.Get("type").String(); gotType != tt.wantChoiceType {
+				t.Fatalf("tool_choice.type = %q, want %q; body=%s", gotType, tt.wantChoiceType, gotBody)
+			}
+			nativeChoices := 0
+			namedChoices := 0
+			lookupChoices := 0
+			choice.Get("tools").ForEach(func(_, tool gjson.Result) bool {
+				if tool.Get("type").String() == xaiWebSearchToolType {
+					nativeChoices++
+				}
+				if strings.EqualFold(tool.Get("name").String(), xaiWebSearchToolType) {
+					namedChoices++
+				}
+				if tool.Get("name").String() == "lookup" {
+					lookupChoices++
+				}
+				return true
+			})
+			if nativeChoices != tt.wantNativeChoices {
+				t.Fatalf("native web_search choices = %d, want %d; body=%s", nativeChoices, tt.wantNativeChoices, gotBody)
+			}
+			if namedChoices != tt.wantNamedChoices {
+				t.Fatalf("named web_search choices = %d, want %d; body=%s", namedChoices, tt.wantNamedChoices, gotBody)
+			}
+			if lookupChoices != tt.wantLookupChoices {
+				t.Fatalf("lookup choices = %d, want %d; body=%s", lookupChoices, tt.wantLookupChoices, gotBody)
+			}
+		})
+	}
+}
+
+func TestXAIExecutorExecuteStreamInjectsNativeWebSearchForCLIChatProxy(t *testing.T) {
+	auth := &cliproxyauth.Auth{
+		Provider: "xai",
+		Attributes: map[string]string{
+			"auth_kind": "oauth",
+			"base_url":  xaiauth.DefaultAPIBaseURL,
+		},
+		Metadata: map[string]any{"access_token": "xai-token"},
+	}
+	_, gotBody := captureXAIResponsesRequest(t, auth, []byte(`{"model":"grok-4.5","max_tokens":1024,"messages":[{"role":"user","content":[{"type":"text","text":"hello"}]}],"stream":true}`), sdktranslator.FormatClaude, true)
+
+	nativeTools := 0
+	gjson.GetBytes(gotBody, "tools").ForEach(func(_, tool gjson.Result) bool {
+		if tool.Get("type").String() == xaiWebSearchToolType {
+			nativeTools++
+		}
+		return true
+	})
+	if nativeTools != 1 {
+		t.Fatalf("native web_search tools = %d, want 1; body=%s", nativeTools, gotBody)
+	}
+}
+
 func TestXAIExecutorExecuteShapesResponsesRequest(t *testing.T) {
 	var gotPath string
 	var gotAuth string
@@ -397,6 +680,9 @@ func TestXAIExecutorCompactUsesCompactEndpoint(t *testing.T) {
 	}
 	if gjson.GetBytes(gotBody, "stream").Exists() {
 		t.Fatalf("stream exists in compact body: %s", string(gotBody))
+	}
+	if gjson.GetBytes(gotBody, "tools").Exists() {
+		t.Fatalf("tools exist in compact body: %s", string(gotBody))
 	}
 	if got := gjson.GetBytes(gotBody, "input.0.encrypted_content").String(); got != validEncryptedContent {
 		t.Fatalf("input.0.encrypted_content = %q, want valid sample; body=%s", got, string(gotBody))

@@ -137,6 +137,7 @@ func (e *XAIExecutor) Execute(ctx context.Context, auth *cliproxyauth.Auth, req 
 	if err != nil {
 		return resp, err
 	}
+	prepared.body = ensureXAIChatProxyWebSearch(auth, baseURL, prepared.body)
 
 	reporter := helps.NewExecutorUsageReporter(ctx, e, prepared.baseModel, auth)
 	defer reporter.TrackFailure(ctx, &err)
@@ -597,6 +598,7 @@ func (e *XAIExecutor) ExecuteStream(ctx context.Context, auth *cliproxyauth.Auth
 	if err != nil {
 		return nil, err
 	}
+	prepared.body = ensureXAIChatProxyWebSearch(auth, baseURL, prepared.body)
 
 	reporter := helps.NewExecutorUsageReporter(ctx, e, prepared.baseModel, auth)
 	defer reporter.TrackFailure(ctx, &err)
@@ -964,10 +966,17 @@ func xaiUsingAPI(auth *cliproxyauth.Auth) bool {
 			}
 		}
 	}
-	if raw := strings.TrimSpace(auth.Attributes["auth_kind"]); raw != "" {
-		return !strings.EqualFold(raw, "oauth")
+	return !xaiIsOAuthAuth(auth)
+}
+
+func xaiIsOAuthAuth(auth *cliproxyauth.Auth) bool {
+	if auth == nil {
+		return false
 	}
-	return !strings.EqualFold(xaiMetadataString(auth.Metadata, "auth_kind"), "oauth")
+	if raw := strings.TrimSpace(auth.Attributes["auth_kind"]); raw != "" {
+		return strings.EqualFold(raw, "oauth")
+	}
+	return strings.EqualFold(xaiMetadataString(auth.Metadata, "auth_kind"), "oauth")
 }
 
 // xaiChatBaseURL returns the base URL for non-image/video xAI HTTP chat requests.
@@ -1101,6 +1110,130 @@ func xaiExecutionSessionID(req cliproxyexecutor.Request, opts cliproxyexecutor.O
 		return strings.TrimSpace(promptCacheKey.String())
 	}
 	return ""
+}
+
+func ensureXAIChatProxyWebSearch(auth *cliproxyauth.Auth, baseURL string, body []byte) []byte {
+	if !xaiIsOAuthAuth(auth) || xaiUsingAPI(auth) || !xaiIsCLIChatProxyBaseURL(baseURL) || !gjson.ValidBytes(body) {
+		return body
+	}
+
+	tools := gjson.GetBytes(body, "tools")
+	if tools.Exists() && !tools.IsArray() {
+		return body
+	}
+	toolItems := tools.Array()
+	keptTools := make([]string, 0, len(toolItems)+1)
+	hasNativeWebSearch := false
+	changed := false
+	for _, tool := range toolItems {
+		toolType := tool.Get("type").String()
+		if toolType == xaiWebSearchToolType {
+			if hasNativeWebSearch {
+				changed = true
+				continue
+			}
+			hasNativeWebSearch = true
+			keptTools = append(keptTools, tool.Raw)
+			continue
+		}
+		if xaiIsNamedWebSearchTool(tool) {
+			changed = true
+			continue
+		}
+		keptTools = append(keptTools, tool.Raw)
+	}
+
+	updatedTools := []byte(`[]`)
+	if !hasNativeWebSearch {
+		changed = true
+		updatedTools = []byte(`[{"type":"web_search"}]`)
+	}
+	if !changed {
+		return normalizeXAIChatProxyWebSearchToolChoice(body)
+	}
+	for _, tool := range keptTools {
+		var errSet error
+		updatedTools, errSet = sjson.SetRawBytes(updatedTools, "-1", []byte(tool))
+		if errSet != nil {
+			return body
+		}
+	}
+	updated, errSet := sjson.SetRawBytes(body, "tools", updatedTools)
+	if errSet != nil {
+		return body
+	}
+	return normalizeXAIChatProxyWebSearchToolChoice(updated)
+}
+
+func normalizeXAIChatProxyWebSearchToolChoice(body []byte) []byte {
+	choice := gjson.GetBytes(body, "tool_choice")
+	if !choice.Exists() {
+		return body
+	}
+	if xaiIsNamedWebSearchTool(choice) {
+		updated, errDelete := sjson.DeleteBytes(body, "tool_choice")
+		if errDelete != nil {
+			return body
+		}
+		return updated
+	}
+	if choice.Get("type").String() != "allowed_tools" {
+		return body
+	}
+
+	allowedTools := choice.Get("tools")
+	if !allowedTools.Exists() || !allowedTools.IsArray() {
+		return body
+	}
+	keptTools := make([]string, 0, len(allowedTools.Array()))
+	hasNativeWebSearch := false
+	changed := false
+	for _, tool := range allowedTools.Array() {
+		if tool.Get("type").String() == xaiWebSearchToolType {
+			if hasNativeWebSearch {
+				changed = true
+				continue
+			}
+			hasNativeWebSearch = true
+			keptTools = append(keptTools, tool.Raw)
+			continue
+		}
+		if xaiIsNamedWebSearchTool(tool) {
+			changed = true
+			continue
+		}
+		keptTools = append(keptTools, tool.Raw)
+	}
+	if !changed {
+		return body
+	}
+	if len(keptTools) == 0 {
+		updated, errDelete := sjson.DeleteBytes(body, "tool_choice")
+		if errDelete != nil {
+			return body
+		}
+		return updated
+	}
+
+	updatedTools := []byte(`[]`)
+	for _, tool := range keptTools {
+		var errSet error
+		updatedTools, errSet = sjson.SetRawBytes(updatedTools, "-1", []byte(tool))
+		if errSet != nil {
+			return body
+		}
+	}
+	updated, errSet := sjson.SetRawBytes(body, "tool_choice.tools", updatedTools)
+	if errSet != nil {
+		return body
+	}
+	return updated
+}
+
+func xaiIsNamedWebSearchTool(tool gjson.Result) bool {
+	toolType := tool.Get("type").String()
+	return (toolType == xaiFunctionToolType || toolType == xaiCustomToolType) &&
+		strings.EqualFold(strings.TrimSpace(tool.Get("name").String()), xaiWebSearchToolType)
 }
 
 func xaiRequiresIsolatedConversation(model string) bool {
