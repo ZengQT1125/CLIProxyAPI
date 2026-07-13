@@ -951,7 +951,7 @@ func TestModelsWithClientVersionReturnsCodexCatalog(t *testing.T) {
 	if got, _ := custom["display_name"].(string); got != "Custom Codex Model" {
 		t.Fatalf("custom display_name = %q, want Custom Codex Model", got)
 	}
-	wantCustomPriority := maxCodexClientTemplatePriorityForTest(t) + 100
+	wantCustomPriority := codexClientTestMaxTemplatePriority(t) + 100
 	if got := codexClientTestPriority(custom["priority"]); got != wantCustomPriority {
 		t.Fatalf("custom priority = %v, want %d", custom["priority"], wantCustomPriority)
 	}
@@ -1020,20 +1020,17 @@ func codexClientTestPriority(raw any) int {
 	}
 }
 
-func maxCodexClientTemplatePriorityForTest(t *testing.T) int {
+func codexClientTestMaxTemplatePriority(t *testing.T) int {
 	t.Helper()
-
 	var payload struct {
 		Models []map[string]any `json:"models"`
 	}
 	if err := json.Unmarshal(registry.GetCodexClientModelsJSON(), &payload); err != nil {
-		t.Fatalf("failed to parse codex client model templates: %v", err)
+		t.Fatalf("parse Codex client model templates: %v", err)
 	}
-
 	maxPriority := 0
 	for _, model := range payload.Models {
-		priority := codexClientTestPriority(model["priority"])
-		if priority > maxPriority {
+		if priority := codexClientTestPriority(model["priority"]); priority > maxPriority {
 			maxPriority = priority
 		}
 	}
