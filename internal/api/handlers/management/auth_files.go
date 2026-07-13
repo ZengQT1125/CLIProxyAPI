@@ -1019,26 +1019,35 @@ func hasAuthFileDeleteFilters(query authFileListQuery) bool {
 	return query.Type != "" || query.ProblemOnly || query.DisabledOnly || query.EnabledOnly
 }
 
+type filteredAuthFileCandidate struct {
+	authID string
+	path   string
+}
+
 func (h *Handler) deleteFilteredAuthFiles(c *gin.Context, ctx context.Context, query authFileListQuery) {
-	names := make([]string, 0)
+	candidates := make([]filteredAuthFileCandidate, 0)
+	seenPaths := make(map[string]struct{})
 	for _, auth := range h.authManager.List() {
 		if auth == nil || isRuntimeOnlyAuth(auth) || !authFileListVisible(auth) || !authMatchesListStatusFilters(auth, query) {
 			continue
 		}
-		name, okName := filteredAuthFileName(auth)
-		if !okName {
+		candidate, okCandidate := h.filteredAuthFileCandidate(auth)
+		if !okCandidate {
 			continue
 		}
-		names = append(names, name)
+		if _, seen := seenPaths[candidate.path]; seen {
+			continue
+		}
+		seenPaths[candidate.path] = struct{}{}
+		candidates = append(candidates, candidate)
 	}
-	names = uniqueAuthFileNames(names)
 
-	deletedFiles := make([]string, 0, len(names))
+	deletedFiles := make([]string, 0, len(candidates))
 	failed := make([]gin.H, 0)
-	for _, name := range names {
-		deletedName, _, errDelete := h.deleteAuthFileByName(ctx, name)
+	for _, candidate := range candidates {
+		deletedName, _, errDelete := h.deleteFilteredAuthFile(ctx, candidate)
 		if errDelete != nil {
-			failed = append(failed, gin.H{"name": name, "error": errDelete.Error()})
+			failed = append(failed, gin.H{"name": filepath.Base(candidate.path), "error": errDelete.Error()})
 			continue
 		}
 		deletedFiles = append(deletedFiles, deletedName)
@@ -1060,19 +1069,59 @@ func (h *Handler) deleteFilteredAuthFiles(c *gin.Context, ctx context.Context, q
 	})
 }
 
-func filteredAuthFileName(auth *coreauth.Auth) (string, bool) {
-	if auth == nil {
+func (h *Handler) filteredAuthFileCandidate(auth *coreauth.Auth) (filteredAuthFileCandidate, bool) {
+	if h == nil || h.cfg == nil || auth == nil {
+		return filteredAuthFileCandidate{}, false
+	}
+	path, okPath := authFilePathWithinDir(h.cfg.AuthDir, authAttribute(auth, "path"))
+	if !okPath {
+		return filteredAuthFileCandidate{}, false
+	}
+	return filteredAuthFileCandidate{authID: auth.ID, path: path}, true
+}
+
+func authFilePathWithinDir(authDir, path string) (string, bool) {
+	authDir = strings.TrimSpace(authDir)
+	path = strings.TrimSpace(path)
+	if authDir == "" || path == "" {
 		return "", false
 	}
-	path := strings.TrimSpace(authAttribute(auth, "path"))
-	if path == "" {
+	authDirAbs, errAuthDirAbs := filepath.Abs(authDir)
+	if errAuthDirAbs != nil {
 		return "", false
 	}
-	name := filepath.Base(path)
+	pathAbs, errPathAbs := filepath.Abs(path)
+	if errPathAbs != nil {
+		return "", false
+	}
+	authDirAbs = filepath.Clean(authDirAbs)
+	pathAbs = filepath.Clean(pathAbs)
+	rel, errRel := filepath.Rel(authDirAbs, pathAbs)
+	if errRel != nil || rel == "." || rel == ".." || strings.HasPrefix(rel, ".."+string(os.PathSeparator)) || filepath.IsAbs(rel) {
+		return "", false
+	}
+	if isUnsafeAuthFileName(filepath.Base(pathAbs)) {
+		return "", false
+	}
+	return pathAbs, true
+}
+
+func (h *Handler) deleteFilteredAuthFile(ctx context.Context, candidate filteredAuthFileCandidate) (string, int, error) {
+	name := filepath.Base(candidate.path)
 	if isUnsafeAuthFileName(name) {
-		return "", false
+		return "", http.StatusBadRequest, fmt.Errorf("invalid name")
 	}
-	return name, true
+	if errRemove := os.Remove(candidate.path); errRemove != nil {
+		if os.IsNotExist(errRemove) {
+			return name, http.StatusNotFound, errAuthFileNotFound
+		}
+		return name, http.StatusInternalServerError, fmt.Errorf("failed to remove file: %w", errRemove)
+	}
+	if errDeleteRecord := h.deleteTokenRecord(ctx, candidate.path); errDeleteRecord != nil {
+		return name, http.StatusInternalServerError, errDeleteRecord
+	}
+	h.removeAuth(ctx, candidate.authID)
+	return name, http.StatusOK, nil
 }
 
 func (h *Handler) multipartAuthFileHeaders(c *gin.Context) ([]*multipart.FileHeader, error) {

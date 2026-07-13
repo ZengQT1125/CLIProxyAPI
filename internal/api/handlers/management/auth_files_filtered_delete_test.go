@@ -153,6 +153,97 @@ func TestDeleteAuthFilesFiltered_UsesPhysicalPathForAbsoluteFileName(t *testing.
 	}
 }
 
+func TestDeleteAuthFilesFiltered_SkipsPathOutsideAuthDir(t *testing.T) {
+	authDir := t.TempDir()
+	externalPath := filepath.Join(t.TempDir(), "external.json")
+	if errWrite := os.WriteFile(externalPath, []byte(`{"type":"codex"}`), 0o600); errWrite != nil {
+		t.Fatal(errWrite)
+	}
+	manager := coreauth.NewManager(nil, nil, nil)
+	if _, errRegister := manager.Register(context.Background(), &coreauth.Auth{
+		ID:       "external.json",
+		FileName: externalPath,
+		Provider: "codex",
+		Attributes: map[string]string{
+			"path": externalPath,
+		},
+	}); errRegister != nil {
+		t.Fatal(errRegister)
+	}
+	h := NewHandlerWithoutConfigFilePath(&config.Config{AuthDir: authDir}, manager)
+	h.tokenStore = &memoryAuthStore{}
+
+	recorder := httptest.NewRecorder()
+	ginCtx, _ := gin.CreateTestContext(recorder)
+	ginCtx.Request = httptest.NewRequest(http.MethodDelete, "/v0/management/auth-files?all=true&type=codex", nil)
+	h.DeleteAuthFile(ginCtx)
+
+	if recorder.Code != http.StatusOK {
+		t.Fatalf("status = %d, body = %s", recorder.Code, recorder.Body.String())
+	}
+	var response struct {
+		Deleted int `json:"deleted"`
+	}
+	if errDecode := json.Unmarshal(recorder.Body.Bytes(), &response); errDecode != nil {
+		t.Fatal(errDecode)
+	}
+	if response.Deleted != 0 {
+		t.Fatalf("outside auth path must not be deleted: %#v", response)
+	}
+	if _, errStat := os.Stat(externalPath); errStat != nil {
+		t.Fatalf("outside auth file must remain, stat error = %v", errStat)
+	}
+	if _, ok := manager.GetByID("external.json"); !ok {
+		t.Fatal("outside auth record must remain")
+	}
+}
+
+func TestDeleteAuthFilesFiltered_DeletesExactNestedPath(t *testing.T) {
+	authDir := t.TempDir()
+	targetPath := filepath.Join(authDir, "a", "shared.json")
+	foreignPath := filepath.Join(authDir, "b", "shared.json")
+	for _, path := range []string{targetPath, foreignPath} {
+		if errMkdir := os.MkdirAll(filepath.Dir(path), 0o700); errMkdir != nil {
+			t.Fatal(errMkdir)
+		}
+		if errWrite := os.WriteFile(path, []byte(`{"type":"codex"}`), 0o600); errWrite != nil {
+			t.Fatal(errWrite)
+		}
+	}
+	manager := coreauth.NewManager(nil, nil, nil)
+	for _, auth := range []*coreauth.Auth{
+		{ID: "target-auth", FileName: targetPath, Provider: "codex", Attributes: map[string]string{"path": targetPath}},
+		{ID: "shared.json", FileName: foreignPath, Provider: "claude", Attributes: map[string]string{"path": foreignPath}},
+	} {
+		if _, errRegister := manager.Register(context.Background(), auth); errRegister != nil {
+			t.Fatal(errRegister)
+		}
+	}
+	h := NewHandlerWithoutConfigFilePath(&config.Config{AuthDir: authDir}, manager)
+	h.tokenStore = &memoryAuthStore{}
+
+	recorder := httptest.NewRecorder()
+	ginCtx, _ := gin.CreateTestContext(recorder)
+	ginCtx.Request = httptest.NewRequest(http.MethodDelete, "/v0/management/auth-files?all=true&type=codex", nil)
+	h.DeleteAuthFile(ginCtx)
+
+	if recorder.Code != http.StatusOK {
+		t.Fatalf("status = %d, body = %s", recorder.Code, recorder.Body.String())
+	}
+	if _, errStat := os.Stat(targetPath); !os.IsNotExist(errStat) {
+		t.Fatalf("matched nested auth must be deleted, stat error = %v", errStat)
+	}
+	if _, errStat := os.Stat(foreignPath); errStat != nil {
+		t.Fatalf("same-basename auth from another provider must remain, stat error = %v", errStat)
+	}
+	if _, ok := manager.GetByID("target-auth"); ok {
+		t.Fatal("matched auth record must be removed")
+	}
+	if _, ok := manager.GetByID("shared.json"); !ok {
+		t.Fatal("non-matching auth record must remain")
+	}
+}
+
 func TestDeleteAuthFilesFiltered_PartialFailure(t *testing.T) {
 	authDir := t.TempDir()
 	manager := coreauth.NewManager(nil, nil, nil)
