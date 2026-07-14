@@ -30,7 +30,6 @@ auths/*
 
 # Documentation
 docs/*
-AGENTS.md
 GEMINI.md
 
 # Tooling metadata
@@ -39,7 +38,6 @@ GEMINI.md
 .codex/*
 .gemini/*
 .serena/*
-.agent/*
 .opencode/*
 .idea/*
 .beads/*
