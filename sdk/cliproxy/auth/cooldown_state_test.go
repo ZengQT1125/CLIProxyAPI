@@ -44,6 +44,14 @@ func (s *recordingCooldownStateStore) recordedBatches() [][]CooldownStateSnapsho
 	return batches
 }
 
+func (s *recordingCooldownStateStore) resetRecording() {
+	s.applyCount.Store(0)
+	s.mu.Lock()
+	s.snapshots = nil
+	s.batches = nil
+	s.mu.Unlock()
+}
+
 type blockingCooldownStateStore struct {
 	started chan struct{}
 	release chan struct{}
@@ -284,6 +292,20 @@ func TestManager_MarkResult_PersistsCooldownOnlyWhenStateChanges(t *testing.T) {
 	if _, errRegister := manager.Register(WithSkipPersist(context.Background()), auth); errRegister != nil {
 		t.Fatalf("Register() returned error: %v", errRegister)
 	}
+	if _, errRegister := manager.Register(WithSkipPersist(context.Background()), &Auth{ID: "auth-2", Provider: "xai", Status: StatusActive}); errRegister != nil {
+		t.Fatalf("Register(auth-2) returned error: %v", errRegister)
+	}
+	manager.MarkResult(context.Background(), Result{
+		AuthID:   "auth-2",
+		Provider: "xai",
+		Model:    "grok-4",
+		Success:  false,
+		Error:    &Error{Message: "upstream unavailable", HTTPStatus: 500},
+	})
+	if errFlush := manager.FlushCooldownStates(context.Background()); errFlush != nil {
+		t.Fatalf("FlushCooldownStates(auth-2) returned error: %v", errFlush)
+	}
+	store.resetRecording()
 
 	manager.MarkResult(context.Background(), Result{AuthID: auth.ID, Provider: "xai", Model: "grok-4", Success: true})
 	if errFlush := manager.FlushCooldownStates(context.Background()); errFlush != nil {
