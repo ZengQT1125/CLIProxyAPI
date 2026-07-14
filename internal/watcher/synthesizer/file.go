@@ -3,6 +3,7 @@ package synthesizer
 import (
 	"context"
 	"encoding/json"
+	"fmt"
 	"os"
 	"path/filepath"
 	"runtime"
@@ -50,7 +51,7 @@ func (s *FileSynthesizer) Synthesize(ctx *SynthesisContext) ([]*coreauth.Auth, e
 		if errRead != nil || len(data) == 0 {
 			continue
 		}
-		auths := synthesizeFileAuths(ctx, full, data)
+		auths := SynthesizeAuthFile(ctx, full, data)
 		if len(auths) == 0 {
 			continue
 		}
@@ -59,75 +60,109 @@ func (s *FileSynthesizer) Synthesize(ctx *SynthesisContext) ([]*coreauth.Auth, e
 	return out, nil
 }
 
+// NativeAuthFileResult contains native auth synthesis results and the source provider.
+type NativeAuthFileResult struct {
+	Provider string
+	Auths    []*coreauth.Auth
+}
+
 // SynthesizeAuthFile generates Auth entries for one auth JSON file payload.
 // It shares exactly the same mapping behavior as FileSynthesizer.Synthesize.
 func SynthesizeAuthFile(ctx *SynthesisContext, fullPath string, data []byte) []*coreauth.Auth {
-	return synthesizeFileAuths(ctx, fullPath, data)
-}
-
-func synthesizeFileAuths(ctx *SynthesisContext, fullPath string, data []byte) []*coreauth.Auth {
-	if ctx == nil || len(data) == 0 {
+	if auths, handled, errPlugin := SynthesizePluginAuthFile(ctx, fullPath, data); errPlugin == nil && handled {
+		return auths
+	}
+	result, errNative := SynthesizeNativeAuthFile(ctx, fullPath, data)
+	if errNative != nil {
 		return nil
 	}
-	now := ctx.Now
-	cfg := ctx.Config
+	return result.Auths
+}
+
+// SynthesizeNativeAuthFile generates native auth entries without invoking plugin parsing.
+func SynthesizeNativeAuthFile(ctx *SynthesisContext, fullPath string, data []byte) (NativeAuthFileResult, error) {
+	if ctx == nil || len(data) == 0 {
+		return NativeAuthFileResult{}, fmt.Errorf("auth file payload is empty")
+	}
 	var metadata map[string]any
 	if errUnmarshal := json.Unmarshal(data, &metadata); errUnmarshal != nil {
-		return nil
+		return NativeAuthFileResult{}, fmt.Errorf("parse auth file: %w", errUnmarshal)
 	}
 	t, _ := metadata["type"].(string)
 	provider := strings.ToLower(strings.TrimSpace(t))
 	if provider == "gemini" {
 		provider = "gemini-cli"
 	}
-	if ctx.PluginAuthParser != nil {
-		auths, handled, errParse := parsePluginFileAuths(ctx.PluginAuthParser, pluginapi.AuthParseRequest{
-			Provider: provider,
-			Path:     fullPath,
-			FileName: filepath.Base(fullPath),
-			RawJSON:  data,
-		})
-		if errParse == nil && handled {
-			auths = compactPluginAuths(auths)
-			if len(auths) == 0 {
-				return nil
-			}
-			perAccountExcluded := extractExcludedModelsFromMetadata(metadata)
-			perAccountModelAliases := extractOAuthModelAliasesFromMetadata(metadata)
-			disabled, _ := metadata["disabled"].(bool)
-			for index, auth := range auths {
-				if auth == nil {
-					continue
-				}
-				if len(auths) > 1 {
-					coreauth.MarkPluginVirtualAuth(auth, fullPath, index)
-				}
-				auth.CreatedAt = now
-				auth.UpdatedAt = now
-				if auth.Attributes == nil {
-					auth.Attributes = make(map[string]string)
-				}
-				auth.Attributes[coreauth.AttributePath] = fullPath
-				auth.Attributes[coreauth.AttributeSource] = fullPath
-				auth.Attributes[coreauth.AttributeSourceBackend] = coreauth.AuthSourceFile
-				if disabled {
-					auth.Disabled = true
-					auth.Status = coreauth.StatusDisabled
-					if auth.Metadata == nil {
-						auth.Metadata = make(map[string]any)
-					}
-					auth.Metadata["disabled"] = true
-				}
-				coreauth.SetOAuthModelAliasesAttribute(auth, perAccountModelAliases)
-				ApplyAuthExcludedModelsMeta(auth, cfg, perAccountExcluded, "oauth")
-				coreauth.ApplyCustomHeadersFromMetadata(auth)
-			}
-			return auths
-		}
+	auths := synthesizeNativeFileAuths(ctx, fullPath, metadata, provider)
+	return NativeAuthFileResult{Provider: provider, Auths: auths}, nil
+}
+
+// SynthesizePluginAuthFile generates plugin auth entries when a plugin handles the file.
+func SynthesizePluginAuthFile(ctx *SynthesisContext, fullPath string, data []byte) ([]*coreauth.Auth, bool, error) {
+	if ctx == nil || ctx.PluginAuthParser == nil {
+		return nil, false, nil
 	}
+	var metadata map[string]any
+	if errUnmarshal := json.Unmarshal(data, &metadata); errUnmarshal != nil {
+		return nil, false, fmt.Errorf("parse plugin auth file: %w", errUnmarshal)
+	}
+	t, _ := metadata["type"].(string)
+	provider := strings.ToLower(strings.TrimSpace(t))
+	if provider == "gemini" {
+		provider = "gemini-cli"
+	}
+	auths, handled, errParse := parsePluginFileAuths(ctx.PluginAuthParser, pluginapi.AuthParseRequest{
+		Provider: provider,
+		Path:     fullPath,
+		FileName: filepath.Base(fullPath),
+		RawJSON:  data,
+	})
+	if errParse != nil || !handled {
+		return nil, handled, errParse
+	}
+	return decoratePluginFileAuths(ctx, fullPath, metadata, compactPluginAuths(auths)), true, nil
+}
+
+func decoratePluginFileAuths(ctx *SynthesisContext, fullPath string, metadata map[string]any, auths []*coreauth.Auth) []*coreauth.Auth {
+	if len(auths) == 0 {
+		return nil
+	}
+	perAccountExcluded := extractExcludedModelsFromMetadata(metadata)
+	perAccountModelAliases := extractOAuthModelAliasesFromMetadata(metadata)
+	disabled, _ := metadata["disabled"].(bool)
+	for index, auth := range auths {
+		if len(auths) > 1 {
+			coreauth.MarkPluginVirtualAuth(auth, fullPath, index)
+		}
+		auth.CreatedAt = ctx.Now
+		auth.UpdatedAt = ctx.Now
+		if auth.Attributes == nil {
+			auth.Attributes = make(map[string]string)
+		}
+		auth.Attributes[coreauth.AttributePath] = fullPath
+		auth.Attributes[coreauth.AttributeSource] = fullPath
+		auth.Attributes[coreauth.AttributeSourceBackend] = coreauth.AuthSourceFile
+		if disabled {
+			auth.Disabled = true
+			auth.Status = coreauth.StatusDisabled
+			if auth.Metadata == nil {
+				auth.Metadata = make(map[string]any)
+			}
+			auth.Metadata["disabled"] = true
+		}
+		coreauth.SetOAuthModelAliasesAttribute(auth, perAccountModelAliases)
+		ApplyAuthExcludedModelsMeta(auth, ctx.Config, perAccountExcluded, "oauth")
+		coreauth.ApplyCustomHeadersFromMetadata(auth)
+	}
+	return auths
+}
+
+func synthesizeNativeFileAuths(ctx *SynthesisContext, fullPath string, metadata map[string]any, provider string) []*coreauth.Auth {
 	if provider == "" || provider == "gemini-cli" {
 		return nil
 	}
+	now := ctx.Now
+	cfg := ctx.Config
 	label := provider
 	if email, _ := metadata["email"].(string); email != "" {
 		label = email

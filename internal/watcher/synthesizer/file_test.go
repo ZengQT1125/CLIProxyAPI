@@ -162,6 +162,49 @@ func TestFileSynthesizer_Synthesize_IgnoresGeminiProviderFile(t *testing.T) {
 	}
 }
 
+func TestSynthesizeNativeAuthFileDoesNotCallPluginParser(t *testing.T) {
+	called := false
+	ctx := &SynthesisContext{
+		AuthDir: t.TempDir(),
+		Now:     time.Now(),
+		PluginAuthParser: multiAuthParserFunc(func(context.Context, pluginapi.AuthParseRequest) ([]*coreauth.Auth, bool, error) {
+			called = true
+			return nil, false, nil
+		}),
+	}
+	path := filepath.Join(ctx.AuthDir, "xai.json")
+	result, errSynthesize := SynthesizeNativeAuthFile(ctx, path, []byte(`{"type":"xai"}`))
+	if errSynthesize != nil {
+		t.Fatalf("SynthesizeNativeAuthFile() error = %v", errSynthesize)
+	}
+	if called {
+		t.Fatal("native synthesis called plugin parser")
+	}
+	if result.Provider != "xai" || len(result.Auths) != 1 {
+		t.Fatalf("native result = %+v, want one xai auth", result)
+	}
+}
+
+func TestSynthesizePluginAuthFileReportsHandledExpansion(t *testing.T) {
+	ctx := &SynthesisContext{
+		AuthDir: t.TempDir(), Now: time.Now(),
+		PluginAuthParser: multiAuthParserFunc(func(context.Context, pluginapi.AuthParseRequest) ([]*coreauth.Auth, bool, error) {
+			return []*coreauth.Auth{{ID: "virtual-a"}, {ID: "virtual-b"}}, true, nil
+		}),
+	}
+	auths, handled, errSynthesize := SynthesizePluginAuthFile(ctx, filepath.Join(ctx.AuthDir, "plugin.json"), []byte(`{"type":"plugin"}`))
+	if errSynthesize != nil || !handled || len(auths) != 2 {
+		t.Fatalf("plugin result = (%+v, %t, %v), want two handled auths", auths, handled, errSynthesize)
+	}
+}
+
+func TestSynthesizeNativeAuthFileRejectsMalformedJSON(t *testing.T) {
+	_, errSynthesize := SynthesizeNativeAuthFile(&SynthesisContext{}, "broken.json", []byte(`{"type":`))
+	if errSynthesize == nil {
+		t.Fatal("malformed JSON returned nil error")
+	}
+}
+
 func TestSynthesizeAuthFileExpandsPluginMultiAuths(t *testing.T) {
 	tempDir := t.TempDir()
 	fullPath := filepath.Join(tempDir, "geminicli.json")
