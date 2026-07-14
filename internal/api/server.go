@@ -1654,7 +1654,7 @@ func (s *Server) Listening() <-chan net.Addr {
 }
 
 func (s *Server) publishListening(addr net.Addr) {
-	if s == nil {
+	if s == nil || s.listening == nil {
 		return
 	}
 	s.listeningOnce.Do(func() {

@@ -576,6 +576,71 @@ func TestServerListening(t *testing.T) {
 	}
 }
 
+func TestServerListeningClosesOnStartupFailure(t *testing.T) {
+	assertClosedWithoutAddress := func(t *testing.T, listening <-chan net.Addr) {
+		t.Helper()
+		select {
+		case addr, ok := <-listening:
+			if ok {
+				t.Fatalf("listening channel delivered address %v", addr)
+			}
+		case <-time.After(time.Second):
+			t.Fatal("listening channel did not close")
+		}
+	}
+
+	t.Run("uninitialized server", func(t *testing.T) {
+		server := &Server{}
+		if errStart := server.Start(); errStart == nil {
+			t.Fatal("Start() error = nil")
+		}
+		assertClosedWithoutAddress(t, server.Listening())
+	})
+
+	t.Run("bind failure", func(t *testing.T) {
+		occupied, errListen := net.Listen("tcp", "127.0.0.1:0")
+		if errListen != nil {
+			t.Fatalf("occupy port: %v", errListen)
+		}
+		defer func() {
+			if errClose := occupied.Close(); errClose != nil {
+				t.Errorf("close occupied listener: %v", errClose)
+			}
+		}()
+		server := newTestServer(t)
+		server.server.Addr = occupied.Addr().String()
+		listening := server.Listening()
+		if errStart := server.Start(); errStart == nil {
+			t.Fatal("Start() error = nil")
+		}
+		assertClosedWithoutAddress(t, listening)
+	})
+
+	t.Run("missing TLS config", func(t *testing.T) {
+		server := newTestServer(t)
+		server.server.Addr = "127.0.0.1:0"
+		server.cfg.TLS.Enable = true
+		listening := server.Listening()
+		if errStart := server.Start(); errStart == nil {
+			t.Fatal("Start() error = nil")
+		}
+		assertClosedWithoutAddress(t, listening)
+	})
+
+	t.Run("invalid TLS certificate", func(t *testing.T) {
+		server := newTestServer(t)
+		server.server.Addr = "127.0.0.1:0"
+		server.cfg.TLS.Enable = true
+		server.cfg.TLS.Cert = filepath.Join(t.TempDir(), "missing-cert.pem")
+		server.cfg.TLS.Key = filepath.Join(t.TempDir(), "missing-key.pem")
+		listening := server.Listening()
+		if errStart := server.Start(); errStart == nil {
+			t.Fatal("Start() error = nil")
+		}
+		assertClosedWithoutAddress(t, listening)
+	})
+}
+
 func TestManagementPluginsRouteRegistered(t *testing.T) {
 	t.Setenv("MANAGEMENT_PASSWORD", "test-management-key")
 

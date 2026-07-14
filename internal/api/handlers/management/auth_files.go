@@ -3108,7 +3108,9 @@ func (h *Handler) rollbackSavedTokenRecords(ctx context.Context, savedPaths []st
 		}
 		if errDelete := h.deleteTokenRecord(ctx, path); errDelete != nil {
 			log.WithError(errDelete).WithField("path", path).Warn("failed to roll back plugin auth token")
+			continue
 		}
+		h.notifyAuthFileMutation(path)
 		h.removeAuthsForPath(ctx, path, path)
 	}
 }

@@ -20,6 +20,24 @@ import (
 )
 
 func TestGetAuthFileLoadStatus(t *testing.T) {
+	t.Run("idle without provider", func(t *testing.T) {
+		h := NewHandlerWithoutConfigFilePath(&config.Config{AuthDir: t.TempDir()}, nil)
+		recorder := httptest.NewRecorder()
+		ctx, _ := gin.CreateTestContext(recorder)
+		ctx.Request = httptest.NewRequest(http.MethodGet, "/v0/management/auth-files/load-status", nil)
+		h.GetAuthFileLoadStatus(ctx)
+		if recorder.Code != http.StatusOK {
+			t.Fatalf("status = %d, body = %s", recorder.Code, recorder.Body.String())
+		}
+		var got watcher.AuthLoadStatus
+		if errDecode := json.Unmarshal(recorder.Body.Bytes(), &got); errDecode != nil {
+			t.Fatalf("decode response: %v", errDecode)
+		}
+		if got.State != watcher.AuthLoadStateIdle {
+			t.Fatalf("state = %q, want %q", got.State, watcher.AuthLoadStateIdle)
+		}
+	})
+
 	completed := time.Date(2026, 7, 14, 3, 9, 1, 0, time.UTC)
 	tests := []watcher.AuthLoadStatus{
 		{State: watcher.AuthLoadStateLoading, FilesDiscovered: 3, FilesProcessed: 1, AuthsLoaded: 1},

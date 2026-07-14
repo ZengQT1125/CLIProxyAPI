@@ -986,6 +986,7 @@ func (h *Handler) removeCodexAuth(ctx context.Context, auth *coreauth.Auth) erro
 	if err := os.Remove(path); err != nil && !os.IsNotExist(err) {
 		return fmt.Errorf("failed to remove file: %w", err)
 	}
+	h.notifyAuthFileMutation(path)
 	if err := h.deleteTokenRecord(ctx, path); err != nil {
 		return fmt.Errorf("failed to delete token record: %w", err)
 	}
