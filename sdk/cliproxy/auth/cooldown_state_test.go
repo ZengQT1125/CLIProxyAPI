@@ -897,9 +897,13 @@ func TestManager_NewCooldownChangeSupersedesFailedRestoreBatch(t *testing.T) {
 
 // TestManager_PGStyleRestoreThenRegisterDoesNotYieldAuthNotFound reproduces the
 // non-progressive (PG) startup order:
-//   Load/Register → RestoreCooldownStates → register models → Reconcile → Refresh → pick
+//
+//	Load/Register → RestoreCooldownStates → register models → Reconcile → Refresh → pick
+//
 // User symptom after PG restart with save-cooldown-status=true was:
-//   auth_not_found: no auth available (providers=xai, model=grok-4.5)
+//
+//	auth_not_found: no auth available (providers=xai, model=grok-4.5)
+//
 // Restored cooldowns must surface as model_cooldown (or ready), never empty-shard auth_not_found.
 func TestManager_PGStyleRestoreThenRegisterDoesNotYieldAuthNotFound(t *testing.T) {
 	prev := quotaCooldownDisabled.Load()
@@ -1093,7 +1097,8 @@ func TestManager_RestoreThenSyncSchedulerStillSeesModels(t *testing.T) {
 // never bound on non-home startup. pickNextMixed filters providers without an
 // executor out of eligibleProviders and returns auth_not_found — not
 // executor_not_found. That matches:
-//   auth_not_found: no auth available (providers=xai, model=grok-4.5)
+//
+//	auth_not_found: no auth available (providers=xai, model=grok-4.5)
 func TestManager_PickNextMixedWithoutExecutorYieldsAuthNotFound(t *testing.T) {
 	authID := "pg-xai-no-exec"
 	model := "grok-4.5"

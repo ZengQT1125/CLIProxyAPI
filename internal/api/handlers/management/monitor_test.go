@@ -285,7 +285,7 @@ func TestGetMonitorRequestLogs_DatabasePluginPath(t *testing.T) {
 		t.Fatalf("expected database plugin to be initialized")
 	}
 
-	base := time.Date(2026, 2, 7, 12, 0, 0, 0, time.UTC)
+	base := time.Now().UTC().Truncate(time.Second)
 	added, skipped, err := plugin.ImportRecords(usage.StatisticsSnapshot{
 		APIs: map[string]usage.APISnapshot{
 			"api-db": {
