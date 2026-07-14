@@ -40,8 +40,6 @@ func (w *Watcher) start(ctx context.Context) error {
 	log.Debugf("watching auth directory: %s", w.authDir)
 
 	go w.processEvents(ctx)
-
-	w.reloadClients(true, nil, false)
 	return nil
 }
 
@@ -91,6 +89,9 @@ func (w *Watcher) handleEvent(event fsnotify.Event) {
 	// Handle auth directory changes incrementally (.json only)
 	w.authRescanMu.Lock()
 	defer w.authRescanMu.Unlock()
+	w.clientsMutex.Lock()
+	w.advancePathGenerationLocked(normalizedName)
+	w.clientsMutex.Unlock()
 
 	if event.Op&(fsnotify.Remove|fsnotify.Rename) != 0 {
 		if w.shouldDebounceRemove(normalizedName, now) {

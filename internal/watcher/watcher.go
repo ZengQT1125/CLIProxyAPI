@@ -31,37 +31,46 @@ type authDirProvider interface {
 
 // Watcher manages file watching for configuration and authentication files
 type Watcher struct {
-	configPath        string
-	authDir           string
-	config            *config.Config
-	clientsMutex      sync.RWMutex
-	authRescanMu      sync.Mutex
-	configReloadMu    sync.Mutex
-	configReloadTimer *time.Timer
-	serverUpdateMu    sync.Mutex
-	serverUpdateTimer *time.Timer
-	serverUpdateLast  time.Time
-	serverUpdatePend  bool
-	stopped           atomic.Bool
-	reloadCallback    func(*config.Config)
-	watcher           *fsnotify.Watcher
-	lastAuthHashes    map[string]string
-	lastAuthContents  map[string]*coreauth.Auth
-	fileAuthsByPath   map[string]map[string]*coreauth.Auth
-	lastRemoveTimes   map[string]time.Time
-	lastConfigHash    string
-	authQueue         chan<- AuthUpdate
-	currentAuths      map[string]*coreauth.Auth
-	runtimeAuths      map[string]*coreauth.Auth
-	dispatchMu        sync.Mutex
-	dispatchCond      *sync.Cond
-	pendingUpdates    map[string]AuthUpdate
-	pendingOrder      []string
-	dispatchCancel    context.CancelFunc
-	storePersister    storePersister
-	pluginAuthParser  synthesizer.PluginAuthParser
-	mirroredAuthDir   string
-	oldConfigYaml     []byte
+	configPath             string
+	authDir                string
+	config                 *config.Config
+	clientsMutex           sync.RWMutex
+	authRescanMu           sync.Mutex
+	configReloadMu         sync.Mutex
+	configReloadTimer      *time.Timer
+	serverUpdateMu         sync.Mutex
+	serverUpdateTimer      *time.Timer
+	serverUpdateLast       time.Time
+	serverUpdatePend       bool
+	stopped                atomic.Bool
+	reloadCallback         func(*config.Config)
+	watcher                *fsnotify.Watcher
+	lastAuthHashes         map[string]string
+	lastAuthContents       map[string]*coreauth.Auth
+	fileAuthsByPath        map[string]map[string]*coreauth.Auth
+	lastRemoveTimes        map[string]time.Time
+	lastConfigHash         string
+	authQueue              chan<- AuthUpdateBatch
+	currentAuths           map[string]*coreauth.Auth
+	runtimeAuths           map[string]*coreauth.Auth
+	dispatchMu             sync.Mutex
+	dispatchCond           *sync.Cond
+	pendingUpdates         map[string]AuthUpdate
+	pendingOrder           []string
+	dispatchCancel         context.CancelFunc
+	storePersister         storePersister
+	pluginAuthParser       synthesizer.PluginAuthParser
+	mirroredAuthDir        string
+	oldConfigYaml          []byte
+	authLoadMu             sync.Mutex
+	authLoadCancel         context.CancelFunc
+	authLoadDone           chan struct{}
+	authLoadStatus         atomic.Value
+	pathGenerations        map[string]uint64
+	nextPathGeneration     uint64
+	authLoadSequence       uint64
+	authLoadHooks          AuthLoadHooks
+	fileAuthLoadingEnabled bool
 }
 
 // AuthUpdateAction represents the type of change detected in auth sources.
@@ -82,6 +91,22 @@ type AuthUpdate struct {
 	ReplaceMaterial bool
 }
 
+type AuthUpdateResult struct {
+	ID     string
+	Loaded bool
+}
+
+type AuthUpdateBatch struct {
+	Updates []AuthUpdate
+	Result  chan<- []AuthUpdateResult
+	Initial bool
+}
+
+type AuthLoadHooks struct {
+	Before func(context.Context) error
+	After  func(context.Context) error
+}
+
 const (
 	// replaceCheckDelay is a short delay to allow atomic replace (rename) to settle
 	// before deciding whether a Remove event indicates a real deletion.
@@ -98,13 +123,16 @@ func NewWatcher(configPath, authDir string, reloadCallback func(*config.Config))
 		return nil, errNewWatcher
 	}
 	w := &Watcher{
-		configPath:      configPath,
-		authDir:         authDir,
-		reloadCallback:  reloadCallback,
-		watcher:         watcher,
-		lastAuthHashes:  make(map[string]string),
-		fileAuthsByPath: make(map[string]map[string]*coreauth.Auth),
+		configPath:             configPath,
+		authDir:                authDir,
+		reloadCallback:         reloadCallback,
+		watcher:                watcher,
+		lastAuthHashes:         make(map[string]string),
+		fileAuthsByPath:        make(map[string]map[string]*coreauth.Auth),
+		pathGenerations:        make(map[string]uint64),
+		fileAuthLoadingEnabled: true,
 	}
+	w.publishAuthLoadStatus(idleAuthLoadStatus())
 	w.dispatchCond = sync.NewCond(&w.dispatchMu)
 	if store := sdkAuth.GetTokenStore(); store != nil {
 		if persister, ok := store.(storePersister); ok {
@@ -129,6 +157,11 @@ func (w *Watcher) Start(ctx context.Context) error {
 // Stop stops the file watcher
 func (w *Watcher) Stop() error {
 	w.stopped.Store(true)
+	w.authLoadMu.Lock()
+	if w.authLoadCancel != nil {
+		w.authLoadCancel()
+	}
+	w.authLoadMu.Unlock()
 	w.stopDispatch()
 	w.stopConfigReloadTimer()
 	w.stopServerUpdateTimer()
@@ -151,8 +184,61 @@ func (w *Watcher) SetPluginAuthParser(parser synthesizer.PluginAuthParser) {
 }
 
 // SetAuthUpdateQueue sets the queue used to emit auth updates.
-func (w *Watcher) SetAuthUpdateQueue(queue chan<- AuthUpdate) {
+func (w *Watcher) SetAuthUpdateQueue(queue chan<- AuthUpdateBatch) {
 	w.setAuthUpdateQueue(queue)
+}
+
+func (w *Watcher) SetAuthLoadHooks(hooks AuthLoadHooks) {
+	if w == nil {
+		return
+	}
+	w.authLoadMu.Lock()
+	w.authLoadHooks = hooks
+	w.authLoadMu.Unlock()
+}
+
+func (w *Watcher) SetFileAuthLoadingEnabled(enabled bool) {
+	if w == nil {
+		return
+	}
+	w.clientsMutex.Lock()
+	w.fileAuthLoadingEnabled = enabled
+	w.clientsMutex.Unlock()
+}
+
+func (w *Watcher) fileAuthLoadingIsEnabled() bool {
+	w.clientsMutex.RLock()
+	defer w.clientsMutex.RUnlock()
+	if w.authLoadStatus.Load() == nil {
+		return true
+	}
+	return w.fileAuthLoadingEnabled
+}
+
+func (w *Watcher) advancePathGenerationLocked(path string) uint64 {
+	if w.pathGenerations == nil {
+		w.pathGenerations = make(map[string]uint64)
+	}
+	w.nextPathGeneration++
+	w.pathGenerations[path] = w.nextPathGeneration
+	return w.nextPathGeneration
+}
+
+func (w *Watcher) pathGenerationCurrentLocked(path string, generation uint64) bool {
+	return w.pathGenerations[path] == generation
+}
+
+func (w *Watcher) MarkAuthPathChanged(path string) {
+	if w == nil {
+		return
+	}
+	normalized := w.normalizeAuthPath(path)
+	if normalized == "" {
+		return
+	}
+	w.clientsMutex.Lock()
+	w.advancePathGenerationLocked(normalized)
+	w.clientsMutex.Unlock()
 }
 
 // DispatchRuntimeAuthUpdate allows external runtime providers (e.g., websocket-driven auths)
@@ -171,9 +257,34 @@ func (w *Watcher) DispatchPersistedAuthUpdate(update AuthUpdate) bool {
 // SnapshotCoreAuths converts current clients snapshot into core auth entries.
 func (w *Watcher) SnapshotCoreAuths() []*coreauth.Auth {
 	w.clientsMutex.RLock()
-	cfg := w.config
-	authDir := w.authDir
-	parser := w.pluginAuthParser
+	var cfg *config.Config
+	if w.config != nil {
+		cfg = w.config.CloneForRuntime()
+	}
+	fileAuths := cloneFileAuths(w.fileAuthsByPath)
+	runtimeAuths := cloneAuthMap(w.runtimeAuths)
 	w.clientsMutex.RUnlock()
-	return snapshotCoreAuths(cfg, authDir, parser)
+	ctx := &synthesizer.SynthesisContext{Config: cfg, Now: time.Now(), IDGenerator: synthesizer.NewStableIDGenerator()}
+	auths, _ := synthesizer.NewConfigSynthesizer().Synthesize(ctx)
+	for _, pathAuths := range fileAuths {
+		for _, auth := range pathAuths {
+			if auth != nil {
+				auths = append(auths, auth.Clone())
+			}
+		}
+	}
+	for _, auth := range runtimeAuths {
+		if auth != nil {
+			auths = append(auths, auth.Clone())
+		}
+	}
+	return auths
+}
+
+func cloneFileAuths(source map[string]map[string]*coreauth.Auth) map[string]map[string]*coreauth.Auth {
+	cloned := make(map[string]map[string]*coreauth.Auth, len(source))
+	for path, auths := range source {
+		cloned[path] = cloneAuthMap(auths)
+	}
+	return cloned
 }

@@ -9,14 +9,11 @@ import (
 	"sync"
 	"time"
 
-	"github.com/router-for-me/CLIProxyAPI/v7/internal/config"
 	"github.com/router-for-me/CLIProxyAPI/v7/internal/watcher/synthesizer"
 	coreauth "github.com/router-for-me/CLIProxyAPI/v7/sdk/cliproxy/auth"
 )
 
-var snapshotCoreAuthsFunc = snapshotCoreAuths
-
-func (w *Watcher) setAuthUpdateQueue(queue chan<- AuthUpdate) {
+func (w *Watcher) setAuthUpdateQueue(queue chan<- AuthUpdateBatch) {
 	w.clientsMutex.Lock()
 	defer w.clientsMutex.Unlock()
 	w.authQueue = queue
@@ -97,6 +94,7 @@ func (w *Watcher) dispatchPersistedAuthUpdate(update AuthUpdate) bool {
 	}
 	clone := update.Auth.Clone()
 	w.clientsMutex.Lock()
+	w.advancePathGenerationLocked(normalized)
 	if w.fileAuthsByPath == nil {
 		w.fileAuthsByPath = make(map[string]map[string]*coreauth.Auth)
 	}
@@ -105,7 +103,7 @@ func (w *Watcher) dispatchPersistedAuthUpdate(update AuthUpdate) bool {
 		pathAuths = make(map[string]*coreauth.Auth)
 		w.fileAuthsByPath[normalized] = pathAuths
 	}
-	pathAuths[clone.ID] = nil
+	pathAuths[clone.ID] = clone.Clone()
 	if w.currentAuths == nil {
 		w.currentAuths = make(map[string]*coreauth.Auth)
 	}
@@ -128,10 +126,18 @@ func (w *Watcher) dispatchPersistedAuthUpdate(update AuthUpdate) bool {
 func (w *Watcher) refreshAuthState(force bool) {
 	w.clientsMutex.RLock()
 	cfg := w.config
-	authDir := w.authDir
-	parser := w.pluginAuthParser
+	fileAuths := make([]*coreauth.Auth, 0)
+	for _, pathAuths := range w.fileAuthsByPath {
+		for _, auth := range pathAuths {
+			if auth != nil {
+				fileAuths = append(fileAuths, auth.Clone())
+			}
+		}
+	}
 	w.clientsMutex.RUnlock()
-	auths := snapshotCoreAuthsFunc(cfg, authDir, parser)
+	ctx := &synthesizer.SynthesisContext{Config: cfg, Now: time.Now(), IDGenerator: synthesizer.NewStableIDGenerator()}
+	auths, _ := synthesizer.NewConfigSynthesizer().Synthesize(ctx)
+	auths = append(auths, fileAuths...)
 	w.clientsMutex.Lock()
 	if len(w.runtimeAuths) > 0 {
 		for _, a := range w.runtimeAuths {
@@ -244,12 +250,10 @@ func (w *Watcher) dispatchLoop(ctx context.Context) {
 			time.Sleep(10 * time.Millisecond)
 			continue
 		}
-		for _, update := range batch {
-			select {
-			case queue <- update:
-			case <-ctx.Done():
-				return
-			}
+		select {
+		case queue <- AuthUpdateBatch{Updates: batch}:
+		case <-ctx.Done():
+			return
 		}
 	}
 }
@@ -275,10 +279,33 @@ func (w *Watcher) nextPendingBatch(ctx context.Context) ([]AuthUpdate, bool) {
 	return batch, true
 }
 
-func (w *Watcher) getAuthQueue() chan<- AuthUpdate {
+func (w *Watcher) getAuthQueue() chan<- AuthUpdateBatch {
 	w.clientsMutex.RLock()
 	defer w.clientsMutex.RUnlock()
 	return w.authQueue
+}
+
+func (w *Watcher) dispatchInitialAuthBatch(ctx context.Context, updates []AuthUpdate) []AuthUpdateResult {
+	if len(updates) == 0 {
+		return nil
+	}
+	queue := w.getAuthQueue()
+	if queue == nil {
+		return nil
+	}
+	resultCh := make(chan []AuthUpdateResult, 1)
+	batch := AuthUpdateBatch{Updates: updates, Result: resultCh, Initial: true}
+	select {
+	case queue <- batch:
+	case <-ctx.Done():
+		return nil
+	}
+	select {
+	case results := <-resultCh:
+		return results
+	case <-ctx.Done():
+		return nil
+	}
 }
 
 func (w *Watcher) stopDispatch() {
@@ -314,28 +341,4 @@ func normalizeAuth(a *coreauth.Auth) *coreauth.Auth {
 	clone.Runtime = nil
 	clone.Quota.NextRecoverAt = time.Time{}
 	return clone
-}
-
-func snapshotCoreAuths(cfg *config.Config, authDir string, parser synthesizer.PluginAuthParser) []*coreauth.Auth {
-	ctx := &synthesizer.SynthesisContext{
-		Config:           cfg,
-		AuthDir:          authDir,
-		Now:              time.Now(),
-		IDGenerator:      synthesizer.NewStableIDGenerator(),
-		PluginAuthParser: parser,
-	}
-
-	var out []*coreauth.Auth
-
-	configSynth := synthesizer.NewConfigSynthesizer()
-	if auths, err := configSynth.Synthesize(ctx); err == nil {
-		out = append(out, auths...)
-	}
-
-	fileSynth := synthesizer.NewFileSynthesizer()
-	if auths, err := fileSynth.Synthesize(ctx); err == nil {
-		out = append(out, auths...)
-	}
-
-	return out
 }

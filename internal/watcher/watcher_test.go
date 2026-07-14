@@ -4,9 +4,11 @@ import (
 	"context"
 	"crypto/sha256"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"os"
 	"path/filepath"
+	"reflect"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -20,6 +22,7 @@ import (
 	"github.com/router-for-me/CLIProxyAPI/v7/internal/watcher/synthesizer"
 	sdkAuth "github.com/router-for-me/CLIProxyAPI/v7/sdk/auth"
 	coreauth "github.com/router-for-me/CLIProxyAPI/v7/sdk/cliproxy/auth"
+	"github.com/router-for-me/CLIProxyAPI/v7/sdk/pluginapi"
 	"gopkg.in/yaml.v3"
 )
 
@@ -258,8 +261,8 @@ func TestStartAndStopSuccess(t *testing.T) {
 	if err := w.Stop(); err != nil {
 		t.Fatalf("expected Stop to succeed: %v", err)
 	}
-	if got := atomic.LoadInt32(&reloads); got != 1 {
-		t.Fatalf("expected one reload callback, got %d", got)
+	if got := atomic.LoadInt32(&reloads); got != 0 {
+		t.Fatalf("expected no reload callback, got %d", got)
 	}
 }
 
@@ -286,7 +289,7 @@ func TestStartFailsWhenConfigMissing(t *testing.T) {
 }
 
 func TestDispatchRuntimeAuthUpdateEnqueuesAndUpdatesState(t *testing.T) {
-	queue := make(chan AuthUpdate, 4)
+	queue := make(chan AuthUpdateBatch, 4)
 	w := &Watcher{}
 	w.SetAuthUpdateQueue(queue)
 	defer w.stopDispatch()
@@ -297,7 +300,11 @@ func TestDispatchRuntimeAuthUpdateEnqueuesAndUpdatesState(t *testing.T) {
 	}
 
 	select {
-	case update := <-queue:
+	case batch := <-queue:
+		if len(batch.Updates) != 1 {
+			t.Fatalf("unexpected batch: %+v", batch)
+		}
+		update := batch.Updates[0]
 		if update.Action != AuthUpdateActionAdd || update.Auth.ID != "auth-1" {
 			t.Fatalf("unexpected update: %+v", update)
 		}
@@ -309,7 +316,11 @@ func TestDispatchRuntimeAuthUpdateEnqueuesAndUpdatesState(t *testing.T) {
 		t.Fatal("expected delete update to enqueue")
 	}
 	select {
-	case update := <-queue:
+	case batch := <-queue:
+		if len(batch.Updates) != 1 {
+			t.Fatalf("unexpected batch: %+v", batch)
+		}
+		update := batch.Updates[0]
 		if update.Action != AuthUpdateActionDelete || update.ID != "auth-1" {
 			t.Fatalf("unexpected delete update: %+v", update)
 		}
@@ -431,37 +442,6 @@ func TestAuthFileClientChangesNotifyUsageSubscribersToRefresh(t *testing.T) {
 
 	w.removeClient(authFile)
 	requireWatcherUsagePayload(t, subscriber, `{"refresh":true}`)
-}
-
-func TestAuthFileEventsDoNotInvokeSnapshotCoreAuths(t *testing.T) {
-	tmpDir := t.TempDir()
-	authFile := filepath.Join(tmpDir, "sample.json")
-	if err := os.WriteFile(authFile, []byte(`{"type":"codex","email":"u@example.com"}`), 0o644); err != nil {
-		t.Fatalf("failed to create auth file: %v", err)
-	}
-
-	origSnapshot := snapshotCoreAuthsFunc
-	var snapshotCalls int32
-	snapshotCoreAuthsFunc = func(cfg *config.Config, authDir string, parser synthesizer.PluginAuthParser) []*coreauth.Auth {
-		atomic.AddInt32(&snapshotCalls, 1)
-		return origSnapshot(cfg, authDir, parser)
-	}
-	defer func() { snapshotCoreAuthsFunc = origSnapshot }()
-
-	w := &Watcher{
-		authDir:          tmpDir,
-		lastAuthHashes:   make(map[string]string),
-		lastAuthContents: make(map[string]*coreauth.Auth),
-		fileAuthsByPath:  make(map[string]map[string]*coreauth.Auth),
-	}
-	w.SetConfig(&config.Config{AuthDir: tmpDir})
-
-	w.addOrUpdateClient(authFile)
-	w.removeClient(authFile)
-
-	if got := atomic.LoadInt32(&snapshotCalls); got != 0 {
-		t.Fatalf("expected auth file events to avoid full snapshot, got %d calls", got)
-	}
 }
 
 func TestAuthSliceToMap(t *testing.T) {
@@ -654,12 +634,18 @@ func TestReloadClientsCachesAuthHashes(t *testing.T) {
 		t.Fatalf("failed to write auth file: %v", err)
 	}
 	w := &Watcher{
-		authDir: tmpDir,
-		config:  &config.Config{AuthDir: tmpDir},
+		authDir:                tmpDir,
+		config:                 &config.Config{AuthDir: tmpDir},
+		fileAuthLoadingEnabled: true,
 	}
 
 	w.reloadClients(true, nil, false)
 
+	eventually(t, time.Second, func() bool {
+		w.clientsMutex.RLock()
+		defer w.clientsMutex.RUnlock()
+		return len(w.lastAuthHashes) == 1
+	})
 	w.clientsMutex.RLock()
 	defer w.clientsMutex.RUnlock()
 	if len(w.lastAuthHashes) != 1 {
@@ -740,7 +726,7 @@ func requireWatcherUsagePayload(t *testing.T, subscriber <-chan []byte, want str
 
 func TestSetAuthUpdateQueueNilResetsDispatch(t *testing.T) {
 	w := &Watcher{}
-	queue := make(chan AuthUpdate, 1)
+	queue := make(chan AuthUpdateBatch, 1)
 	w.SetAuthUpdateQueue(queue)
 	if w.dispatchCond == nil || w.dispatchCancel == nil {
 		t.Fatal("expected dispatch to be initialized")
@@ -833,7 +819,7 @@ func TestHandleEventRemovesAuthFile(t *testing.T) {
 }
 
 func TestDispatchAuthUpdatesFlushesQueue(t *testing.T) {
-	queue := make(chan AuthUpdate, 4)
+	queue := make(chan AuthUpdateBatch, 4)
 	w := &Watcher{}
 	w.SetAuthUpdateQueue(queue)
 	defer w.stopDispatch()
@@ -843,14 +829,12 @@ func TestDispatchAuthUpdatesFlushesQueue(t *testing.T) {
 		{Action: AuthUpdateActionModify, ID: "b"},
 	})
 
-	got := make([]AuthUpdate, 0, 2)
-	for i := 0; i < 2; i++ {
-		select {
-		case u := <-queue:
-			got = append(got, u)
-		case <-time.After(2 * time.Second):
-			t.Fatalf("timed out waiting for update %d", i)
-		}
+	var got []AuthUpdate
+	select {
+	case batch := <-queue:
+		got = batch.Updates
+	case <-time.After(2 * time.Second):
+		t.Fatal("timed out waiting for update batch")
 	}
 	if len(got) != 2 || got[0].ID != "a" || got[1].ID != "b" {
 		t.Fatalf("unexpected updates order/content: %+v", got)
@@ -858,7 +842,7 @@ func TestDispatchAuthUpdatesFlushesQueue(t *testing.T) {
 }
 
 func TestDispatchLoopExitsOnContextDoneWhileSending(t *testing.T) {
-	queue := make(chan AuthUpdate) // unbuffered to block sends
+	queue := make(chan AuthUpdateBatch) // unbuffered to block sends
 	w := &Watcher{
 		authQueue: queue,
 		pendingUpdates: map[string]AuthUpdate{
@@ -1210,7 +1194,7 @@ func TestNormalizeAuthPathAndDebounceCleanup(t *testing.T) {
 }
 
 func TestRefreshAuthStateDispatchesRuntimeAuths(t *testing.T) {
-	queue := make(chan AuthUpdate, 8)
+	queue := make(chan AuthUpdateBatch, 8)
 	w := &Watcher{
 		authDir:        t.TempDir(),
 		lastAuthHashes: make(map[string]string),
@@ -1229,7 +1213,11 @@ func TestRefreshAuthStateDispatchesRuntimeAuths(t *testing.T) {
 	w.refreshAuthState(false)
 
 	select {
-	case u := <-queue:
+	case batch := <-queue:
+		if len(batch.Updates) != 1 {
+			t.Fatalf("unexpected batch: %+v", batch)
+		}
+		u := batch.Updates[0]
 		if u.Action != AuthUpdateActionAdd || u.ID != "r1" {
 			t.Fatalf("unexpected auth update: %+v", u)
 		}
@@ -1269,27 +1257,6 @@ func TestAddOrUpdateClientEdgeCases(t *testing.T) {
 	}
 }
 
-func TestLoadFileClientsWalkError(t *testing.T) {
-	tmpDir := t.TempDir()
-	noAccessDir := filepath.Join(tmpDir, "0noaccess")
-	if err := os.MkdirAll(noAccessDir, 0o755); err != nil {
-		t.Fatalf("failed to create noaccess dir: %v", err)
-	}
-	if err := os.Chmod(noAccessDir, 0); err != nil {
-		t.Skipf("chmod not supported: %v", err)
-	}
-	defer func() { _ = os.Chmod(noAccessDir, 0o755) }()
-
-	cfg := &config.Config{AuthDir: tmpDir}
-	w := &Watcher{}
-	w.SetConfig(cfg)
-
-	count := w.loadFileClients(cfg)
-	if count != 0 {
-		t.Fatalf("expected count 0 due to walk error, got %d", count)
-	}
-}
-
 func TestReloadConfigIfChangedHandlesMissingAndEmpty(t *testing.T) {
 	tmpDir := t.TempDir()
 	authDir := filepath.Join(tmpDir, "auth")
@@ -1324,17 +1291,17 @@ func TestReloadConfigUsesMirroredAuthDir(t *testing.T) {
 	}
 
 	w := &Watcher{
-		configPath:      configPath,
-		authDir:         authDir,
-		mirroredAuthDir: authDir,
-		lastAuthHashes:  make(map[string]string),
+		configPath:             configPath,
+		authDir:                authDir,
+		mirroredAuthDir:        authDir,
+		lastAuthHashes:         make(map[string]string),
+		fileAuthLoadingEnabled: true,
 	}
 	w.SetConfig(&config.Config{AuthDir: authDir})
 
 	if ok := w.reloadConfig(); !ok {
 		t.Fatal("expected reloadConfig to succeed")
 	}
-
 	w.clientsMutex.RLock()
 	defer w.clientsMutex.RUnlock()
 	if w.config == nil || w.config.AuthDir != authDir {
@@ -1376,9 +1343,10 @@ func TestReloadConfigFiltersAffectedOAuthProviders(t *testing.T) {
 	}
 
 	w := &Watcher{
-		configPath:     configPath,
-		authDir:        authDir,
-		lastAuthHashes: make(map[string]string),
+		configPath:             configPath,
+		authDir:                authDir,
+		lastAuthHashes:         make(map[string]string),
+		fileAuthLoadingEnabled: true,
 		currentAuths: map[string]*coreauth.Auth{
 			"a": {ID: "a", Provider: "provider-a"},
 		},
@@ -1388,6 +1356,16 @@ func TestReloadConfigFiltersAffectedOAuthProviders(t *testing.T) {
 	if ok := w.reloadConfig(); !ok {
 		t.Fatal("expected reloadConfig to succeed")
 	}
+	eventually(t, time.Second, func() bool {
+		w.clientsMutex.RLock()
+		defer w.clientsMutex.RUnlock()
+		for _, auth := range w.currentAuths {
+			if auth != nil && auth.Provider == "provider-b" {
+				return true
+			}
+		}
+		return false
+	})
 
 	w.clientsMutex.RLock()
 	defer w.clientsMutex.RUnlock()
@@ -1510,6 +1488,7 @@ func TestNormalizeAuthNil(t *testing.T) {
 
 // stubStore implements coreauth.Store plus watcher-specific persistence helpers.
 type stubStore struct {
+	mu              sync.RWMutex
 	authDir         string
 	cfgPersisted    int32
 	authPersisted   int32
@@ -1528,8 +1507,10 @@ func (s *stubStore) PersistConfig(context.Context) error {
 }
 func (s *stubStore) PersistAuthFiles(_ context.Context, message string, paths ...string) error {
 	atomic.AddInt32(&s.authPersisted, 1)
+	s.mu.Lock()
 	s.lastAuthMessage = message
-	s.lastAuthPaths = paths
+	s.lastAuthPaths = append(s.lastAuthPaths[:0], paths...)
+	s.mu.Unlock()
 	return nil
 }
 func (s *stubStore) AuthDir() string { return s.authDir }
@@ -1569,11 +1550,15 @@ func TestPersistConfigAndAuthAsyncInvokePersister(t *testing.T) {
 	if atomic.LoadInt32(&store.authPersisted) != 1 {
 		t.Fatalf("expected PersistAuthFiles to be called once, got %d", store.authPersisted)
 	}
-	if store.lastAuthMessage != "msg" {
-		t.Fatalf("unexpected auth message: %s", store.lastAuthMessage)
+	store.mu.RLock()
+	message := store.lastAuthMessage
+	paths := append([]string(nil), store.lastAuthPaths...)
+	store.mu.RUnlock()
+	if message != "msg" {
+		t.Fatalf("unexpected auth message: %s", message)
 	}
-	if len(store.lastAuthPaths) != 2 || store.lastAuthPaths[0] != "a" || store.lastAuthPaths[1] != "b" {
-		t.Fatalf("unexpected filtered paths: %#v", store.lastAuthPaths)
+	if len(paths) != 2 || paths[0] != "a" || paths[1] != "b" {
+		t.Fatalf("unexpected filtered paths: %#v", paths)
 	}
 }
 
@@ -1601,7 +1586,10 @@ func TestScheduleConfigReloadDebounces(t *testing.T) {
 	if atomic.LoadInt32(&reloads) != 1 {
 		t.Fatalf("expected single debounced reload, got %d", reloads)
 	}
-	if w.lastConfigHash == "" {
+	w.clientsMutex.RLock()
+	lastConfigHash := w.lastConfigHash
+	w.clientsMutex.RUnlock()
+	if lastConfigHash == "" {
 		t.Fatal("expected lastConfigHash to be set after reload")
 	}
 }
@@ -1611,7 +1599,7 @@ func TestPrepareAuthUpdatesLockedForceAndDelete(t *testing.T) {
 		currentAuths: map[string]*coreauth.Auth{
 			"a": {ID: "a", Provider: "p1"},
 		},
-		authQueue: make(chan AuthUpdate, 4),
+		authQueue: make(chan AuthUpdateBatch, 4),
 	}
 
 	updates := w.prepareAuthUpdatesLocked([]*coreauth.Auth{{ID: "a", Provider: "p2"}}, false)
@@ -1717,4 +1705,331 @@ func TestScheduleProcessEventsStopsOnContextDone(t *testing.T) {
 
 func hexString(data []byte) string {
 	return strings.ToLower(fmt.Sprintf("%x", data))
+}
+
+func TestInitialAuthLoadHonorsWorkerLimitAndPublishesReady(t *testing.T) {
+	authDir := t.TempDir()
+	for i := 0; i < 40; i++ {
+		mustWriteFile(t, filepath.Join(authDir, fmt.Sprintf("auth-%03d.json", i)), []byte(`{"type":"xai"}`))
+	}
+
+	originalRead := readInitialAuthFile
+	defer func() { readInitialAuthFile = originalRead }()
+	var active atomic.Int32
+	var peak atomic.Int32
+	readInitialAuthFile = func(path string) ([]byte, error) {
+		current := active.Add(1)
+		defer active.Add(-1)
+		for current > peak.Load() && !peak.CompareAndSwap(peak.Load(), current) {
+		}
+		time.Sleep(10 * time.Millisecond)
+		return os.ReadFile(path)
+	}
+
+	queue := make(chan AuthUpdateBatch, 8)
+	w := newInitialLoadTestWatcher(t, authDir, queue)
+	done := w.StartInitialAuthLoad(context.Background(), 4)
+	loaded := 0
+	for {
+		select {
+		case batch := <-queue:
+			loaded += len(batch.Updates)
+			batch.Result <- loadedResults(batch.Updates)
+		case <-done:
+			goto loadComplete
+		case <-time.After(2 * time.Second):
+			t.Fatal("timed out waiting for initial auth load")
+		}
+	}
+loadComplete:
+	if peak.Load() > 4 {
+		t.Fatalf("peak concurrent reads = %d, want <= 4", peak.Load())
+	}
+	status := w.AuthLoadStatus()
+	if status.State != AuthLoadStateReady || status.FilesProcessed != 40 || status.AuthsLoaded != int64(loaded) {
+		t.Fatalf("status = %+v, loaded = %d", status, loaded)
+	}
+}
+
+func TestInitialAuthLoadMakesFirstBatchAvailableBeforeCompletion(t *testing.T) {
+	authDir := writeInitialLoadAuthFiles(t, 40)
+	releaseTail := make(chan struct{})
+	originalRead := readInitialAuthFile
+	defer func() { readInitialAuthFile = originalRead }()
+	readInitialAuthFile = func(path string) ([]byte, error) {
+		if filepath.Base(path) >= "auth-032.json" {
+			<-releaseTail
+		}
+		return os.ReadFile(path)
+	}
+	queue := make(chan AuthUpdateBatch, 8)
+	w := newInitialLoadTestWatcher(t, authDir, queue)
+	done := w.StartInitialAuthLoad(context.Background(), 4)
+	first := <-queue
+	first.Result <- loadedResults(first.Updates)
+	eventually(t, time.Second, func() bool { return w.AuthLoadStatus().AuthsLoaded > 0 })
+	select {
+	case <-done:
+		t.Fatal("load completed before delayed tail was released")
+	default:
+	}
+	close(releaseTail)
+	acknowledgeInitialLoadUntilDone(t, queue, done)
+}
+
+func TestInitialAuthLoadMalformedFileDoesNotBlockValidFile(t *testing.T) {
+	authDir := t.TempDir()
+	mustWriteFile(t, filepath.Join(authDir, "broken.json"), []byte(`{"type":`))
+	mustWriteFile(t, filepath.Join(authDir, "valid.json"), []byte(`{"type":"xai"}`))
+	queue := make(chan AuthUpdateBatch, 4)
+	w := newInitialLoadTestWatcher(t, authDir, queue)
+	done := w.StartInitialAuthLoad(context.Background(), 2)
+	acknowledgeInitialLoadUntilDone(t, queue, done)
+	status := w.AuthLoadStatus()
+	if status.State != AuthLoadStateDegraded || status.FilesProcessed != 2 || status.FilesFailed != 1 || status.AuthsLoaded != 1 {
+		t.Fatalf("status = %+v", status)
+	}
+}
+
+func TestInitialAuthLoadPluginExpansionCountsAuths(t *testing.T) {
+	authDir := t.TempDir()
+	mustWriteFile(t, filepath.Join(authDir, "plugin.json"), []byte(`{"type":"plugin"}`))
+	queue := make(chan AuthUpdateBatch, 4)
+	w := newInitialLoadTestWatcher(t, authDir, queue)
+	w.SetPluginAuthParser(watcherMultiAuthParserFunc(func(context.Context, pluginapi.AuthParseRequest) ([]*coreauth.Auth, bool, error) {
+		return []*coreauth.Auth{{ID: "virtual-a", Provider: "plugin"}, {ID: "virtual-b", Provider: "plugin"}}, true, nil
+	}))
+	done := w.StartInitialAuthLoad(context.Background(), 2)
+	acknowledgeInitialLoadUntilDone(t, queue, done)
+	status := w.AuthLoadStatus()
+	if status.FilesProcessed != 1 || status.AuthsLoaded != 2 {
+		t.Fatalf("status = %+v", status)
+	}
+}
+
+func TestInitialAuthLoadDropsResultAfterLiveDelete(t *testing.T) {
+	authDir := t.TempDir()
+	path := filepath.Join(authDir, "stale.json")
+	mustWriteFile(t, path, []byte(`{"type":"xai"}`))
+	readCaptured := make(chan struct{})
+	releaseRead := make(chan struct{})
+	originalRead := readInitialAuthFile
+	defer func() { readInitialAuthFile = originalRead }()
+	readInitialAuthFile = func(path string) ([]byte, error) {
+		data, errRead := os.ReadFile(path)
+		close(readCaptured)
+		<-releaseRead
+		return data, errRead
+	}
+	queue := make(chan AuthUpdateBatch, 4)
+	w := newInitialLoadTestWatcher(t, authDir, queue)
+	done := w.StartInitialAuthLoad(context.Background(), 1)
+	<-readCaptured
+	if errRemove := os.Remove(path); errRemove != nil {
+		t.Fatal(errRemove)
+	}
+	w.handleEvent(fsnotify.Event{Name: path, Op: fsnotify.Remove})
+	close(releaseRead)
+	<-done
+	select {
+	case batch := <-queue:
+		t.Fatalf("stale scan emitted batch: %+v", batch.Updates)
+	default:
+	}
+}
+
+func TestInitialAuthLoadStopsOnCancellation(t *testing.T) {
+	authDir := writeInitialLoadAuthFiles(t, 8)
+	releaseRead := make(chan struct{})
+	originalRead := readInitialAuthFile
+	defer func() { readInitialAuthFile = originalRead }()
+	readInitialAuthFile = func(path string) ([]byte, error) {
+		<-releaseRead
+		return os.ReadFile(path)
+	}
+	queue := make(chan AuthUpdateBatch, 4)
+	w := newInitialLoadTestWatcher(t, authDir, queue)
+	ctx, cancel := context.WithCancel(context.Background())
+	done := w.StartInitialAuthLoad(ctx, 2)
+	cancel()
+	close(releaseRead)
+	select {
+	case <-done:
+	case <-time.After(time.Second):
+		t.Fatal("loader did not stop after cancellation")
+	}
+	terminal := w.AuthLoadStatus()
+	time.Sleep(20 * time.Millisecond)
+	if got := w.AuthLoadStatus(); !reflect.DeepEqual(got, terminal) {
+		t.Fatalf("status changed after completion: before=%+v after=%+v", terminal, got)
+	}
+}
+
+func TestInitialAuthLoadDirectoryFailureIsDegraded(t *testing.T) {
+	authDir := t.TempDir()
+	queue := make(chan AuthUpdateBatch, 1)
+	w := newInitialLoadTestWatcher(t, authDir, queue)
+	if errRemove := os.RemoveAll(authDir); errRemove != nil {
+		t.Fatal(errRemove)
+	}
+	done := w.StartInitialAuthLoad(context.Background(), 2)
+	<-done
+	status := w.AuthLoadStatus()
+	if status.State != AuthLoadStateDegraded || !status.ScanComplete || status.FilesDiscovered != 0 {
+		t.Fatalf("status = %+v", status)
+	}
+}
+
+func TestFullAuthRescanAcceptsStablePreviouslyChangedPath(t *testing.T) {
+	authDir := t.TempDir()
+	path := filepath.Join(authDir, "changed.json")
+	mustWriteFile(t, path, []byte(`{"type":"xai"}`))
+	queue := make(chan AuthUpdateBatch, 4)
+	w := newInitialLoadTestWatcher(t, authDir, queue)
+	w.MarkAuthPathChanged(path)
+	firstDone := w.StartInitialAuthLoad(context.Background(), 1)
+	<-firstDone
+	if status := w.AuthLoadStatus(); status.FilesSkipped != 1 {
+		t.Fatalf("first scan status = %+v, want live generation skip", status)
+	}
+	secondDone := w.StartInitialAuthLoad(context.Background(), 1)
+	acknowledgeInitialLoadUntilDone(t, queue, secondDone)
+	if status := w.AuthLoadStatus(); status.AuthsLoaded != 1 {
+		t.Fatalf("second scan status = %+v, want stable changed path loaded", status)
+	}
+}
+
+func TestAuthLoadHooksWrapEveryFullScan(t *testing.T) {
+	authDir := writeInitialLoadAuthFiles(t, 1)
+	queue := make(chan AuthUpdateBatch, 4)
+	w := newInitialLoadTestWatcher(t, authDir, queue)
+	var before atomic.Int32
+	var after atomic.Int32
+	w.SetAuthLoadHooks(AuthLoadHooks{
+		Before: func(context.Context) error { before.Add(1); return nil },
+		After:  func(context.Context) error { after.Add(1); return nil },
+	})
+	for scan := int32(1); scan <= 2; scan++ {
+		if scan == 2 {
+			mustWriteFile(t, filepath.Join(authDir, "auth-000.json"), []byte(`{"type":"xai","note":"changed"}`))
+		}
+		done := w.StartInitialAuthLoad(context.Background(), 1)
+		batch := <-queue
+		if got := before.Load(); got != scan {
+			t.Fatalf("before count at batch = %d, want %d", got, scan)
+		}
+		batch.Result <- loadedResults(batch.Updates)
+		<-done
+		if got := after.Load(); got != scan {
+			t.Fatalf("after count at completion = %d, want %d", got, scan)
+		}
+	}
+}
+
+func TestAuthLoadBeforeHookFailurePreventsCredentialRegistration(t *testing.T) {
+	authDir := writeInitialLoadAuthFiles(t, 1)
+	queue := make(chan AuthUpdateBatch, 1)
+	w := newInitialLoadTestWatcher(t, authDir, queue)
+	w.SetAuthLoadHooks(AuthLoadHooks{Before: func(context.Context) error { return errors.New("cooldown unavailable") }})
+	done := w.StartInitialAuthLoad(context.Background(), 1)
+	<-done
+	status := w.AuthLoadStatus()
+	if status.State != AuthLoadStateDegraded || !status.ScanComplete || status.FilesProcessed != 0 {
+		t.Fatalf("status = %+v", status)
+	}
+	select {
+	case batch := <-queue:
+		t.Fatalf("hook failure emitted auth updates: %+v", batch.Updates)
+	default:
+	}
+}
+
+func TestInitialAuthLoadDisabledForNonFileStore(t *testing.T) {
+	authDir := writeInitialLoadAuthFiles(t, 1)
+	queue := make(chan AuthUpdateBatch, 1)
+	w := newInitialLoadTestWatcher(t, authDir, queue)
+	w.SetFileAuthLoadingEnabled(false)
+	done := w.StartInitialAuthLoad(context.Background(), 16)
+	select {
+	case <-done:
+	case <-time.After(time.Second):
+		t.Fatal("disabled loader did not return immediately")
+	}
+	if status := w.AuthLoadStatus(); status.State != AuthLoadStateIdle {
+		t.Fatalf("status = %+v, want idle", status)
+	}
+}
+
+func newInitialLoadTestWatcher(t testing.TB, authDir string, queue chan AuthUpdateBatch) *Watcher {
+	t.Helper()
+	configPath := filepath.Join(t.TempDir(), "config.yaml")
+	mustWriteFile(t, configPath, []byte("port: 8317\n"))
+	w, errNew := NewWatcher(configPath, authDir, nil)
+	if errNew != nil {
+		t.Fatal(errNew)
+	}
+	w.SetConfig(&config.Config{AuthDir: authDir, AuthLoadWorkers: 16})
+	w.SetAuthUpdateQueue(queue)
+	t.Cleanup(func() { _ = w.Stop() })
+	return w
+}
+
+type watcherMultiAuthParserFunc func(context.Context, pluginapi.AuthParseRequest) ([]*coreauth.Auth, bool, error)
+
+func (f watcherMultiAuthParserFunc) ParseAuth(context.Context, pluginapi.AuthParseRequest) (*coreauth.Auth, bool, error) {
+	return nil, false, nil
+}
+
+func (f watcherMultiAuthParserFunc) ParseAuths(ctx context.Context, req pluginapi.AuthParseRequest) ([]*coreauth.Auth, bool, error) {
+	return f(ctx, req)
+}
+
+func mustWriteFile(t testing.TB, path string, data []byte) {
+	t.Helper()
+	if errWrite := os.WriteFile(path, data, 0o600); errWrite != nil {
+		t.Fatal(errWrite)
+	}
+}
+
+func writeInitialLoadAuthFiles(t testing.TB, count int) string {
+	t.Helper()
+	dir := t.TempDir()
+	for i := 0; i < count; i++ {
+		mustWriteFile(t, filepath.Join(dir, fmt.Sprintf("auth-%03d.json", i)), []byte(`{"type":"xai"}`))
+	}
+	return dir
+}
+
+func eventually(t testing.TB, timeout time.Duration, condition func() bool) {
+	t.Helper()
+	deadline := time.Now().Add(timeout)
+	for time.Now().Before(deadline) {
+		if condition() {
+			return
+		}
+		time.Sleep(time.Millisecond)
+	}
+	t.Fatal("condition was not satisfied before timeout")
+}
+
+func loadedResults(updates []AuthUpdate) []AuthUpdateResult {
+	results := make([]AuthUpdateResult, 0, len(updates))
+	for _, update := range updates {
+		results = append(results, AuthUpdateResult{ID: update.ID, Loaded: true})
+	}
+	return results
+}
+
+func acknowledgeInitialLoadUntilDone(t testing.TB, queue <-chan AuthUpdateBatch, done <-chan struct{}) {
+	t.Helper()
+	for {
+		select {
+		case batch := <-queue:
+			batch.Result <- loadedResults(batch.Updates)
+		case <-done:
+			return
+		case <-time.After(2 * time.Second):
+			t.Fatal("timed out waiting for initial auth load")
+		}
+	}
 }
