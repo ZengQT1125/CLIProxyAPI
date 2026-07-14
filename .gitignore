@@ -37,13 +37,9 @@ GEMINI.md
 .vscode/*
 .worktrees/
 .codex/*
-.claude/*
-.claude
 .gemini/*
 .serena/*
 .agent/*
-.agents
-.agents/*
 .opencode/*
 .idea/*
 .beads/*
