@@ -797,3 +797,32 @@ func TestManager_PreparedCooldownDisabledUpdateDefersCleanup(t *testing.T) {
 		})
 	}
 }
+
+func TestManager_CompleteCooldownRestoreDoesNotPersistToReplacedStore(t *testing.T) {
+	nextRetry := time.Now().Add(time.Hour)
+	oldStore := &recordingCooldownStateStore{load: []CooldownStateSnapshot{{
+		AuthID:  "auth-1",
+		Records: []CooldownStateRecord{{AuthID: "auth-1", NextRetryAfter: nextRetry}},
+	}}}
+	manager := NewManager(nil, nil, nil)
+	manager.SetCooldownStateStore(oldStore)
+	if _, errRegister := manager.Register(WithSkipPersist(context.Background()), &Auth{ID: "auth-1", Provider: "xai"}); errRegister != nil {
+		t.Fatal(errRegister)
+	}
+	if errPrepare := manager.PrepareCooldownRestore(context.Background()); errPrepare != nil {
+		t.Fatal(errPrepare)
+	}
+	auth, ok := manager.GetByID("auth-1")
+	if !ok || !auth.Unavailable || !auth.NextRetryAfter.Equal(nextRetry) {
+		t.Fatalf("auth after prepare = %+v, want old store cooldown", auth)
+	}
+
+	newStore := &recordingCooldownStateStore{}
+	manager.SetCooldownStateStore(newStore)
+	if errComplete := manager.CompleteCooldownRestore(context.Background()); errComplete != nil {
+		t.Fatal(errComplete)
+	}
+	if got := newStore.applyCount.Load(); got != 0 {
+		t.Fatalf("new store Apply count = %d, want 0", got)
+	}
+}

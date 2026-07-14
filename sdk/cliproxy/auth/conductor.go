@@ -226,6 +226,7 @@ type Manager struct {
 	store                  Store
 	cooldownStore          CooldownStateStore
 	cooldownStoreVersion   uint64
+	cooldownRestoreVersion uint64
 	pendingCooldownRestore map[string][]CooldownStateRecord
 	cooldownRestoreIDs     map[string]struct{}
 	cooldownPersister      *cooldownStatePersister
@@ -233,6 +234,7 @@ type Manager struct {
 	selector               Selector
 	hook                   Hook
 	mu                     sync.RWMutex
+	cooldownRestoreMu      sync.Mutex
 	auths                  map[string]*Auth
 	scheduler              *authScheduler
 	// pluginScheduler runs outside m.mu before falling back to native selection.
@@ -504,10 +506,13 @@ func (m *Manager) SetCooldownStateStore(store CooldownStateStore) {
 	if m == nil {
 		return
 	}
+	m.cooldownRestoreMu.Lock()
+	defer m.cooldownRestoreMu.Unlock()
 	m.mu.Lock()
 	defer m.mu.Unlock()
 	m.cooldownStore = store
 	m.cooldownStoreVersion++
+	m.cooldownRestoreVersion = 0
 	m.pendingCooldownRestore = nil
 	m.cooldownRestoreIDs = nil
 }
@@ -623,6 +628,7 @@ func (m *Manager) PrepareCooldownRestore(ctx context.Context) error {
 	}
 	m.pendingCooldownRestore = pending
 	m.cooldownRestoreIDs = ids
+	m.cooldownRestoreVersion = storeVersion
 	now := time.Now()
 	schedulerSnapshots := make([]*Auth, 0, len(m.auths))
 	for _, auth := range m.auths {
@@ -646,7 +652,16 @@ func (m *Manager) CompleteCooldownRestore(ctx context.Context) error {
 	if m == nil {
 		return nil
 	}
+	m.cooldownRestoreMu.Lock()
+	defer m.cooldownRestoreMu.Unlock()
 	m.mu.Lock()
+	if m.cooldownRestoreVersion == 0 || m.cooldownRestoreVersion != m.cooldownStoreVersion {
+		m.pendingCooldownRestore = nil
+		m.cooldownRestoreIDs = nil
+		m.cooldownRestoreVersion = 0
+		m.mu.Unlock()
+		return nil
+	}
 	idSet := make(map[string]struct{}, len(m.cooldownRestoreIDs)+len(m.auths))
 	for authID := range m.cooldownRestoreIDs {
 		idSet[authID] = struct{}{}
@@ -659,6 +674,7 @@ func (m *Manager) CompleteCooldownRestore(ctx context.Context) error {
 	}
 	m.pendingCooldownRestore = nil
 	m.cooldownRestoreIDs = nil
+	m.cooldownRestoreVersion = 0
 	m.mu.Unlock()
 	ids := make([]string, 0, len(idSet))
 	for authID := range idSet {
