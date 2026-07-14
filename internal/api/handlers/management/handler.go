@@ -19,6 +19,7 @@ import (
 	"github.com/router-for-me/CLIProxyAPI/v7/internal/pluginhost"
 	"github.com/router-for-me/CLIProxyAPI/v7/internal/pluginstore"
 	"github.com/router-for-me/CLIProxyAPI/v7/internal/usage"
+	"github.com/router-for-me/CLIProxyAPI/v7/internal/watcher"
 	sdkAuth "github.com/router-for-me/CLIProxyAPI/v7/sdk/auth"
 	coreauth "github.com/router-for-me/CLIProxyAPI/v7/sdk/cliproxy/auth"
 	log "github.com/sirupsen/logrus"
@@ -56,6 +57,8 @@ type Handler struct {
 	logDir                  string
 	postAuthHook            coreauth.PostAuthHook
 	postAuthPersistHook     coreauth.PostAuthHook
+	authLoadStatusProvider  func() watcher.AuthLoadStatus
+	authFileMutationHook    func(string)
 	pluginHost              *pluginhost.Host
 	configReloadHook        func(context.Context, *config.Config)
 	pluginStoreRegistryURL  string
@@ -140,6 +143,26 @@ func (h *Handler) SetAuthManager(manager *coreauth.Manager) {
 	}
 	h.mu.Lock()
 	h.authManager = manager
+	h.mu.Unlock()
+}
+
+// SetAuthLoadStatusProvider updates the provider used by the auth-file load-status endpoint.
+func (h *Handler) SetAuthLoadStatusProvider(provider func() watcher.AuthLoadStatus) {
+	if h == nil {
+		return
+	}
+	h.mu.Lock()
+	h.authLoadStatusProvider = provider
+	h.mu.Unlock()
+}
+
+// SetAuthFileMutationHook updates the hook called after an auth file is persisted or deleted.
+func (h *Handler) SetAuthFileMutationHook(hook func(string)) {
+	if h == nil {
+		return
+	}
+	h.mu.Lock()
+	h.authFileMutationHook = hook
 	h.mu.Unlock()
 }
 

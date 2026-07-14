@@ -39,6 +39,7 @@ import (
 	"github.com/router-for-me/CLIProxyAPI/v7/internal/safemode"
 	"github.com/router-for-me/CLIProxyAPI/v7/internal/usage"
 	"github.com/router-for-me/CLIProxyAPI/v7/internal/util"
+	"github.com/router-for-me/CLIProxyAPI/v7/internal/watcher"
 	sdkaccess "github.com/router-for-me/CLIProxyAPI/v7/sdk/access"
 	"github.com/router-for-me/CLIProxyAPI/v7/sdk/api/handlers"
 	"github.com/router-for-me/CLIProxyAPI/v7/sdk/api/handlers/claude"
@@ -73,19 +74,21 @@ const (
 )
 
 type serverOptionConfig struct {
-	extraMiddleware       []gin.HandlerFunc
-	engineConfigurator    func(*gin.Engine)
-	routerConfigurator    func(*gin.Engine, *handlers.BaseAPIHandler, *config.Config)
-	requestLoggerFactory  func(*config.Config, string) logging.RequestLogger
-	localPassword         string
-	keepAliveEnabled      bool
-	keepAliveTimeout      time.Duration
-	keepAliveOnTimeout    func()
-	postAuthHook          auth.PostAuthHook
-	postAuthPersistHook   auth.PostAuthHook
-	pluginHost            *pluginhost.Host
-	configReloadHook      func(context.Context, *config.Config)
-	exampleAPIKeySafeMode bool
+	extraMiddleware        []gin.HandlerFunc
+	engineConfigurator     func(*gin.Engine)
+	routerConfigurator     func(*gin.Engine, *handlers.BaseAPIHandler, *config.Config)
+	requestLoggerFactory   func(*config.Config, string) logging.RequestLogger
+	localPassword          string
+	keepAliveEnabled       bool
+	keepAliveTimeout       time.Duration
+	keepAliveOnTimeout     func()
+	postAuthHook           auth.PostAuthHook
+	postAuthPersistHook    auth.PostAuthHook
+	pluginHost             *pluginhost.Host
+	configReloadHook       func(context.Context, *config.Config)
+	authLoadStatusProvider func() watcher.AuthLoadStatus
+	authFileMutationHook   func(string)
+	exampleAPIKeySafeMode  bool
 }
 
 // ServerOption customises HTTP server construction.
@@ -183,6 +186,20 @@ func WithConfigReloadHook(hook func(context.Context, *config.Config)) ServerOpti
 	}
 }
 
+// WithAuthLoadStatusProvider registers a provider for management auth-file load status.
+func WithAuthLoadStatusProvider(provider func() watcher.AuthLoadStatus) ServerOption {
+	return func(options *serverOptionConfig) {
+		options.authLoadStatusProvider = provider
+	}
+}
+
+// WithAuthFileMutationHook registers a hook called after managed auth files change on disk.
+func WithAuthFileMutationHook(hook func(string)) ServerOption {
+	return func(options *serverOptionConfig) {
+		options.authFileMutationHook = hook
+	}
+}
+
 // WithExampleAPIKeySafeMode blocks proxy API endpoints while template API keys remain configured.
 func WithExampleAPIKeySafeMode() ServerOption {
 	return func(cfg *serverOptionConfig) {
@@ -204,6 +221,9 @@ type Server struct {
 
 	// muxHTTPListener receives HTTP connections selected by the multiplexer.
 	muxHTTPListener *muxListener
+
+	listening     chan net.Addr
+	listeningOnce sync.Once
 
 	// handlers contains the API handlers for processing requests.
 	handlers *handlers.BaseAPIHandler
@@ -335,6 +355,7 @@ func NewServer(cfg *config.Config, authManager *auth.Manager, accessManager *sdk
 		envManagementSecret: envManagementSecret,
 		wsRoutes:            make(map[string]struct{}),
 		pluginHost:          optionState.pluginHost,
+		listening:           make(chan net.Addr, 1),
 
 		exampleAPIKeySafeModeEnabled: optionState.exampleAPIKeySafeMode,
 	}
@@ -361,6 +382,8 @@ func NewServer(cfg *config.Config, authManager *auth.Manager, accessManager *sdk
 	s.mgmt = managementHandlers.NewHandler(cfg, configFilePath, authManager)
 	s.mgmt.SetPluginHost(optionState.pluginHost)
 	s.mgmt.SetConfigReloadHook(optionState.configReloadHook)
+	s.mgmt.SetAuthLoadStatusProvider(optionState.authLoadStatusProvider)
+	s.mgmt.SetAuthFileMutationHook(optionState.authFileMutationHook)
 	if optionState.localPassword != "" {
 		s.mgmt.SetLocalPassword(optionState.localPassword)
 	}
@@ -926,6 +949,7 @@ func (s *Server) registerManagementRoutes() {
 		mgmt.PATCH("/oauth-model-alias", s.mgmt.PatchOAuthModelAlias)
 		mgmt.DELETE("/oauth-model-alias", s.mgmt.DeleteOAuthModelAlias)
 
+		mgmt.GET("/auth-files/load-status", s.mgmt.GetAuthFileLoadStatus)
 		mgmt.GET("/auth-files", s.mgmt.ListAuthFiles)
 		mgmt.GET("/auth-files/models", s.mgmt.GetAuthFileModels)
 		mgmt.GET("/model-definitions/:channel", s.mgmt.GetStaticModelDefinitions)
@@ -1619,19 +1643,46 @@ func homeModelInt64Value(model map[string]any, keys ...string) int64 {
 	return 0
 }
 
+// Listening returns a channel that receives the bound listener address exactly once.
+func (s *Server) Listening() <-chan net.Addr {
+	if s == nil || s.listening == nil {
+		closed := make(chan net.Addr)
+		close(closed)
+		return closed
+	}
+	return s.listening
+}
+
+func (s *Server) publishListening(addr net.Addr) {
+	if s == nil {
+		return
+	}
+	s.listeningOnce.Do(func() {
+		if addr != nil {
+			s.listening <- addr
+		}
+		close(s.listening)
+	})
+}
+
 // Start begins listening for and serving HTTP or HTTPS requests.
 // It's a blocking call and will only return on an unrecoverable error.
 //
 // Returns:
 //   - error: An error if the server fails to start
 func (s *Server) Start() error {
-	if s == nil || s.server == nil {
+	if s == nil {
+		return fmt.Errorf("failed to start HTTP server: server not initialized")
+	}
+	if s.server == nil {
+		s.publishListening(nil)
 		return fmt.Errorf("failed to start HTTP server: server not initialized")
 	}
 
 	addr := s.server.Addr
 	listener, errListen := net.Listen("tcp", addr)
 	if errListen != nil {
+		s.publishListening(nil)
 		return fmt.Errorf("failed to start HTTP server: %v", errListen)
 	}
 
@@ -1643,6 +1694,7 @@ func (s *Server) Start() error {
 			if errClose := listener.Close(); errClose != nil {
 				log.Errorf("failed to close listener after TLS validation failure: %v", errClose)
 			}
+			s.publishListening(nil)
 			return fmt.Errorf("failed to start HTTPS server: tls.cert or tls.key is empty")
 		}
 		certPair, errLoad := tls.LoadX509KeyPair(certPath, keyPath)
@@ -1650,6 +1702,7 @@ func (s *Server) Start() error {
 			if errClose := listener.Close(); errClose != nil {
 				log.Errorf("failed to close listener after TLS key pair load failure: %v", errClose)
 			}
+			s.publishListening(nil)
 			return fmt.Errorf("failed to start HTTPS server: %v", errLoad)
 		}
 
@@ -1670,6 +1723,7 @@ func (s *Server) Start() error {
 	httpListener := newMuxListener(listener.Addr(), 1024)
 	s.muxBaseListener = listener
 	s.muxHTTPListener = httpListener
+	s.publishListening(listener.Addr())
 
 	httpErrCh := make(chan error, 1)
 	acceptErrCh := make(chan error, 1)

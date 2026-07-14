@@ -156,6 +156,13 @@ func TestDeleteAuthFile_RemovesRuntimeAuth(t *testing.T) {
 
 	h := NewHandlerWithoutConfigFilePath(&config.Config{AuthDir: authDir}, manager)
 	h.tokenStore = &memoryAuthStore{}
+	var notifiedPath string
+	h.SetAuthFileMutationHook(func(path string) {
+		notifiedPath = path
+		if _, ok := manager.GetByID(record.ID); !ok {
+			t.Error("runtime auth changed before mutation hook")
+		}
+	})
 
 	deleteRec := httptest.NewRecorder()
 	deleteCtx, _ := gin.CreateTestContext(deleteRec)
@@ -165,6 +172,14 @@ func TestDeleteAuthFile_RemovesRuntimeAuth(t *testing.T) {
 
 	if deleteRec.Code != http.StatusOK {
 		t.Fatalf("expected delete status %d, got %d with body %s", http.StatusOK, deleteRec.Code, deleteRec.Body.String())
+	}
+	normalizedAuthDir, errEval := filepath.EvalSymlinks(authDir)
+	if errEval != nil {
+		t.Fatalf("resolve auth dir: %v", errEval)
+	}
+	wantPath := filepath.Join(normalizedAuthDir, fileName)
+	if got := notifiedPath; got != wantPath {
+		t.Fatalf("mutation path = %q, want %q", got, wantPath)
 	}
 	if _, ok := manager.GetByID(record.ID); ok {
 		t.Fatalf("expected runtime auth %q to be removed", record.ID)

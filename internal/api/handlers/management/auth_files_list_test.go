@@ -10,12 +10,43 @@ import (
 	"path/filepath"
 	"reflect"
 	"testing"
+	"time"
 
 	"github.com/gin-gonic/gin"
 	"github.com/router-for-me/CLIProxyAPI/v7/internal/api/middleware"
 	"github.com/router-for-me/CLIProxyAPI/v7/internal/config"
+	"github.com/router-for-me/CLIProxyAPI/v7/internal/watcher"
 	coreauth "github.com/router-for-me/CLIProxyAPI/v7/sdk/cliproxy/auth"
 )
+
+func TestGetAuthFileLoadStatus(t *testing.T) {
+	completed := time.Date(2026, 7, 14, 3, 9, 1, 0, time.UTC)
+	tests := []watcher.AuthLoadStatus{
+		{State: watcher.AuthLoadStateLoading, FilesDiscovered: 3, FilesProcessed: 1, AuthsLoaded: 1},
+		{State: watcher.AuthLoadStateReady, FilesDiscovered: 3, FilesProcessed: 3, AuthsLoaded: 3, ScanComplete: true, CompletedAt: &completed},
+		{State: watcher.AuthLoadStateDegraded, FilesDiscovered: 3, FilesProcessed: 3, AuthsLoaded: 2, FilesFailed: 1, ScanComplete: true, CompletedAt: &completed},
+	}
+	for _, want := range tests {
+		t.Run(string(want.State), func(t *testing.T) {
+			h := NewHandlerWithoutConfigFilePath(&config.Config{AuthDir: t.TempDir()}, nil)
+			h.SetAuthLoadStatusProvider(func() watcher.AuthLoadStatus { return want })
+			recorder := httptest.NewRecorder()
+			ctx, _ := gin.CreateTestContext(recorder)
+			ctx.Request = httptest.NewRequest(http.MethodGet, "/v0/management/auth-files/load-status", nil)
+			h.GetAuthFileLoadStatus(ctx)
+			if recorder.Code != http.StatusOK {
+				t.Fatalf("status = %d, body = %s", recorder.Code, recorder.Body.String())
+			}
+			var got watcher.AuthLoadStatus
+			if errDecode := json.Unmarshal(recorder.Body.Bytes(), &got); errDecode != nil {
+				t.Fatalf("decode response: %v", errDecode)
+			}
+			if got.State != want.State || got.FilesProcessed != want.FilesProcessed || got.FilesFailed != want.FilesFailed || got.ScanComplete != want.ScanComplete {
+				t.Fatalf("response = %+v, want %+v", got, want)
+			}
+		})
+	}
+}
 
 func TestParseAuthFileListQuery(t *testing.T) {
 	tests := []struct {
