@@ -223,14 +223,15 @@ func (NoopHook) OnResult(context.Context, Result) {}
 
 // Manager orchestrates auth lifecycle, selection, execution, and persistence.
 type Manager struct {
-	store         Store
-	cooldownStore CooldownStateStore
-	executors     map[string]ProviderExecutor
-	selector      Selector
-	hook          Hook
-	mu            sync.RWMutex
-	auths         map[string]*Auth
-	scheduler     *authScheduler
+	store             Store
+	cooldownStore     CooldownStateStore
+	cooldownPersister *cooldownStatePersister
+	executors         map[string]ProviderExecutor
+	selector          Selector
+	hook              Hook
+	mu                sync.RWMutex
+	auths             map[string]*Auth
+	scheduler         *authScheduler
 	// pluginScheduler runs outside m.mu before falling back to native selection.
 	pluginScheduler PluginScheduler
 	// homeRuntimeAuths caches auths returned by Home so websocket sessions can
@@ -293,6 +294,7 @@ func NewManager(store Store, selector Selector, hook Hook) *Manager {
 	manager.runtimeConfig.Store(&internalconfig.Config{})
 	manager.apiKeyModelAlias.Store(apiKeyModelAliasTable(nil))
 	manager.scheduler = newAuthScheduler(selector)
+	manager.cooldownPersister = newCooldownStatePersister(manager.persistCooldownStateIDs)
 	return manager
 }
 
@@ -521,14 +523,12 @@ func (m *Manager) SetConfig(cfg *internalconfig.Config) {
 		cfg = &internalconfig.Config{}
 	}
 	m.runtimeConfig.Store(cfg)
-	clearedCooldowns := m.clearDisabledCooldownStates(cfg)
+	clearedCooldownAuthIDs := m.clearDisabledCooldownStates(cfg)
 	if !cfg.Home.Enabled {
 		m.clearHomeRuntimeAuths()
 	}
 	m.rebuildAPIKeyModelAliasFromRuntimeConfig()
-	if clearedCooldowns {
-		m.persistCooldownStates(context.Background())
-	}
+	m.queueCooldownStatePersist(clearedCooldownAuthIDs...)
 }
 
 func (m *Manager) cooldownDisabledForAuth(auth *Auth) bool {
@@ -539,12 +539,13 @@ func (m *Manager) cooldownDisabledForAuth(auth *Auth) bool {
 	return quotaCooldownDisabledForAuthWithConfig(auth, cfg)
 }
 
-func (m *Manager) clearDisabledCooldownStates(cfg *internalconfig.Config) bool {
+func (m *Manager) clearDisabledCooldownStates(cfg *internalconfig.Config) []string {
 	if m == nil {
-		return false
+		return nil
 	}
 	now := time.Now()
 	snapshots := make([]*Auth, 0)
+	authIDs := make([]string, 0)
 	m.mu.Lock()
 	for _, auth := range m.auths {
 		if auth == nil {
@@ -555,6 +556,7 @@ func (m *Manager) clearDisabledCooldownStates(cfg *internalconfig.Config) bool {
 		}
 		if clearCooldownStateForAuth(auth, now) {
 			snapshots = append(snapshots, auth.Clone())
+			authIDs = append(authIDs, auth.ID)
 		}
 	}
 	m.mu.Unlock()
@@ -564,7 +566,7 @@ func (m *Manager) clearDisabledCooldownStates(cfg *internalconfig.Config) bool {
 			m.scheduler.upsertAuth(snapshot)
 		}
 	}
-	return len(snapshots) > 0
+	return authIDs
 }
 
 // RestoreCooldownStates restores unexpired persisted cooldown records into registered auths.
@@ -585,17 +587,23 @@ func (m *Manager) RestoreCooldownStates(ctx context.Context) error {
 	if errLoad != nil {
 		return errLoad
 	}
-	if len(snapshots) == 0 {
-		return nil
-	}
-
 	now := time.Now()
 	authLevelRecords := make([]CooldownStateRecord, 0)
 	snapshotsByID := make(map[string]*Auth)
+	reconcileAuthIDs := make(map[string]struct{}, len(snapshots))
+	for _, snapshot := range snapshots {
+		if authID := strings.TrimSpace(snapshot.AuthID); authID != "" {
+			reconcileAuthIDs[authID] = struct{}{}
+		}
+	}
 
 	m.mu.Lock()
 	for _, snapshot := range snapshots {
-		for _, record := range snapshot.Records {
+		for _, loadedRecord := range snapshot.Records {
+			record := loadedRecord
+			if strings.TrimSpace(record.AuthID) == "" {
+				record.AuthID = strings.TrimSpace(snapshot.AuthID)
+			}
 			if strings.TrimSpace(record.Model) == "" {
 				authLevelRecords = append(authLevelRecords, record)
 				continue
@@ -614,6 +622,11 @@ func (m *Manager) RestoreCooldownStates(ctx context.Context) error {
 			}
 		}
 	}
+	for authID, auth := range m.auths {
+		if len(m.cooldownStateRecordsForAuthLocked(auth, now)) > 0 {
+			reconcileAuthIDs[authID] = struct{}{}
+		}
+	}
 	m.mu.Unlock()
 
 	if m.scheduler != nil {
@@ -621,8 +634,12 @@ func (m *Manager) RestoreCooldownStates(ctx context.Context) error {
 			m.scheduler.upsertAuth(snapshot)
 		}
 	}
-	m.persistCooldownStates(ctx)
-	return nil
+	authIDs := make([]string, 0, len(reconcileAuthIDs))
+	for authID := range reconcileAuthIDs {
+		authIDs = append(authIDs, authID)
+	}
+	m.queueCooldownStatePersist(authIDs...)
+	return m.FlushCooldownStates(ctx)
 }
 
 func (m *Manager) restoreCooldownRecordLocked(record CooldownStateRecord, now time.Time) bool {
@@ -798,7 +815,7 @@ func (m *Manager) ResetQuota(ctx context.Context, authID string) (*Auth, []strin
 		m.scheduler.upsertAuth(snapshot)
 	}
 	if snapshot != nil && cooldownStateChanged {
-		m.persistCooldownStates(ctx)
+		m.queueCooldownStatePersist(authID)
 	}
 	return snapshot, models, nil
 }
@@ -815,25 +832,48 @@ func modelsForRegisteredAuth(authID string) []string {
 	return models
 }
 
-func (m *Manager) persistCooldownStates(ctx context.Context) {
-	if m == nil {
+func (m *Manager) queueCooldownStatePersist(authIDs ...string) {
+	if m == nil || m.cooldownPersister == nil {
 		return
+	}
+	m.mu.RLock()
+	enabled := m.cooldownStore != nil
+	m.mu.RUnlock()
+	if !enabled {
+		return
+	}
+	m.cooldownPersister.mark(authIDs...)
+}
+
+// FlushCooldownStates persists all pending cooldown changes before returning.
+func (m *Manager) FlushCooldownStates(ctx context.Context) error {
+	if m == nil || m.cooldownPersister == nil {
+		return nil
+	}
+	return m.cooldownPersister.flush(ctx)
+}
+
+func (m *Manager) persistCooldownStateIDs(ctx context.Context, authIDs []string) error {
+	if m == nil || len(authIDs) == 0 {
+		return nil
 	}
 	if ctx == nil {
 		ctx = context.Background()
 	}
-	snapshots, store := m.cooldownStateSnapshot()
-	if store == nil {
-		return
+	snapshots, store := m.cooldownStateSnapshots(authIDs)
+	if store == nil || len(snapshots) == 0 {
+		return nil
 	}
-	if errSave := store.Apply(ctx, snapshots); errSave != nil {
-		logEntryWithRequestID(ctx).Warnf("failed to persist cooldown state: %v", errSave)
+	if errApply := store.Apply(ctx, snapshots); errApply != nil {
+		return fmt.Errorf("persist cooldown state: %w", errApply)
 	}
+	return nil
 }
 
-func (m *Manager) cooldownStateSnapshot() ([]CooldownStateSnapshot, CooldownStateStore) {
+func (m *Manager) cooldownStateSnapshots(authIDs []string) ([]CooldownStateSnapshot, CooldownStateStore) {
 	now := time.Now()
-	snapshots := make([]CooldownStateSnapshot, 0)
+	snapshots := make([]CooldownStateSnapshot, 0, len(authIDs))
+	seen := make(map[string]struct{}, len(authIDs))
 
 	m.mu.RLock()
 	store := m.cooldownStore
@@ -841,13 +881,23 @@ func (m *Manager) cooldownStateSnapshot() ([]CooldownStateSnapshot, CooldownStat
 		m.mu.RUnlock()
 		return nil, nil
 	}
-	for _, auth := range m.auths {
-		if auth == nil || strings.TrimSpace(auth.ID) == "" {
+	for _, authID := range authIDs {
+		authID = strings.TrimSpace(authID)
+		if authID == "" {
 			continue
 		}
+		if _, ok := seen[authID]; ok {
+			continue
+		}
+		seen[authID] = struct{}{}
+		auth := m.auths[authID]
+		var records []CooldownStateRecord
+		if auth != nil {
+			records = m.cooldownStateRecordsForAuthLocked(auth, now)
+		}
 		snapshots = append(snapshots, CooldownStateSnapshot{
-			AuthID:  auth.ID,
-			Records: m.cooldownStateRecordsForAuthLocked(auth, now),
+			AuthID:  authID,
+			Records: records,
 		})
 	}
 	m.mu.RUnlock()
@@ -2184,7 +2234,7 @@ func (m *Manager) Register(ctx context.Context, auth *Auth) (*Auth, error) {
 	_ = m.persist(ctx, auth)
 	m.hook.OnAuthRegistered(ctx, auth.Clone())
 	if clearedCooldown {
-		m.persistCooldownStates(ctx)
+		m.queueCooldownStatePersist(auth.ID)
 	}
 	return auth.Clone(), nil
 }
@@ -2246,7 +2296,7 @@ func (m *Manager) Update(ctx context.Context, auth *Auth) (*Auth, error) {
 	_ = m.persist(ctx, auth)
 	m.hook.OnAuthUpdated(ctx, auth.Clone())
 	if clearedCooldown || cooldownStateChanged {
-		m.persistCooldownStates(ctx)
+		m.queueCooldownStatePersist(auth.ID)
 	}
 	for _, model := range resumeModels {
 		registry.GetGlobalRegistry().ClearModelQuotaExceeded(auth.ID, model)
@@ -2345,7 +2395,7 @@ func (m *Manager) Remove(ctx context.Context, id string) {
 			}
 		}
 	}
-	m.persistCooldownStates(ctx)
+	m.queueCooldownStatePersist(id)
 }
 
 func (m *Manager) invalidateSessionAffinity(authID string) {
@@ -3939,7 +3989,7 @@ func (m *Manager) MarkResult(ctx context.Context, result Result) {
 		m.scheduler.upsertAuth(authSnapshot)
 	}
 	if authSnapshot != nil && cooldownStateChanged {
-		m.persistCooldownStates(context.Background())
+		m.queueCooldownStatePersist(result.AuthID)
 	}
 
 	if clearModelQuota && result.Model != "" {
@@ -3966,6 +4016,7 @@ func (m *Manager) removeDeletedAuth(ctx context.Context, authID string, store St
 	if authID == "" {
 		return
 	}
+	m.queueCooldownStatePersist(authID)
 	if store != nil {
 		if err := store.Delete(ctx, authID); err != nil {
 			logEntryWithRequestID(ctx).WithField("auth_id", authID).Warnf("failed to delete unauthorized auth: %v", err)

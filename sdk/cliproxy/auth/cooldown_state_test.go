@@ -15,6 +15,7 @@ type recordingCooldownStateStore struct {
 	applyCount atomic.Int32
 	mu         sync.Mutex
 	snapshots  []CooldownStateSnapshot
+	batches    [][]CooldownStateSnapshot
 	load       []CooldownStateSnapshot
 }
 
@@ -29,7 +30,47 @@ func (s *recordingCooldownStateStore) Apply(_ context.Context, snapshots []Coold
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	s.snapshots = cloneCooldownStateSnapshots(snapshots)
+	s.batches = append(s.batches, cloneCooldownStateSnapshots(snapshots))
 	return nil
+}
+
+func (s *recordingCooldownStateStore) recordedBatches() [][]CooldownStateSnapshot {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	batches := make([][]CooldownStateSnapshot, len(s.batches))
+	for i := range s.batches {
+		batches[i] = cloneCooldownStateSnapshots(s.batches[i])
+	}
+	return batches
+}
+
+type blockingCooldownStateStore struct {
+	started chan struct{}
+	release chan struct{}
+	once    sync.Once
+	recordingCooldownStateStore
+}
+
+func (s *blockingCooldownStateStore) Apply(ctx context.Context, snapshots []CooldownStateSnapshot) error {
+	s.once.Do(func() { close(s.started) })
+	select {
+	case <-ctx.Done():
+		return ctx.Err()
+	case <-s.release:
+	}
+	return s.recordingCooldownStateStore.Apply(ctx, snapshots)
+}
+
+type failingCooldownStateStore struct {
+	fail atomic.Bool
+	recordingCooldownStateStore
+}
+
+func (s *failingCooldownStateStore) Apply(ctx context.Context, snapshots []CooldownStateSnapshot) error {
+	if s.fail.Load() {
+		return errors.New("cooldown store unavailable")
+	}
+	return s.recordingCooldownStateStore.Apply(ctx, snapshots)
 }
 
 func cloneCooldownStateSnapshots(snapshots []CooldownStateSnapshot) []CooldownStateSnapshot {
@@ -245,6 +286,9 @@ func TestManager_MarkResult_PersistsCooldownOnlyWhenStateChanges(t *testing.T) {
 	}
 
 	manager.MarkResult(context.Background(), Result{AuthID: auth.ID, Provider: "xai", Model: "grok-4", Success: true})
+	if errFlush := manager.FlushCooldownStates(context.Background()); errFlush != nil {
+		t.Fatalf("FlushCooldownStates() returned error: %v", errFlush)
+	}
 	if got := store.applyCount.Load(); got != 0 {
 		t.Fatalf("healthy success saved cooldown state %d times, want 0", got)
 	}
@@ -256,18 +300,142 @@ func TestManager_MarkResult_PersistsCooldownOnlyWhenStateChanges(t *testing.T) {
 		Success:  false,
 		Error:    &Error{Message: "upstream unavailable", HTTPStatus: 500},
 	})
+	if errFlush := manager.FlushCooldownStates(context.Background()); errFlush != nil {
+		t.Fatalf("FlushCooldownStates() returned error: %v", errFlush)
+	}
 	if got := store.applyCount.Load(); got != 1 {
 		t.Fatalf("cooldown failure saved cooldown state %d times, want 1", got)
 	}
-
-	manager.MarkResult(context.Background(), Result{AuthID: auth.ID, Provider: "xai", Model: "grok-4", Success: true})
-	if got := store.applyCount.Load(); got != 2 {
-		t.Fatalf("cooldown clear saved cooldown state %d times, want 2", got)
+	batches := store.recordedBatches()
+	if len(batches) != 1 || len(batches[0]) != 1 || batches[0][0].AuthID != auth.ID || len(batches[0][0].Records) == 0 {
+		t.Fatalf("cooldown failure batches = %+v, want one auth-1 snapshot", batches)
 	}
 
 	manager.MarkResult(context.Background(), Result{AuthID: auth.ID, Provider: "xai", Model: "grok-4", Success: true})
+	if errFlush := manager.FlushCooldownStates(context.Background()); errFlush != nil {
+		t.Fatalf("FlushCooldownStates() returned error: %v", errFlush)
+	}
+	if got := store.applyCount.Load(); got != 2 {
+		t.Fatalf("cooldown clear saved cooldown state %d times, want 2", got)
+	}
+	batches = store.recordedBatches()
+	if len(batches) != 2 || len(batches[1]) != 1 || batches[1][0].AuthID != auth.ID || len(batches[1][0].Records) != 0 {
+		t.Fatalf("cooldown clear batches = %+v, want empty auth-1 snapshot", batches)
+	}
+
+	manager.MarkResult(context.Background(), Result{AuthID: auth.ID, Provider: "xai", Model: "grok-4", Success: true})
+	if errFlush := manager.FlushCooldownStates(context.Background()); errFlush != nil {
+		t.Fatalf("FlushCooldownStates() returned error: %v", errFlush)
+	}
 	if got := store.applyCount.Load(); got != 2 {
 		t.Fatalf("clean success saved cooldown state %d times, want 2", got)
+	}
+}
+
+func TestManager_MarkResult_DoesNotWaitForCooldownStore(t *testing.T) {
+	store := &blockingCooldownStateStore{
+		started: make(chan struct{}),
+		release: make(chan struct{}),
+	}
+	manager := NewManager(nil, nil, nil)
+	manager.SetCooldownStateStore(store)
+	if _, errRegister := manager.Register(WithSkipPersist(context.Background()), &Auth{ID: "auth-1", Provider: "xai", Status: StatusActive}); errRegister != nil {
+		t.Fatalf("Register() returned error: %v", errRegister)
+	}
+
+	done := make(chan struct{})
+	go func() {
+		manager.MarkResult(context.Background(), Result{
+			AuthID:   "auth-1",
+			Provider: "xai",
+			Model:    "grok-4",
+			Success:  false,
+			Error:    &Error{Message: "rate limited", HTTPStatus: 429},
+		})
+		close(done)
+	}()
+
+	select {
+	case <-done:
+	case <-time.After(time.Second):
+		t.Fatal("MarkResult blocked on cooldown persistence")
+	}
+	select {
+	case <-store.started:
+	case <-time.After(time.Second):
+		t.Fatal("cooldown Apply did not start")
+	}
+	close(store.release)
+	if errFlush := manager.FlushCooldownStates(context.Background()); errFlush != nil {
+		t.Fatalf("FlushCooldownStates() returned error: %v", errFlush)
+	}
+}
+
+func TestManager_FlushCooldownStates_RetainsFailedBatch(t *testing.T) {
+	store := &failingCooldownStateStore{}
+	store.fail.Store(true)
+	manager := NewManager(nil, nil, nil)
+	manager.SetCooldownStateStore(store)
+	if _, errRegister := manager.Register(WithSkipPersist(context.Background()), &Auth{ID: "auth-1", Provider: "xai", Status: StatusActive}); errRegister != nil {
+		t.Fatalf("Register() returned error: %v", errRegister)
+	}
+	manager.MarkResult(context.Background(), Result{
+		AuthID:   "auth-1",
+		Provider: "xai",
+		Model:    "grok-4",
+		Success:  false,
+		Error:    &Error{Message: "rate limited", HTTPStatus: 429},
+	})
+
+	if errFlush := manager.FlushCooldownStates(context.Background()); errFlush == nil {
+		t.Fatal("FlushCooldownStates() returned nil error while store was failing")
+	}
+	store.fail.Store(false)
+	if errFlush := manager.FlushCooldownStates(context.Background()); errFlush != nil {
+		t.Fatalf("FlushCooldownStates() retry returned error: %v", errFlush)
+	}
+	batches := store.recordedBatches()
+	if len(batches) == 0 || len(batches[len(batches)-1]) != 1 || batches[len(batches)-1][0].AuthID != "auth-1" {
+		t.Fatalf("successful retry batches = %+v, want auth-1", batches)
+	}
+}
+
+func TestManager_FlushCooldownStates_PersistsChangeDuringApply(t *testing.T) {
+	store := &blockingCooldownStateStore{
+		started: make(chan struct{}),
+		release: make(chan struct{}),
+	}
+	manager := NewManager(nil, nil, nil)
+	manager.SetCooldownStateStore(store)
+	if _, errRegister := manager.Register(WithSkipPersist(context.Background()), &Auth{ID: "auth-1", Provider: "xai", Status: StatusActive}); errRegister != nil {
+		t.Fatalf("Register() returned error: %v", errRegister)
+	}
+	manager.MarkResult(context.Background(), Result{
+		AuthID:   "auth-1",
+		Provider: "xai",
+		Model:    "grok-4",
+		Success:  false,
+		Error:    &Error{Message: "rate limited", HTTPStatus: 429},
+	})
+
+	select {
+	case <-store.started:
+	case <-time.After(time.Second):
+		t.Fatal("cooldown Apply did not start")
+	}
+	manager.MarkResult(context.Background(), Result{AuthID: "auth-1", Provider: "xai", Model: "grok-4", Success: true})
+	close(store.release)
+	if errFlush := manager.FlushCooldownStates(context.Background()); errFlush != nil {
+		t.Fatalf("FlushCooldownStates() returned error: %v", errFlush)
+	}
+
+	batches := store.recordedBatches()
+	if len(batches) < 2 {
+		t.Fatalf("recorded batches = %+v, want failure and clear batches", batches)
+	}
+	lastBatch := batches[len(batches)-1]
+	if len(lastBatch) != 1 || lastBatch[0].AuthID != "auth-1" || len(lastBatch[0].Records) != 0 {
+		t.Fatalf("last batch = %+v, want empty auth-1 snapshot", lastBatch)
 	}
 }
 
