@@ -83,8 +83,8 @@ type Service struct {
 	// watcherCancel cancels the watcher context.
 	watcherCancel context.CancelFunc
 
-	// authUpdates channel for authentication updates.
-	authUpdates chan watcher.AuthUpdate
+	// authUpdates channel for authentication update batches.
+	authUpdates chan watcher.AuthUpdateBatch
 
 	// authQueueStop cancels the auth update queue processing.
 	authQueueStop context.CancelFunc
@@ -100,6 +100,14 @@ type Service struct {
 
 	// pluginHost owns dynamic plugin lifecycle and runtime capability adapters.
 	pluginHost *pluginhost.Host
+
+	// progressiveFileAuth reports that this Service owns the default file-backed auth manager.
+	progressiveFileAuth bool
+
+	serviceStartedAt  time.Time
+	listenerReadyAt   time.Time
+	firstFileAuthOnce sync.Once
+	autoRefreshOnce   sync.Once
 
 	// shutdownOnce ensures shutdown is called only once.
 	shutdownOnce sync.Once
@@ -442,7 +450,7 @@ func (s *Service) ensureAuthUpdateQueue(ctx context.Context) {
 		return
 	}
 	if s.authUpdates == nil {
-		s.authUpdates = make(chan watcher.AuthUpdate, 256)
+		s.authUpdates = make(chan watcher.AuthUpdateBatch, 256)
 	}
 	if s.authQueueStop != nil {
 		return
@@ -458,21 +466,26 @@ func (s *Service) consumeAuthUpdates(ctx context.Context) {
 		select {
 		case <-ctx.Done():
 			return
-		case update, ok := <-s.authUpdates:
+		case batch, ok := <-s.authUpdates:
 			if !ok {
 				return
 			}
-			updates := []watcher.AuthUpdate{update}
-		labelDrain:
-			for {
+			results := s.handleAuthUpdates(ctx, batch.Updates)
+			if batch.Initial && hasLoadedAuthUpdate(results) {
+				s.firstFileAuthOnce.Do(func() {
+					log.WithFields(log.Fields{
+						"process_start_to_listener": s.listenerReadyAt.Sub(s.serviceStartedAt),
+						"listener_to_first_auth":    time.Since(s.listenerReadyAt),
+					}).Info("first file auth batch available")
+				})
+			}
+			if batch.Result != nil {
 				select {
-				case nextUpdate := <-s.authUpdates:
-					updates = append(updates, nextUpdate)
-				default:
-					break labelDrain
+				case batch.Result <- results:
+				case <-ctx.Done():
+					return
 				}
 			}
-			s.handleAuthUpdates(ctx, updates)
 		}
 	}
 }
@@ -489,7 +502,7 @@ func (s *Service) emitAuthUpdate(ctx context.Context, update watcher.AuthUpdate)
 	}
 	if s.authUpdates != nil {
 		select {
-		case s.authUpdates <- update:
+		case s.authUpdates <- watcher.AuthUpdateBatch{Updates: []watcher.AuthUpdate{update}}:
 			return
 		default:
 			log.Debugf("auth update queue saturated, applying inline action=%v id=%s", update.Action, update.ID)
@@ -499,26 +512,31 @@ func (s *Service) emitAuthUpdate(ctx context.Context, update watcher.AuthUpdate)
 }
 
 func (s *Service) handleAuthUpdate(ctx context.Context, update watcher.AuthUpdate) {
-	s.handleAuthUpdates(ctx, []watcher.AuthUpdate{update})
+	_ = s.handleAuthUpdates(ctx, []watcher.AuthUpdate{update})
 }
 
-func (s *Service) handleAuthUpdates(ctx context.Context, updates []watcher.AuthUpdate) {
+func (s *Service) handleAuthUpdates(ctx context.Context, updates []watcher.AuthUpdate) []watcher.AuthUpdateResult {
 	if s == nil {
-		return
+		return nil
 	}
 	updates = coalesceAuthUpdates(updates)
+	results := make([]watcher.AuthUpdateResult, len(updates))
+	for i, update := range updates {
+		results[i].ID = authUpdateID(update)
+	}
 	s.cfgMu.RLock()
 	cfg := s.cfg
 	s.cfgMu.RUnlock()
 	if cfg == nil || s.coreManager == nil {
-		return
+		return results
 	}
 
 	registrationCtx := coreauth.WithDeferredAPIKeyModelAliasRebuild(ctx)
 	tasks := make([]modelRegistrationTask, 0, len(updates))
+	loaded := make([]int, 0, len(updates))
 	needsPluginSync := false
 	needsAliasRebuild := false
-	for _, update := range updates {
+	for i, update := range updates {
 		switch update.Action {
 		case watcher.AuthUpdateActionAdd, watcher.AuthUpdateActionModify:
 			if update.Auth == nil || update.Auth.ID == "" {
@@ -542,6 +560,7 @@ func (s *Service) handleAuthUpdates(ctx context.Context, updates []watcher.AuthU
 					s.completeModelRegistrationForAuthWithCache(registrationTaskCtx, authForRegistration, compatCache)
 				},
 			})
+			loaded = append(loaded, i)
 			needsPluginSync = true
 		case watcher.AuthUpdateActionDelete:
 			id := update.ID
@@ -553,6 +572,8 @@ func (s *Service) handleAuthUpdates(ctx context.Context, updates []watcher.AuthU
 			}
 			s.applyCoreAuthRemoval(registrationCtx, id)
 			needsAliasRebuild = true
+			results[i].Loaded = true
+			needsPluginSync = true
 		default:
 			log.Debugf("received unknown auth update action: %v", update.Action)
 		}
@@ -565,6 +586,21 @@ func (s *Service) handleAuthUpdates(ctx context.Context, updates []watcher.AuthU
 	if needsPluginSync {
 		s.syncPluginRuntime(registrationCtx)
 	}
+	if ctx == nil || ctx.Err() == nil {
+		for _, i := range loaded {
+			results[i].Loaded = true
+		}
+	}
+	return results
+}
+
+func hasLoadedAuthUpdate(results []watcher.AuthUpdateResult) bool {
+	for _, result := range results {
+		if result.Loaded {
+			return true
+		}
+	}
+	return false
 }
 
 func coalesceAuthUpdates(updates []watcher.AuthUpdate) []watcher.AuthUpdate {
@@ -762,7 +798,6 @@ func (s *Service) applyCoreAuthRemoval(ctx context.Context, id string) {
 	if strings.EqualFold(provider, "xai") {
 		executor.CloseXAIWebsocketSessionsForAuthID(id, "auth_removed")
 	}
-	s.syncPluginRuntime(ctx)
 }
 
 func (s *Service) applyRetryConfig(cfg *config.Config) {
@@ -1360,6 +1395,8 @@ func (s *Service) applyConfigUpdateWithAuthSynthesis(newCfg *config.Config, synt
 	}
 	ctx := coreauth.WithSkipPersist(context.Background())
 	s.syncPluginRuntimeConfig(ctx)
+	progressiveFullScanPending := !synthesizeConfigAuths && s.progressiveFileAuth && s.watcher != nil &&
+		s.watcher.AuthLoadStatus().State == watcher.AuthLoadStateLoading
 	var auths []*coreauth.Auth
 	if s.coreManager != nil {
 		auths = s.coreManager.List()
@@ -1372,12 +1409,14 @@ func (s *Service) applyConfigUpdateWithAuthSynthesis(newCfg *config.Config, synt
 	if synthesizeConfigAuths {
 		s.registerConfigAPIKeyAuths(ctx, newCfg)
 	}
-	if s.coreManager != nil && !newCfg.Home.Enabled && newCfg.SaveCooldownStatus {
+	if !progressiveFullScanPending && s.coreManager != nil && !newCfg.Home.Enabled && newCfg.SaveCooldownStatus {
 		if errRestoreCooldown := s.coreManager.RestoreCooldownStates(context.Background()); errRestoreCooldown != nil {
 			log.Warnf("failed to restore cooldown state after config update: %v", errRestoreCooldown)
 		}
 	}
-	s.syncPluginModelRuntime(ctx)
+	if !progressiveFullScanPending {
+		s.syncPluginModelRuntime(ctx)
+	}
 }
 
 func (s *Service) reloadConfigFromWatcher() bool {
@@ -1430,6 +1469,79 @@ func (s *Service) registerConfigAPIKeyAuths(ctx context.Context, cfg *config.Con
 		s.coreManager.RefreshAPIKeyModelAlias()
 	}
 	s.runModelRegistrationTasks(registrationCtx, tasks)
+}
+
+func (s *Service) beforeProgressiveAuthLoad(ctx context.Context) error {
+	if s == nil || s.coreManager == nil || s.cfg == nil {
+		return nil
+	}
+	if s.cfg.SaveCooldownStatus {
+		if errPrepare := s.coreManager.PrepareCooldownRestore(ctx); errPrepare != nil {
+			return fmt.Errorf("prepare cooldown restore: %w", errPrepare)
+		}
+	}
+	s.registerConfigAPIKeyAuths(coreauth.WithSkipPersist(ctx), s.cfg)
+	return nil
+}
+
+func (s *Service) afterProgressiveAuthLoad(ctx context.Context) error {
+	if s == nil || s.coreManager == nil {
+		return nil
+	}
+	var errComplete error
+	if s.cfg != nil && s.cfg.SaveCooldownStatus {
+		if errCooldown := s.coreManager.CompleteCooldownRestore(ctx); errCooldown != nil {
+			errComplete = fmt.Errorf("complete cooldown restore: %w", errCooldown)
+		}
+	}
+	s.syncPluginModelRuntime(ctx)
+	s.startCoreAuthAutoRefresh(ctx)
+	return errComplete
+}
+
+func (s *Service) startCoreAuthAutoRefresh(ctx context.Context) {
+	if s == nil || s.coreManager == nil {
+		return
+	}
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	s.autoRefreshOnce.Do(func() {
+		interval := 15 * time.Minute
+		s.coreManager.StartAutoRefresh(ctx, interval)
+		log.Infof("core auth auto-refresh started (interval=%s)", interval)
+	})
+}
+
+func (s *Service) setupFileWatcher(ctx context.Context) (*WatcherWrapper, error) {
+	if s == nil || s.cfg == nil || s.watcherFactory == nil {
+		return nil, fmt.Errorf("create watcher: service is not configured")
+	}
+	watcherWrapper, errCreate := s.watcherFactory(s.configPath, s.cfg.AuthDir, func(newCfg *config.Config) {
+		s.applyWatcherConfigUpdate(newCfg)
+	})
+	if errCreate != nil {
+		return nil, fmt.Errorf("create watcher: %w", errCreate)
+	}
+	s.watcher = watcherWrapper
+	s.ensureAuthUpdateQueue(ctx)
+	watcherWrapper.SetAuthUpdateQueue(s.authUpdates)
+	watcherWrapper.SetConfig(s.cfg)
+	s.registerPluginAuthParser()
+	watcherWrapper.SetFileAuthLoadingEnabled(s.progressiveFileAuth)
+	if s.progressiveFileAuth {
+		watcherWrapper.SetAuthLoadHooks(watcher.AuthLoadHooks{
+			Before: s.beforeProgressiveAuthLoad,
+			After:  s.afterProgressiveAuthLoad,
+		})
+	}
+	watcherCtx, watcherCancel := context.WithCancel(ctx)
+	s.watcherCancel = watcherCancel
+	if errStart := watcherWrapper.Start(watcherCtx); errStart != nil {
+		watcherCancel()
+		return nil, fmt.Errorf("start watcher: %w", errStart)
+	}
+	return watcherWrapper, nil
 }
 
 func forceHomeRuntimeConfig(cfg *config.Config) {
@@ -1635,6 +1747,7 @@ func (s *Service) Run(ctx context.Context) error {
 	if s == nil {
 		return fmt.Errorf("cliproxy: service is nil")
 	}
+	s.serviceStartedAt = time.Now()
 	if ctx == nil {
 		ctx = context.Background()
 	}
@@ -1653,6 +1766,8 @@ func (s *Service) Run(ctx context.Context) error {
 			log.Errorf("service shutdown returned error: %v", err)
 		}
 	}()
+	runCtx, runCancel := context.WithCancel(ctx)
+	defer runCancel()
 
 	if !homeEnabled {
 		if errEnsureAuthDir := s.ensureAuthDir(); errEnsureAuthDir != nil {
@@ -1661,7 +1776,7 @@ func (s *Service) Run(ctx context.Context) error {
 	}
 
 	if s.cfg != nil {
-		if err := internalusage.UpdatePersistence(ctx, s.cfg.UsagePersistenceEnabled, s.cfg.AuthDir); err != nil {
+		if err := internalusage.UpdatePersistence(runCtx, s.cfg.UsagePersistenceEnabled, s.cfg.AuthDir); err != nil {
 			if s.cfg.UsagePersistenceEnabled {
 				return fmt.Errorf("cliproxy: initialize usage persistence: %w", err)
 			}
@@ -1672,21 +1787,23 @@ func (s *Service) Run(ctx context.Context) error {
 	s.applyRetryConfig(s.cfg)
 	s.configureCooldownStateStore(s.cfg)
 
-	s.registerPluginAuthParser()
 	if s.coreManager != nil && !homeEnabled {
-		if errLoad := s.coreManager.Load(ctx); errLoad != nil {
-			log.Warnf("failed to load auth store: %v", errLoad)
-		}
-		s.registerConfigAPIKeyAuths(coreauth.WithSkipPersist(ctx), s.cfg)
-		if s.cfg.SaveCooldownStatus {
-			if errRestoreCooldown := s.coreManager.RestoreCooldownStates(ctx); errRestoreCooldown != nil {
-				log.Warnf("failed to restore cooldown state: %v", errRestoreCooldown)
+		if !s.progressiveFileAuth {
+			startupCtx := coreauth.WithSkipPersist(runCtx)
+			if errLoad := s.coreManager.Load(runCtx); errLoad != nil {
+				log.Warnf("failed to load auth store: %v", errLoad)
+			}
+			s.registerConfigAPIKeyAuths(startupCtx, s.cfg)
+			if s.cfg.SaveCooldownStatus {
+				if errRestoreCooldown := s.coreManager.RestoreCooldownStates(runCtx); errRestoreCooldown != nil {
+					log.Warnf("failed to restore cooldown state: %v", errRestoreCooldown)
+				}
 			}
 		}
 	}
 
 	if !homeEnabled {
-		tokenResult, err := s.tokenProvider.Load(ctx, s.cfg)
+		tokenResult, err := s.tokenProvider.Load(runCtx, s.cfg)
 		if err != nil && !errors.Is(err, context.Canceled) {
 			return err
 		}
@@ -1694,7 +1811,7 @@ func (s *Service) Run(ctx context.Context) error {
 			tokenResult = &TokenClientResult{}
 		}
 
-		apiKeyResult, err := s.apiKeyProvider.Load(ctx, s.cfg)
+		apiKeyResult, err := s.apiKeyProvider.Load(runCtx, s.cfg)
 		if err != nil && !errors.Is(err, context.Canceled) {
 			return err
 		}
@@ -1707,18 +1824,34 @@ func (s *Service) Run(ctx context.Context) error {
 
 	s.ensureWebsocketGateway()
 	if homeEnabled {
-		s.registerAvailableExecutors(ctx, executorRegistrationOptions{
+		s.registerAvailableExecutors(runCtx, executorRegistrationOptions{
 			includeBaseline: true,
 		})
 		// Home mode does not expose in-process Redis RESP usage output; usage is forwarded to home instead.
 		redisqueue.SetEnabled(true)
 	}
 
+	var watcherWrapper *WatcherWrapper
+	if !homeEnabled {
+		var errWatcher error
+		watcherWrapper, errWatcher = s.setupFileWatcher(runCtx)
+		if errWatcher != nil {
+			return fmt.Errorf("cliproxy: %w", errWatcher)
+		}
+	}
+
+	serverOptions := append([]api.ServerOption(nil), s.serverOptions...)
+	if watcherWrapper != nil {
+		serverOptions = append(serverOptions,
+			api.WithAuthLoadStatusProvider(watcherWrapper.AuthLoadStatus),
+			api.WithAuthFileMutationHook(watcherWrapper.MarkAuthPathChanged),
+		)
+	}
 	// handlers no longer depend on legacy clients; pass nil slice initially
-	s.server = api.NewServer(s.cfg, s.coreManager, s.accessManager, s.configPath, s.serverOptions...)
-	s.syncPluginRuntimeConfig(ctx)
+	s.server = api.NewServer(s.cfg, s.coreManager, s.accessManager, s.configPath, serverOptions...)
+	s.syncPluginRuntimeConfig(runCtx)
 	if homeEnabled {
-		s.syncPluginModelRuntime(ctx)
+		s.syncPluginModelRuntime(runCtx)
 	}
 
 	if s.authManager == nil {
@@ -1726,7 +1859,7 @@ func (s *Service) Run(ctx context.Context) error {
 	}
 
 	if homeEnabled {
-		s.startHomeSubscriber(ctx)
+		s.startHomeSubscriber(runCtx)
 	}
 
 	if s.server != nil && s.wsGateway != nil {
@@ -1762,7 +1895,26 @@ func (s *Service) Run(ctx context.Context) error {
 		}
 	}()
 
-	time.Sleep(100 * time.Millisecond)
+	select {
+	case addr, ok := <-s.server.Listening():
+		if !ok || addr == nil {
+			return fmt.Errorf("cliproxy: server stopped before listener became ready")
+		}
+		s.listenerReadyAt = time.Now()
+		log.WithField("address", addr.String()).Info("API server listener ready")
+	case errServer := <-s.serverErr:
+		return errServer
+	case <-runCtx.Done():
+		return runCtx.Err()
+	}
+
+	if s.progressiveFileAuth && watcherWrapper != nil {
+		watcherWrapper.StartInitialAuthLoad(runCtx, s.cfg.AuthLoadWorkers)
+	} else if s.coreManager != nil && !homeEnabled {
+		s.registerModelsForAuthBatch(runCtx, s.coreManager.List())
+		s.startCoreAuthAutoRefresh(runCtx)
+	}
+
 	fmt.Printf("API server started successfully on: %s:%d\n", s.cfg.Host, s.cfg.Port)
 
 	s.applyPprofConfig(s.cfg)
@@ -1771,44 +1923,12 @@ func (s *Service) Run(ctx context.Context) error {
 		s.hooks.OnAfterStart(s)
 	}
 
-	if !homeEnabled {
-		var watcherWrapper *WatcherWrapper
-		reloadCallback := func(newCfg *config.Config) { s.applyWatcherConfigUpdate(newCfg) }
-
-		watcherWrapper, errCreate := s.watcherFactory(s.configPath, s.cfg.AuthDir, reloadCallback)
-		if errCreate != nil {
-			return fmt.Errorf("cliproxy: failed to create watcher: %w", errCreate)
-		}
-		s.watcher = watcherWrapper
-		s.ensureAuthUpdateQueue(ctx)
-		if s.authUpdates != nil {
-			watcherWrapper.SetAuthUpdateQueue(s.authUpdates)
-		}
-		watcherWrapper.SetConfig(s.cfg)
-		s.registerPluginAuthParser()
-
-		watcherCtx, watcherCancel := context.WithCancel(context.Background())
-		s.watcherCancel = watcherCancel
-		if errStart := watcherWrapper.Start(watcherCtx); errStart != nil {
-			return fmt.Errorf("cliproxy: failed to start watcher: %w", errStart)
-		}
-		log.Info("file watcher started for config and auth directory changes")
-		s.syncPluginModelRuntime(ctx)
-	}
-
 	s.registerModelRefreshCallback()
 
-	// Prefer core auth manager auto refresh if available.
-	if s.coreManager != nil && !homeEnabled {
-		interval := 15 * time.Minute
-		s.coreManager.StartAutoRefresh(context.Background(), interval)
-		log.Infof("core auth auto-refresh started (interval=%s)", interval)
-	}
-
 	select {
-	case <-ctx.Done():
+	case <-runCtx.Done():
 		log.Debug("service context cancelled, shutting down...")
-		return ctx.Err()
+		return runCtx.Err()
 	case errServer := <-s.serverErr:
 		return errServer
 	}
