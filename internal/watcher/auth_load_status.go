@@ -1,6 +1,9 @@
 package watcher
 
-import "time"
+import (
+	"context"
+	"time"
+)
 
 type AuthLoadState string
 
@@ -31,11 +34,28 @@ func (w *Watcher) publishAuthLoadStatus(status AuthLoadStatus) {
 	if w == nil {
 		return
 	}
+	w.storeAuthLoadStatus(status)
+}
+
+func (w *Watcher) storeAuthLoadStatus(status AuthLoadStatus) {
 	if status.CompletedAt != nil {
 		completed := *status.CompletedAt
 		status.CompletedAt = &completed
 	}
 	w.authLoadStatus.Store(status)
+}
+
+func (w *Watcher) publishAuthLoadStatusForScan(ctx context.Context, sequence uint64, status AuthLoadStatus) bool {
+	if w == nil || ctx == nil || ctx.Err() != nil {
+		return false
+	}
+	w.authLoadMu.Lock()
+	defer w.authLoadMu.Unlock()
+	if w.authLoadSequence != sequence || ctx.Err() != nil {
+		return false
+	}
+	w.storeAuthLoadStatus(status)
+	return true
 }
 
 func (w *Watcher) AuthLoadStatus() AuthLoadStatus {

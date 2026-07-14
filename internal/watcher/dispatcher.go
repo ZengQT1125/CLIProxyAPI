@@ -285,26 +285,38 @@ func (w *Watcher) getAuthQueue() chan<- AuthUpdateBatch {
 	return w.authQueue
 }
 
-func (w *Watcher) dispatchInitialAuthBatch(ctx context.Context, updates []AuthUpdate) []AuthUpdateResult {
+func (w *Watcher) dispatchInitialAuthBatch(ctx context.Context, sequence uint64, updates []AuthUpdate) ([]AuthUpdateResult, bool) {
+	if ctx == nil || ctx.Err() != nil || !w.authLoadScanActive(ctx, sequence) {
+		return nil, false
+	}
 	if len(updates) == 0 {
-		return nil
+		return nil, true
 	}
 	queue := w.getAuthQueue()
 	if queue == nil {
-		return nil
+		return nil, true
 	}
 	resultCh := make(chan []AuthUpdateResult, 1)
 	batch := AuthUpdateBatch{Updates: updates, Result: resultCh, Initial: true}
+	if ctx.Err() != nil || !w.authLoadScanActive(ctx, sequence) {
+		return nil, false
+	}
 	select {
 	case queue <- batch:
 	case <-ctx.Done():
-		return nil
+		return nil, false
+	}
+	if ctx.Err() != nil || !w.authLoadScanActive(ctx, sequence) {
+		return nil, false
 	}
 	select {
 	case results := <-resultCh:
-		return results
+		if ctx.Err() != nil || !w.authLoadScanActive(ctx, sequence) {
+			return nil, false
+		}
+		return results, true
 	case <-ctx.Done():
-		return nil
+		return nil, false
 	}
 }
 

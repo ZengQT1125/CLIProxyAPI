@@ -46,10 +46,21 @@ type initialAuthReadResult struct {
 	hash              string
 	native            synthesizer.NativeAuthFileResult
 	readTime          time.Duration
-	synthTime         time.Duration
+	nativeSynthTime   time.Duration
 	err               error
 	enumerationResult bool
 	discovered        int64
+	enumerationTime   time.Duration
+}
+
+type authLoadMetrics struct {
+	started              time.Time
+	lastLog              time.Time
+	directoryEnumeration time.Duration
+	fileRead             time.Duration
+	nativeSynthesis      time.Duration
+	pluginSynthesis      time.Duration
+	batchRegistration    time.Duration
 }
 
 func (w *Watcher) StartInitialAuthLoad(ctx context.Context, workers int) <-chan struct{} {
@@ -70,29 +81,33 @@ func (w *Watcher) StartInitialAuthLoad(ctx context.Context, workers int) <-chan 
 	if w.authLoadCancel != nil {
 		w.authLoadCancel()
 	}
+	w.authLoadSequence++
+	sequence := w.authLoadSequence
 	w.authLoadCancel = cancel
 	w.authLoadDone = done
-	isInitialScan := w.authLoadSequence == 0
-	w.authLoadSequence++
+	isInitialScan := sequence == 1
+	status := AuthLoadStatus{State: AuthLoadStateLoading, StartedAt: time.Now().UTC()}
+	w.storeAuthLoadStatus(status)
 	w.authLoadMu.Unlock()
-	w.publishAuthLoadStatus(AuthLoadStatus{State: AuthLoadStateLoading, StartedAt: time.Now().UTC()})
-	go w.runInitialAuthLoad(loadCtx, workers, done, isInitialScan)
+	go w.runInitialAuthLoad(loadCtx, workers, done, sequence, isInitialScan, status)
 	return done
 }
 
-func (w *Watcher) runInitialAuthLoad(ctx context.Context, workers int, done chan struct{}, isInitialScan bool) {
+func (w *Watcher) runInitialAuthLoad(ctx context.Context, workers int, done chan struct{}, sequence uint64, isInitialScan bool, status AuthLoadStatus) {
 	defer close(done)
 	w.authLoadMu.Lock()
 	hooks := w.authLoadHooks
 	w.authLoadMu.Unlock()
+	if !w.authLoadScanActive(ctx, sequence) {
+		return
+	}
 	if hooks.Before != nil {
 		if errBefore := hooks.Before(ctx); errBefore != nil {
-			w.publishTerminalAuthLoadStatus(true, true)
+			w.publishTerminalAuthLoadStatus(ctx, sequence, status, true, true)
 			return
 		}
 	}
-	if ctx.Err() != nil {
-		w.publishTerminalAuthLoadStatus(false, false)
+	if !w.authLoadScanActive(ctx, sequence) {
 		return
 	}
 	snapshot := w.snapshotAuthLoadInputs()
@@ -113,7 +128,29 @@ func (w *Watcher) runInitialAuthLoad(ctx context.Context, workers int, done chan
 		workersWG.Wait()
 		close(results)
 	}()
-	w.aggregateInitialAuthResults(ctx, snapshot, results, baseline, hooks.After)
+	w.aggregateInitialAuthResults(ctx, sequence, status, snapshot, results, baseline, hooks.After)
+}
+
+func (w *Watcher) authLoadScanActive(ctx context.Context, sequence uint64) bool {
+	if w == nil || ctx == nil || ctx.Err() != nil {
+		return false
+	}
+	w.authLoadMu.Lock()
+	defer w.authLoadMu.Unlock()
+	return w.authLoadSequence == sequence && ctx.Err() == nil
+}
+
+func (w *Watcher) withActiveAuthLoadScan(ctx context.Context, sequence uint64, action func()) bool {
+	if w == nil || ctx == nil || ctx.Err() != nil {
+		return false
+	}
+	w.authLoadMu.Lock()
+	defer w.authLoadMu.Unlock()
+	if w.authLoadSequence != sequence || ctx.Err() != nil {
+		return false
+	}
+	action()
+	return true
 }
 
 func (w *Watcher) snapshotAuthLoadInputs() authLoadSnapshot {
@@ -141,9 +178,10 @@ func (w *Watcher) snapshotFileGenerationBaseline(isInitialScan bool) map[string]
 }
 
 func (w *Watcher) enumerateInitialAuthFiles(ctx context.Context, snapshot authLoadSnapshot, jobs chan<- initialAuthJob, results chan<- initialAuthReadResult, isInitialScan bool) {
+	enumerationStarted := time.Now()
 	entries, errReadDir := os.ReadDir(snapshot.authDir)
 	if errReadDir != nil {
-		w.sendInitialAuthResult(ctx, results, initialAuthReadResult{enumerationResult: true, err: errReadDir})
+		w.sendInitialAuthResult(ctx, results, initialAuthReadResult{enumerationResult: true, err: errReadDir, enumerationTime: time.Since(enumerationStarted)})
 		return
 	}
 	var discovered int64
@@ -169,7 +207,7 @@ func (w *Watcher) enumerateInitialAuthFiles(ctx context.Context, snapshot authLo
 			return
 		}
 	}
-	w.sendInitialAuthResult(ctx, results, initialAuthReadResult{enumerationResult: true, discovered: discovered})
+	w.sendInitialAuthResult(ctx, results, initialAuthReadResult{enumerationResult: true, discovered: discovered, enumerationTime: time.Since(enumerationStarted)})
 }
 
 func (w *Watcher) initialAuthReadWorker(ctx context.Context, snapshot authLoadSnapshot, jobs <-chan initialAuthJob, results chan<- initialAuthReadResult) {
@@ -195,7 +233,7 @@ func (w *Watcher) initialAuthReadWorker(ctx context.Context, snapshot authLoadSn
 				result.native, result.err = synthesizer.SynthesizeNativeAuthFile(&synthesizer.SynthesisContext{
 					Config: snapshot.config, AuthDir: snapshot.authDir, Now: snapshot.now, IDGenerator: synthesizer.NewStableIDGenerator(),
 				}, job.path, result.raw)
-				result.synthTime = time.Since(synthStarted)
+				result.nativeSynthTime = time.Since(synthStarted)
 			}
 			if !w.sendInitialAuthResult(ctx, results, result) {
 				return
@@ -205,6 +243,9 @@ func (w *Watcher) initialAuthReadWorker(ctx context.Context, snapshot authLoadSn
 }
 
 func (w *Watcher) sendInitialAuthResult(ctx context.Context, results chan<- initialAuthReadResult, result initialAuthReadResult) bool {
+	if ctx.Err() != nil {
+		return false
+	}
 	select {
 	case results <- result:
 		return true
@@ -213,34 +254,71 @@ func (w *Watcher) sendInitialAuthResult(ctx context.Context, results chan<- init
 	}
 }
 
-func (w *Watcher) aggregateInitialAuthResults(ctx context.Context, snapshot authLoadSnapshot, results <-chan initialAuthReadResult, baseline map[string]uint64, after func(context.Context) error) {
-	status := w.AuthLoadStatus()
+func (w *Watcher) aggregateInitialAuthResults(ctx context.Context, sequence uint64, status AuthLoadStatus, snapshot authLoadSnapshot, results <-chan initialAuthReadResult, baseline map[string]uint64, after func(context.Context) error) {
 	pending := make([]initialAuthReadResult, 0, authLoadBatchSize)
 	seen := make(map[string]struct{})
 	enumerationFailed := false
+	metrics := authLoadMetrics{started: status.StartedAt, lastLog: time.Now()}
 	timer := time.NewTimer(authLoadFlushInterval)
 	defer timer.Stop()
-	flush := func() {
+	drain := func() {
+		for result := range results {
+			result.raw = nil
+		}
+	}
+	flush := func() bool {
 		if len(pending) == 0 {
-			return
+			return w.authLoadScanActive(ctx, sequence)
+		}
+		if !w.authLoadScanActive(ctx, sequence) {
+			pending = nil
+			return false
 		}
 		sort.Slice(pending, func(i, j int) bool { return pending[i].normalized < pending[j].normalized })
-		w.commitInitialAuthResults(ctx, snapshot, pending, &status, seen)
+		if !w.commitInitialAuthResults(ctx, sequence, snapshot, pending, &status, &metrics) {
+			pending = nil
+			return false
+		}
 		for i := range pending {
 			pending[i].raw = nil
 		}
 		pending = pending[:0]
-		w.publishAuthLoadStatus(status)
+		if !w.publishAuthLoadStatusForScan(ctx, sequence, status) {
+			return false
+		}
+		w.logAuthLoadProgress(status, &metrics, false)
+		return true
 	}
 	for {
+		if !w.authLoadScanActive(ctx, sequence) {
+			pending = nil
+			drain()
+			return
+		}
 		select {
 		case result, ok := <-results:
+			if !w.authLoadScanActive(ctx, sequence) {
+				result.raw = nil
+				pending = nil
+				drain()
+				return
+			}
 			if !ok {
-				flush()
-				if ctx.Err() == nil {
-					w.reconcileMissingInitialAuthPaths(ctx, baseline, seen, &status)
-					if after != nil && after(ctx) != nil {
+				if !flush() {
+					return
+				}
+				if !w.reconcileMissingInitialAuthPaths(ctx, sequence, baseline, seen, &status, &metrics) {
+					return
+				}
+				if after != nil {
+					if !w.authLoadScanActive(ctx, sequence) {
+						return
+					}
+					if errAfter := after(ctx); errAfter != nil {
 						enumerationFailed = true
+					}
+					if !w.authLoadScanActive(ctx, sequence) {
+						return
 					}
 				}
 				completed := time.Now().UTC()
@@ -250,56 +328,86 @@ func (w *Watcher) aggregateInitialAuthResults(ctx context.Context, snapshot auth
 				} else {
 					status.State = AuthLoadStateReady
 				}
-				w.publishAuthLoadStatus(status)
+				if !w.publishAuthLoadStatusForScan(ctx, sequence, status) {
+					return
+				}
+				w.logAuthLoadProgress(status, &metrics, true)
 				return
 			}
 			if result.enumerationResult {
 				status.FilesDiscovered = result.discovered
 				status.ScanComplete = true
+				metrics.directoryEnumeration += result.enumerationTime
 				if result.err != nil {
 					enumerationFailed = true
 				}
-				w.publishAuthLoadStatus(status)
+				if !w.publishAuthLoadStatusForScan(ctx, sequence, status) {
+					return
+				}
+				w.logAuthLoadProgress(status, &metrics, false)
 				continue
 			}
+			metrics.fileRead += result.readTime
+			metrics.nativeSynthesis += result.nativeSynthTime
 			seen[result.normalized] = struct{}{}
 			pending = append(pending, result)
 			if len(pending) >= authLoadBatchSize {
-				flush()
+				if !flush() {
+					drain()
+					return
+				}
 			}
 		case <-timer.C:
-			flush()
+			if !w.authLoadScanActive(ctx, sequence) {
+				pending = nil
+				drain()
+				return
+			}
+			if !flush() {
+				drain()
+				return
+			}
 			timer.Reset(authLoadFlushInterval)
 		case <-ctx.Done():
 			pending = nil
+			drain()
+			return
 		}
 	}
 }
 
-func (w *Watcher) commitInitialAuthResults(ctx context.Context, snapshot authLoadSnapshot, results []initialAuthReadResult, status *AuthLoadStatus, seen map[string]struct{}) {
+func (w *Watcher) commitInitialAuthResults(ctx context.Context, sequence uint64, snapshot authLoadSnapshot, results []initialAuthReadResult, status *AuthLoadStatus, metrics *authLoadMetrics) bool {
 	updates := make([]AuthUpdate, 0, len(results))
 	pathByID := make(map[string]string)
 	unchanged := make(map[string]int64)
 	failedPaths := make(map[string]struct{})
 	for i := range results {
+		if !w.authLoadScanActive(ctx, sequence) {
+			return false
+		}
 		result := &results[i]
 		status.FilesProcessed++
 		if result.err != nil {
 			status.FilesFailed++
 			continue
 		}
-		w.clientsMutex.Lock()
-		if !w.pathGenerationCurrentLocked(result.normalized, result.generation) {
+		generationCurrent := false
+		if !w.withActiveAuthLoadScan(ctx, sequence, func() {
+			w.clientsMutex.Lock()
+			generationCurrent = w.pathGenerationCurrentLocked(result.normalized, result.generation)
 			w.clientsMutex.Unlock()
+		}) {
+			return false
+		}
+		if !generationCurrent {
 			status.FilesSkipped++
 			continue
 		}
-		w.clientsMutex.Unlock()
 		pluginStarted := time.Now()
 		pluginAuths, handled, errPlugin := synthesizer.SynthesizePluginAuthFile(&synthesizer.SynthesisContext{
 			Config: snapshot.config, AuthDir: snapshot.authDir, Now: snapshot.now, IDGenerator: synthesizer.NewStableIDGenerator(), PluginAuthParser: snapshot.parser,
 		}, result.path, result.raw)
-		result.synthTime += time.Since(pluginStarted)
+		metrics.pluginSynthesis += time.Since(pluginStarted)
 		if errPlugin != nil {
 			status.FilesFailed++
 			continue
@@ -309,27 +417,36 @@ func (w *Watcher) commitInitialAuthResults(ctx context.Context, snapshot authLoa
 			auths = pluginAuths
 		}
 		newByID := authSliceToMap(auths)
-		w.clientsMutex.Lock()
-		if !w.pathGenerationCurrentLocked(result.normalized, result.generation) {
-			w.clientsMutex.Unlock()
+		generationCurrent = false
+		var pathUpdates []AuthUpdate
+		if !w.withActiveAuthLoadScan(ctx, sequence, func() {
+			w.clientsMutex.Lock()
+			defer w.clientsMutex.Unlock()
+			generationCurrent = w.pathGenerationCurrentLocked(result.normalized, result.generation)
+			if !generationCurrent {
+				return
+			}
+			if w.lastAuthHashes == nil {
+				w.lastAuthHashes = make(map[string]string)
+			}
+			if w.fileAuthsByPath == nil {
+				w.fileAuthsByPath = make(map[string]map[string]*coreauth.Auth)
+			}
+			w.lastAuthHashes[result.normalized] = result.hash
+			oldByID := cloneAuthMap(w.fileAuthsByPath[result.normalized])
+			if len(newByID) == 0 {
+				delete(w.fileAuthsByPath, result.normalized)
+			} else {
+				w.fileAuthsByPath[result.normalized] = cloneAuthMap(newByID)
+			}
+			pathUpdates = w.computePerPathUpdatesLocked(oldByID, newByID)
+		}) {
+			return false
+		}
+		if !generationCurrent {
 			status.FilesSkipped++
 			continue
 		}
-		if w.lastAuthHashes == nil {
-			w.lastAuthHashes = make(map[string]string)
-		}
-		if w.fileAuthsByPath == nil {
-			w.fileAuthsByPath = make(map[string]map[string]*coreauth.Auth)
-		}
-		w.lastAuthHashes[result.normalized] = result.hash
-		oldByID := cloneAuthMap(w.fileAuthsByPath[result.normalized])
-		if len(newByID) == 0 {
-			delete(w.fileAuthsByPath, result.normalized)
-		} else {
-			w.fileAuthsByPath[result.normalized] = cloneAuthMap(newByID)
-		}
-		pathUpdates := w.computePerPathUpdatesLocked(oldByID, newByID)
-		w.clientsMutex.Unlock()
 		for _, auth := range newByID {
 			if auth == nil {
 				continue
@@ -353,7 +470,12 @@ func (w *Watcher) commitInitialAuthResults(ctx context.Context, snapshot authLoa
 	for _, count := range unchanged {
 		status.AuthsLoaded += count
 	}
-	acknowledged := w.dispatchInitialAuthBatch(ctx, updates)
+	batchStarted := time.Now()
+	acknowledged, dispatched := w.dispatchInitialAuthBatch(ctx, sequence, updates)
+	metrics.batchRegistration += time.Since(batchStarted)
+	if !dispatched || !w.authLoadScanActive(ctx, sequence) {
+		return false
+	}
 	loadedByID := make(map[string]bool, len(acknowledged))
 	for _, result := range acknowledged {
 		loadedByID[result.ID] = result.Loaded
@@ -366,25 +488,36 @@ func (w *Watcher) commitInitialAuthResults(ctx context.Context, snapshot authLoa
 		failedPaths[pathByID[update.ID]] = struct{}{}
 	}
 	status.FilesFailed += int64(len(failedPaths))
+	return true
 }
 
-func (w *Watcher) reconcileMissingInitialAuthPaths(ctx context.Context, baseline map[string]uint64, seen map[string]struct{}, status *AuthLoadStatus) {
+func (w *Watcher) reconcileMissingInitialAuthPaths(ctx context.Context, sequence uint64, baseline map[string]uint64, seen map[string]struct{}, status *AuthLoadStatus, metrics *authLoadMetrics) bool {
 	updates := make([]AuthUpdate, 0)
-	w.clientsMutex.Lock()
-	for path, generation := range baseline {
-		if _, present := seen[path]; present || !w.pathGenerationCurrentLocked(path, generation) {
-			continue
+	if !w.withActiveAuthLoadScan(ctx, sequence, func() {
+		w.clientsMutex.Lock()
+		defer w.clientsMutex.Unlock()
+		for path, generation := range baseline {
+			if _, present := seen[path]; present || !w.pathGenerationCurrentLocked(path, generation) {
+				continue
+			}
+			oldByID := cloneAuthMap(w.fileAuthsByPath[path])
+			delete(w.fileAuthsByPath, path)
+			delete(w.lastAuthHashes, path)
+			delete(w.lastAuthContents, path)
+			updates = append(updates, w.computePerPathUpdatesLocked(oldByID, map[string]*coreauth.Auth{})...)
 		}
-		oldByID := cloneAuthMap(w.fileAuthsByPath[path])
-		delete(w.fileAuthsByPath, path)
-		delete(w.lastAuthHashes, path)
-		delete(w.lastAuthContents, path)
-		updates = append(updates, w.computePerPathUpdatesLocked(oldByID, map[string]*coreauth.Auth{})...)
+	}) {
+		return false
 	}
-	w.clientsMutex.Unlock()
 	if len(updates) > 0 {
-		w.dispatchInitialAuthBatch(ctx, updates)
+		batchStarted := time.Now()
+		_, dispatched := w.dispatchInitialAuthBatch(ctx, sequence, updates)
+		metrics.batchRegistration += time.Since(batchStarted)
+		if !dispatched {
+			return false
+		}
 	}
+	return w.authLoadScanActive(ctx, sequence)
 }
 
 func cloneAuthMap(auths map[string]*coreauth.Auth) map[string]*coreauth.Auth {
@@ -397,8 +530,10 @@ func cloneAuthMap(auths map[string]*coreauth.Auth) map[string]*coreauth.Auth {
 	return cloned
 }
 
-func (w *Watcher) publishTerminalAuthLoadStatus(degraded, scanComplete bool) {
-	status := w.AuthLoadStatus()
+func (w *Watcher) publishTerminalAuthLoadStatus(ctx context.Context, sequence uint64, status AuthLoadStatus, degraded, scanComplete bool) {
+	if !w.authLoadScanActive(ctx, sequence) {
+		return
+	}
 	status.ScanComplete = scanComplete
 	completed := time.Now().UTC()
 	status.CompletedAt = &completed
@@ -407,15 +542,35 @@ func (w *Watcher) publishTerminalAuthLoadStatus(degraded, scanComplete bool) {
 	} else {
 		status.State = AuthLoadStateReady
 	}
-	w.publishAuthLoadStatus(status)
+	w.publishAuthLoadStatusForScan(ctx, sequence, status)
 }
 
-func (w *Watcher) logAuthLoadSummary(status AuthLoadStatus) {
-	log.WithFields(log.Fields{
-		"files_discovered": status.FilesDiscovered,
-		"files_processed":  status.FilesProcessed,
-		"auths_loaded":     status.AuthsLoaded,
-		"files_failed":     status.FilesFailed,
-		"files_skipped":    status.FilesSkipped,
-	}).Debug("auth load progress")
+func (w *Watcher) logAuthLoadProgress(status AuthLoadStatus, metrics *authLoadMetrics, complete bool) {
+	if metrics == nil {
+		return
+	}
+	now := time.Now()
+	if !complete && now.Sub(metrics.lastLog) < authLoadLogInterval {
+		return
+	}
+	metrics.lastLog = now
+	fields := log.Fields{
+		"files_discovered":      status.FilesDiscovered,
+		"files_processed":       status.FilesProcessed,
+		"auths_loaded":          status.AuthsLoaded,
+		"files_failed":          status.FilesFailed,
+		"files_skipped":         status.FilesSkipped,
+		"directory_enumeration": metrics.directoryEnumeration,
+		"file_read":             metrics.fileRead,
+		"native_synthesis":      metrics.nativeSynthesis,
+		"plugin_synthesis":      metrics.pluginSynthesis,
+		"batch_registration":    metrics.batchRegistration,
+		"total_load":            now.Sub(metrics.started),
+	}
+	entry := log.WithFields(fields)
+	if complete {
+		entry.Info("auth file load complete")
+		return
+	}
+	entry.Debug("auth file load progress")
 }

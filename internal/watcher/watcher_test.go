@@ -23,6 +23,7 @@ import (
 	sdkAuth "github.com/router-for-me/CLIProxyAPI/v7/sdk/auth"
 	coreauth "github.com/router-for-me/CLIProxyAPI/v7/sdk/cliproxy/auth"
 	"github.com/router-for-me/CLIProxyAPI/v7/sdk/pluginapi"
+	log "github.com/sirupsen/logrus"
 	"gopkg.in/yaml.v3"
 )
 
@@ -1958,6 +1959,159 @@ func TestInitialAuthLoadDisabledForNonFileStore(t *testing.T) {
 	if status := w.AuthLoadStatus(); status.State != AuthLoadStateIdle {
 		t.Fatalf("status = %+v, want idle", status)
 	}
+}
+
+func TestInitialAuthLoadSupersededScanCannotCommitOrPublish(t *testing.T) {
+	authDir := t.TempDir()
+	path := filepath.Join(authDir, "credential.json")
+	mustWriteFile(t, path, []byte(`{"type":"xai","note":"old"}`))
+	oldReadStarted := make(chan struct{})
+	releaseOldRead := make(chan struct{})
+	originalRead := readInitialAuthFile
+	defer func() { readInitialAuthFile = originalRead }()
+	var reads atomic.Int32
+	readInitialAuthFile = func(path string) ([]byte, error) {
+		if reads.Add(1) == 1 {
+			data, errRead := os.ReadFile(path)
+			close(oldReadStarted)
+			<-releaseOldRead
+			return data, errRead
+		}
+		return os.ReadFile(path)
+	}
+
+	queue := make(chan AuthUpdateBatch, 4)
+	w := newInitialLoadTestWatcher(t, authDir, queue)
+	oldDone := w.StartInitialAuthLoad(context.Background(), 1)
+	<-oldReadStarted
+	mustWriteFile(t, path, []byte(`{"type":"xai","note":"new"}`))
+	newDone := w.StartInitialAuthLoad(context.Background(), 1)
+	select {
+	case batch := <-queue:
+		batch.Result <- loadedResults(batch.Updates)
+	case <-time.After(time.Second):
+		t.Fatal("new scan did not emit a batch")
+	}
+	<-newDone
+	wantStatus := w.AuthLoadStatus()
+	close(releaseOldRead)
+	<-oldDone
+	if got := w.AuthLoadStatus(); !reflect.DeepEqual(got, wantStatus) {
+		t.Fatalf("superseded scan overwrote status: got=%+v want=%+v", got, wantStatus)
+	}
+	select {
+	case batch := <-queue:
+		t.Fatalf("superseded scan emitted batch: %+v", batch.Updates)
+	default:
+	}
+	auths := w.SnapshotCoreAuths()
+	if len(auths) != 1 || auths[0].Metadata["note"] != "new" {
+		t.Fatalf("superseded scan overwrote watcher cache: %+v", auths)
+	}
+}
+
+func TestInitialAuthLoadCancellationNeverDispatchesToReadyQueue(t *testing.T) {
+	originalRead := readInitialAuthFile
+	defer func() { readInitialAuthFile = originalRead }()
+	for attempt := 0; attempt < 64; attempt++ {
+		authDir := writeInitialLoadAuthFiles(t, 1)
+		readStarted := make(chan struct{})
+		releaseRead := make(chan struct{})
+		readInitialAuthFile = func(path string) ([]byte, error) {
+			close(readStarted)
+			<-releaseRead
+			return os.ReadFile(path)
+		}
+		queue := make(chan AuthUpdateBatch, 1)
+		w := newInitialLoadTestWatcher(t, authDir, queue)
+		ctx, cancel := context.WithCancel(context.Background())
+		done := w.StartInitialAuthLoad(ctx, 1)
+		<-readStarted
+		cancel()
+		close(releaseRead)
+		select {
+		case <-done:
+		case <-time.After(time.Second):
+			t.Fatalf("attempt %d did not stop after cancellation", attempt)
+		}
+		select {
+		case batch := <-queue:
+			t.Fatalf("attempt %d dispatched after cancellation: %+v", attempt, batch.Updates)
+		default:
+		}
+	}
+}
+
+func TestInitialAuthLoadCompletionLogContainsOnlyAggregateMetrics(t *testing.T) {
+	logger := log.StandardLogger()
+	originalHooks := logger.ReplaceHooks(make(log.LevelHooks))
+	originalLevel := logger.GetLevel()
+	hook := &authLoadLogHook{}
+	logger.AddHook(hook)
+	logger.SetLevel(log.DebugLevel)
+	defer func() {
+		logger.ReplaceHooks(originalHooks)
+		logger.SetLevel(originalLevel)
+	}()
+
+	authDir := t.TempDir()
+	secretName := "secret-account-identity.json"
+	mustWriteFile(t, filepath.Join(authDir, secretName), []byte(`{"type":"xai"}`))
+	queue := make(chan AuthUpdateBatch, 1)
+	w := newInitialLoadTestWatcher(t, authDir, queue)
+	done := w.StartInitialAuthLoad(context.Background(), 1)
+	acknowledgeInitialLoadUntilDone(t, queue, done)
+
+	entry := hook.find("auth file load complete")
+	if entry == nil {
+		t.Fatal("missing auth load completion log")
+	}
+	for _, field := range []string{
+		"files_discovered", "files_processed", "auths_loaded", "files_failed", "files_skipped",
+		"directory_enumeration", "file_read", "native_synthesis", "plugin_synthesis", "batch_registration", "total_load",
+	} {
+		if _, ok := entry.Data[field]; !ok {
+			t.Fatalf("completion log missing field %q: %+v", field, entry.Data)
+		}
+	}
+	if strings.Contains(entry.Message, secretName) {
+		t.Fatalf("completion log leaked file identity: %s", entry.Message)
+	}
+	for key, value := range entry.Data {
+		if strings.Contains(fmt.Sprint(value), secretName) {
+			t.Fatalf("completion log field %q leaked file identity", key)
+		}
+	}
+}
+
+type authLoadLogHook struct {
+	mu      sync.Mutex
+	entries []*log.Entry
+}
+
+func (h *authLoadLogHook) Levels() []log.Level { return log.AllLevels }
+
+func (h *authLoadLogHook) Fire(entry *log.Entry) error {
+	h.mu.Lock()
+	defer h.mu.Unlock()
+	cloned := *entry
+	cloned.Data = make(log.Fields, len(entry.Data))
+	for key, value := range entry.Data {
+		cloned.Data[key] = value
+	}
+	h.entries = append(h.entries, &cloned)
+	return nil
+}
+
+func (h *authLoadLogHook) find(message string) *log.Entry {
+	h.mu.Lock()
+	defer h.mu.Unlock()
+	for _, entry := range h.entries {
+		if entry.Message == message {
+			return entry
+		}
+	}
+	return nil
 }
 
 func newInitialLoadTestWatcher(t testing.TB, authDir string, queue chan AuthUpdateBatch) *Watcher {
