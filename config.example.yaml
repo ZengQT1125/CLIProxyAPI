@@ -144,9 +144,10 @@ max-retry-interval: 30
 # When true, disable auth/model cooldown scheduling globally (prevents blackout windows after failure states).
 disable-cooling: false
 
-# When true, credentials returning 401 are evicted from memory and deleted from the store.
-# When false (default), 401 only marks the credential as unauthorized and cools it down
-# (30 minutes by default) but keeps the record intact so it can be repaired/reused later.
+# When true, credentials returning 401 or a permanently invalid OAuth refresh grant
+# (for example, invalid_grant after a refresh token is revoked) are evicted from memory
+# and deleted from the store. When false (default), the credential remains stored but
+# terminal refresh failures are removed from automatic refresh scheduling.
 delete-unauthorized-auth: false
 
 # When true, persist per-auth cooldown status across restarts.

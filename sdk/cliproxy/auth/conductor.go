@@ -98,7 +98,8 @@ func SetQuotaCooldownDisabled(disable bool) {
 	quotaCooldownDisabled.Store(disable)
 }
 
-// SetDeleteUnauthorizedAuth toggles credential deletion on upstream 401 responses.
+// SetDeleteUnauthorizedAuth toggles credential deletion on upstream 401
+// responses and permanently invalid OAuth refresh grants.
 func SetDeleteUnauthorizedAuth(enable bool) {
 	deleteUnauthorizedAuth.Store(enable)
 }
@@ -4382,11 +4383,13 @@ func isUnauthorizedError(err error) bool {
 	return strings.Contains(raw, "status 401") || strings.Contains(raw, "401 unauthorized")
 }
 
-func hasUnauthorizedAuthFailure(auth *Auth) bool {
+func hasTerminalRefreshAuthFailure(auth *Auth) bool {
 	if auth == nil || auth.LastError == nil {
 		return false
 	}
-	return auth.LastError.StatusCode() == http.StatusUnauthorized || strings.EqualFold(auth.LastError.Code, "unauthorized")
+	return auth.LastError.StatusCode() == http.StatusUnauthorized ||
+		strings.EqualFold(auth.LastError.Code, "unauthorized") ||
+		strings.EqualFold(auth.LastError.Code, "invalid_grant")
 }
 
 func refreshErrorFromError(err error) *Error {
@@ -4394,11 +4397,15 @@ func refreshErrorFromError(err error) *Error {
 		return nil
 	}
 	statusCode := statusCodeFromError(err)
-	if statusCode == 0 && isUnauthorizedError(err) {
-		statusCode = http.StatusUnauthorized
-	}
 	authErr := &Error{Message: err.Error(), HTTPStatus: statusCode}
-	if statusCode == http.StatusUnauthorized {
+	switch {
+	case isInvalidGrantError(err):
+		authErr.Code = "invalid_grant"
+		authErr.Retryable = false
+	case isUnauthorizedError(err):
+		if authErr.HTTPStatus == 0 {
+			authErr.HTTPStatus = http.StatusUnauthorized
+		}
 		authErr.Code = "unauthorized"
 		authErr.Retryable = false
 	}
@@ -4471,6 +4478,20 @@ func isInvalidGrantErrorMessage(message string) bool {
 	return strings.Contains(strings.ToLower(message), "invalid_grant")
 }
 
+func oauthErrorCodeFromError(err error) string {
+	if err == nil {
+		return ""
+	}
+	type oauthErrorCoder interface {
+		OAuthErrorCode() string
+	}
+	var coder oauthErrorCoder
+	if errors.As(err, &coder) && coder != nil {
+		return strings.TrimSpace(coder.OAuthErrorCode())
+	}
+	return ""
+}
+
 func isInvalidGrantError(err error) bool {
 	if err == nil {
 		return false
@@ -4479,7 +4500,14 @@ func isInvalidGrantError(err error) bool {
 	if status != http.StatusBadRequest && status != http.StatusUnauthorized {
 		return false
 	}
+	if code := oauthErrorCodeFromError(err); code != "" {
+		return strings.EqualFold(code, "invalid_grant")
+	}
 	return isInvalidGrantErrorMessage(err.Error())
+}
+
+func isPermanentRefreshAuthError(err error) bool {
+	return isUnauthorizedError(err) || isInvalidGrantError(err)
 }
 
 func isInvalidGrantResultError(err *Error) bool {
@@ -5953,7 +5981,7 @@ func (m *Manager) shouldRefresh(a *Auth, now time.Time) bool {
 	if a == nil {
 		return false
 	}
-	if hasUnauthorizedAuthFailure(a) {
+	if hasTerminalRefreshAuthFailure(a) {
 		return false
 	}
 	if !a.NextRefreshAfter.IsZero() && now.Before(a.NextRefreshAfter) {
@@ -6288,27 +6316,41 @@ func (m *Manager) refreshAuthForRequest(ctx context.Context, id, failedAccessTok
 	log.Debugf("refreshed %s, %s, %v", auth.Provider, auth.ID, err)
 	now := time.Now()
 	if err != nil {
-		unauthorized := isUnauthorizedError(err)
+		terminal := isPermanentRefreshAuthError(err)
+		shouldDelete := false
 		shouldReschedule := false
+		shouldUnschedule := false
+		var deleteStore Store
 		m.mu.Lock()
 		if current := m.auths[id]; current != nil {
 			current.LastError = refreshErrorFromError(err)
-			if unauthorized {
-				current.NextRefreshAfter = time.Time{}
-				current.Unavailable = true
-				current.Status = StatusError
-				current.StatusMessage = "unauthorized"
+			if terminal && deleteUnauthorizedAuth.Load() {
+				deleteStore = m.store
+				delete(m.auths, id)
+				shouldDelete = true
 			} else {
-				current.NextRefreshAfter = now.Add(refreshFailureBackoff)
-			}
-			m.auths[id] = current
-			shouldReschedule = true
-			if m.scheduler != nil {
-				m.scheduler.upsertAuth(current.Clone())
+				if terminal {
+					current.NextRefreshAfter = time.Time{}
+					current.Unavailable = true
+					current.Status = StatusError
+					current.StatusMessage = current.LastError.Code
+					shouldUnschedule = true
+				} else {
+					current.NextRefreshAfter = now.Add(refreshFailureBackoff)
+					shouldReschedule = true
+				}
+				m.auths[id] = current
+				if m.scheduler != nil {
+					m.scheduler.upsertAuth(current.Clone())
+				}
 			}
 		}
 		m.mu.Unlock()
-		if shouldReschedule {
+		if shouldDelete {
+			m.removeDeletedAuth(ctx, id, deleteStore)
+		} else if shouldUnschedule {
+			m.queueRefreshUnschedule(id)
+		} else if shouldReschedule {
 			m.queueRefreshReschedule(id)
 		}
 		return nil, err

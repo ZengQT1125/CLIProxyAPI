@@ -92,9 +92,9 @@ type Config struct {
 	// DisableCooling disables quota cooldown scheduling when true.
 	DisableCooling bool `yaml:"disable-cooling" json:"disable-cooling"`
 
-	// DeleteUnauthorizedAuth controls whether to delete credentials on 401 responses.
-	// When false (default), 401 only marks the auth as unauthorized and cools it down
-	// via existing MarkResult logic, but keeps the auth in memory and on disk.
+	// DeleteUnauthorizedAuth controls whether to delete credentials on 401 responses
+	// or permanently invalid OAuth refresh grants. When false (default), terminal
+	// refresh failures remain stored but are removed from automatic refresh scheduling.
 	// When true, the auth is evicted from memory and removed from the store.
 	DeleteUnauthorizedAuth bool `yaml:"delete-unauthorized-auth" json:"delete-unauthorized-auth"`
 
