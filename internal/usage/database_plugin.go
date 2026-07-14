@@ -97,14 +97,8 @@ func InitDatabasePlugin(ctx context.Context, pgDSN, pgSchema, authDir string) er
 		closeCh:           make(chan struct{}),
 	}
 	plugin.wg.Add(1)
+	// flushLoop owns the initial retention cleanup so InitDatabasePlugin does not block startup on large SQLite DBs.
 	go plugin.flushLoop()
-
-	// Run initial cleanup of old records
-	if deleted, cleanupErr := store.DeleteOldRecords(ctx, retentionDays); cleanupErr != nil {
-		log.WithError(cleanupErr).Warn("usage: failed to cleanup old records on startup")
-	} else if deleted > 0 {
-		log.WithField("deleted", deleted).Infof("usage: cleaned up records older than %d days", retentionDays)
-	}
 
 	databasePlugin = plugin
 	return nil
@@ -159,6 +153,9 @@ func UsingSQLiteBackend() bool {
 // flushLoop periodically flushes the buffer to the database and cleans up old records.
 func (p *DatabasePlugin) flushLoop() {
 	defer p.wg.Done()
+	// Run once immediately so startup cleanup is asynchronous relative to service start.
+	p.cleanup(true)
+
 	flushTicker := time.NewTicker(defaultFlushInterval)
 	cleanupTicker := time.NewTicker(defaultCleanupInterval)
 	defer flushTicker.Stop()
@@ -172,7 +169,7 @@ func (p *DatabasePlugin) flushLoop() {
 		case <-flushTicker.C:
 			p.flush()
 		case <-cleanupTicker.C:
-			p.cleanup()
+			p.cleanup(false)
 		case <-p.flushCh:
 			p.flush()
 		}
@@ -180,16 +177,25 @@ func (p *DatabasePlugin) flushLoop() {
 }
 
 // cleanup deletes records older than the retention period.
-func (p *DatabasePlugin) cleanup() {
+// When startup is true, successful deletions are logged at info for operators.
+func (p *DatabasePlugin) cleanup(startup bool) {
 	if p.store == nil || p.retentionDays <= 0 {
 		return
 	}
 	deleted, err := p.store.DeleteOldRecords(context.Background(), p.retentionDays)
 	if err != nil {
 		log.WithError(err).Warn("usage: failed to cleanup old records")
-	} else if deleted > 0 {
-		log.WithField("deleted", deleted).Debugf("usage: cleaned up records older than %d days", p.retentionDays)
+		return
 	}
+	if deleted <= 0 {
+		return
+	}
+	fields := log.Fields{"deleted": deleted, "retention_days": p.retentionDays}
+	if startup {
+		log.WithFields(fields).Info("usage: cleaned up records older than retention window")
+		return
+	}
+	log.WithFields(fields).Debug("usage: cleaned up records older than retention window")
 }
 
 // flush writes all buffered records to the database.

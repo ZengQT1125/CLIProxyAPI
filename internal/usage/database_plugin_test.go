@@ -123,3 +123,67 @@ func TestDatabasePluginBuffersCacheWriteTokens(t *testing.T) {
 		t.Fatalf("cache write tokens = %d, want 40", plugin.buffer[0].CacheWriteTokens)
 	}
 }
+
+type blockingDeleteStore struct {
+	fakeUsageStore
+	started  chan struct{}
+	release  chan struct{}
+	finished chan struct{}
+	deleted  int64
+}
+
+func (s *blockingDeleteStore) DeleteOldRecords(context.Context, int) (int64, error) {
+	close(s.started)
+	<-s.release
+	close(s.finished)
+	return s.deleted, nil
+}
+
+func TestDatabasePluginStartupCleanupDoesNotBlockConstruction(t *testing.T) {
+	store := &blockingDeleteStore{
+		started:  make(chan struct{}),
+		release:  make(chan struct{}),
+		finished: make(chan struct{}),
+		deleted:  7,
+	}
+	plugin := &DatabasePlugin{
+		store:         store,
+		retentionDays: 30,
+		buffer:        make([]UsageRecord, 0, defaultBufferSize),
+		flushCh:       make(chan struct{}, 1),
+		closeCh:       make(chan struct{}),
+	}
+	plugin.wg.Add(1)
+	go plugin.flushLoop()
+
+	// Construction/start must proceed while cleanup is still blocked.
+	select {
+	case <-store.started:
+	case <-time.After(time.Second):
+		t.Fatal("startup cleanup did not start")
+	}
+	select {
+	case <-store.finished:
+		t.Fatal("startup cleanup finished before release; expected non-blocking start")
+	default:
+	}
+
+	close(store.release)
+	select {
+	case <-store.finished:
+	case <-time.After(time.Second):
+		t.Fatal("startup cleanup did not finish after release")
+	}
+
+	plugin.closeOnce.Do(func() { close(plugin.closeCh) })
+	done := make(chan struct{})
+	go func() {
+		plugin.wg.Wait()
+		close(done)
+	}()
+	select {
+	case <-done:
+	case <-time.After(time.Second):
+		t.Fatal("flushLoop did not exit after close")
+	}
+}
