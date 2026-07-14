@@ -1999,6 +1999,195 @@ func TestInitialAuthLoadDisabledForNonFileStore(t *testing.T) {
 	}
 }
 
+func TestProgressiveAuthEventsWaitForInitialLoadActivation(t *testing.T) {
+	authDir := t.TempDir()
+	configPath := filepath.Join(t.TempDir(), "config.yaml")
+	mustWriteFile(t, configPath, []byte("port: 8317\n"))
+	path := filepath.Join(authDir, "pending.json")
+	mustWriteFile(t, path, []byte(`{"type":"xai","note":"first"}`))
+	queue := make(chan AuthUpdateBatch, 4)
+	w, errNew := NewWatcher(configPath, authDir, nil)
+	if errNew != nil {
+		t.Fatal(errNew)
+	}
+	w.SetConfig(&config.Config{AuthDir: authDir, AuthLoadWorkers: 1})
+	w.SetAuthUpdateQueue(queue)
+	w.SetFileAuthLoadingEnabled(true)
+	t.Cleanup(func() { _ = w.Stop() })
+	lifecycleCtx, cancelLifecycle := context.WithCancel(context.Background())
+	defer cancelLifecycle()
+	if errStart := w.Start(lifecycleCtx); errStart != nil {
+		t.Fatal(errStart)
+	}
+
+	w.handleEvent(fsnotify.Event{Name: path, Op: fsnotify.Create})
+	mustWriteFile(t, path, []byte(`{"type":"xai","note":"final"}`))
+	w.handleEvent(fsnotify.Event{Name: path, Op: fsnotify.Write})
+	if auths := w.SnapshotCoreAuths(); len(auths) != 0 {
+		t.Fatalf("pre-activation auth event loaded credentials: %+v", auths)
+	}
+	select {
+	case batch := <-queue:
+		t.Fatalf("pre-activation auth event emitted batch: %+v", batch.Updates)
+	default:
+	}
+
+	originalRead := readInitialAuthFile
+	defer func() { readInitialAuthFile = originalRead }()
+	var reads atomic.Int32
+	readInitialAuthFile = func(path string) ([]byte, error) {
+		reads.Add(1)
+		return os.ReadFile(path)
+	}
+	done := w.StartInitialAuthLoad(lifecycleCtx, 1)
+	acknowledgeInitialLoadUntilDone(t, queue, done)
+	if got := reads.Load(); got != 1 {
+		t.Fatalf("initial scan reads = %d, want 1", got)
+	}
+	auths := w.SnapshotCoreAuths()
+	if len(auths) != 1 || auths[0].Metadata["note"] != "final" {
+		t.Fatalf("initial scan did not load final disk state: %+v", auths)
+	}
+}
+
+func TestProgressiveConfigEventAppliesOnceBeforeInitialScan(t *testing.T) {
+	authDir := writeInitialLoadAuthFiles(t, 1)
+	configPath := filepath.Join(t.TempDir(), "config.yaml")
+	mustWriteFile(t, configPath, []byte("port: 8317\n"))
+	queue := make(chan AuthUpdateBatch, 4)
+	var mu sync.Mutex
+	var order []string
+	var callbackPorts []int
+	w, errNew := NewWatcher(configPath, authDir, func(cfg *config.Config) {
+		mu.Lock()
+		order = append(order, "config")
+		callbackPorts = append(callbackPorts, cfg.Port)
+		mu.Unlock()
+	})
+	if errNew != nil {
+		t.Fatal(errNew)
+	}
+	w.SetConfig(&config.Config{Port: 8317, AuthDir: authDir, AuthLoadWorkers: 1})
+	w.SetAuthUpdateQueue(queue)
+	w.SetFileAuthLoadingEnabled(true)
+	w.SetAuthLoadHooks(AuthLoadHooks{Before: func(context.Context) error {
+		mu.Lock()
+		order = append(order, "before")
+		mu.Unlock()
+		return nil
+	}})
+	t.Cleanup(func() { _ = w.Stop() })
+	lifecycleCtx, cancelLifecycle := context.WithCancel(context.Background())
+	defer cancelLifecycle()
+	if errStart := w.Start(lifecycleCtx); errStart != nil {
+		t.Fatal(errStart)
+	}
+
+	mustWriteFile(t, configPath, []byte("port: 9001\n"))
+	w.handleEvent(fsnotify.Event{Name: configPath, Op: fsnotify.Write})
+	time.Sleep(2 * configReloadDebounce)
+	mu.Lock()
+	preActivationCallbacks := len(callbackPorts)
+	mu.Unlock()
+	if preActivationCallbacks != 0 {
+		t.Fatalf("pre-activation config event invoked callback %d times", preActivationCallbacks)
+	}
+	if status := w.AuthLoadStatus(); status.State != AuthLoadStateIdle {
+		t.Fatalf("pre-activation config event started scan: %+v", status)
+	}
+
+	done := w.StartInitialAuthLoad(lifecycleCtx, 1)
+	acknowledgeInitialLoadUntilDone(t, queue, done)
+	mu.Lock()
+	gotOrder := append([]string(nil), order...)
+	gotPorts := append([]int(nil), callbackPorts...)
+	mu.Unlock()
+	if !reflect.DeepEqual(gotPorts, []int{9001}) {
+		t.Fatalf("callback ports = %v, want [9001]", gotPorts)
+	}
+	if !reflect.DeepEqual(gotOrder, []string{"config", "before"}) {
+		t.Fatalf("activation order = %v, want [config before]", gotOrder)
+	}
+	select {
+	case batch := <-queue:
+		t.Fatalf("activation triggered duplicate scan batch: %+v", batch.Updates)
+	default:
+	}
+}
+
+func TestProgressiveConfigRescanStopsWithWatcherLifecycle(t *testing.T) {
+	authDir := writeInitialLoadAuthFiles(t, 1)
+	configPath := filepath.Join(t.TempDir(), "config.yaml")
+	mustWriteFile(t, configPath, []byte("port: 8317\n"))
+	queue := make(chan AuthUpdateBatch, 4)
+	w, errNew := NewWatcher(configPath, authDir, func(*config.Config) {})
+	if errNew != nil {
+		t.Fatal(errNew)
+	}
+	w.SetConfig(&config.Config{Port: 8317, AuthDir: authDir, AuthLoadWorkers: 1})
+	w.SetAuthUpdateQueue(queue)
+	w.SetFileAuthLoadingEnabled(true)
+	t.Cleanup(func() { _ = w.Stop() })
+	lifecycleCtx, cancelLifecycle := context.WithCancel(context.Background())
+	if errStart := w.Start(lifecycleCtx); errStart != nil {
+		t.Fatal(errStart)
+	}
+	initialDone := w.StartInitialAuthLoad(lifecycleCtx, 1)
+	acknowledgeInitialLoadUntilDone(t, queue, initialDone)
+
+	readStarted := make(chan struct{})
+	releaseRead := make(chan struct{})
+	originalRead := readInitialAuthFile
+	defer func() { readInitialAuthFile = originalRead }()
+	readInitialAuthFile = func(path string) ([]byte, error) {
+		close(readStarted)
+		<-releaseRead
+		return []byte(`{"type":"xai","note":"rescan"}`), nil
+	}
+	newAuthDir := t.TempDir()
+	mustWriteFile(t, configPath, []byte("port: 9002\nauth-dir: "+newAuthDir+"\n"))
+	w.handleEvent(fsnotify.Event{Name: configPath, Op: fsnotify.Write})
+	select {
+	case <-readStarted:
+	case <-time.After(time.Second):
+		t.Fatal("config change did not start rescan")
+	}
+	cancelLifecycle()
+	close(releaseRead)
+	time.Sleep(50 * time.Millisecond)
+	select {
+	case batch := <-queue:
+		t.Fatalf("lifecycle-canceled rescan emitted batch: %+v", batch.Updates)
+	default:
+	}
+}
+
+func TestLegacyWatcherProcessesLiveAuthWithoutProgressiveOptIn(t *testing.T) {
+	authDir := t.TempDir()
+	configPath := filepath.Join(t.TempDir(), "config.yaml")
+	mustWriteFile(t, configPath, []byte("port: 8317\n"))
+	path := filepath.Join(authDir, "legacy.json")
+	mustWriteFile(t, path, []byte(`{"type":"xai"}`))
+	queue := make(chan AuthUpdateBatch, 1)
+	w, errNew := NewWatcher(configPath, authDir, nil)
+	if errNew != nil {
+		t.Fatal(errNew)
+	}
+	w.SetConfig(&config.Config{AuthDir: authDir})
+	w.SetAuthUpdateQueue(queue)
+	t.Cleanup(func() { _ = w.Stop() })
+
+	w.handleEvent(fsnotify.Event{Name: path, Op: fsnotify.Write})
+	select {
+	case batch := <-queue:
+		if len(batch.Updates) != 1 || batch.Updates[0].ID != "legacy.json" {
+			t.Fatalf("legacy live event batch = %+v", batch.Updates)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("legacy watcher did not process live auth event")
+	}
+}
+
 func TestInitialAuthLoadSupersededScanCannotCommitOrPublish(t *testing.T) {
 	authDir := t.TempDir()
 	path := filepath.Join(authDir, "credential.json")

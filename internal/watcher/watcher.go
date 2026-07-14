@@ -71,6 +71,10 @@ type Watcher struct {
 	authLoadSequence       uint64
 	authLoadHooks          AuthLoadHooks
 	fileAuthLoadingEnabled bool
+	lifecycleCtx           context.Context
+	authEventGateArmed     bool
+	authEventGateOpen      bool
+	pendingConfigEvent     bool
 }
 
 // AuthUpdateAction represents the type of change detected in auth sources.
@@ -203,6 +207,13 @@ func (w *Watcher) SetFileAuthLoadingEnabled(enabled bool) {
 	}
 	w.clientsMutex.Lock()
 	w.fileAuthLoadingEnabled = enabled
+	if enabled {
+		// Progressive opt-in arms the pre-activation event gate once.
+		w.authEventGateArmed = true
+	} else {
+		// Disabled full scan also bypasses the progressive event gate.
+		w.authEventGateArmed = false
+	}
 	w.clientsMutex.Unlock()
 }
 
@@ -213,6 +224,48 @@ func (w *Watcher) fileAuthLoadingIsEnabled() bool {
 		return true
 	}
 	return w.fileAuthLoadingEnabled
+}
+
+func (w *Watcher) authEventGateBlocks() bool {
+	w.clientsMutex.RLock()
+	defer w.clientsMutex.RUnlock()
+	return w.authEventGateArmed && !w.authEventGateOpen
+}
+
+func (w *Watcher) setLifecycleContext(ctx context.Context) {
+	w.clientsMutex.Lock()
+	w.lifecycleCtx = ctx
+	w.clientsMutex.Unlock()
+}
+
+func (w *Watcher) authLoadContext() context.Context {
+	w.clientsMutex.RLock()
+	ctx := w.lifecycleCtx
+	w.clientsMutex.RUnlock()
+	if ctx == nil {
+		return context.Background()
+	}
+	return ctx
+}
+
+// activateAuthEventGate opens the progressive event gate and reports whether a
+// pre-activation config change must be applied without starting a second scan.
+func (w *Watcher) activateAuthEventGate() (applyPendingConfig bool) {
+	w.clientsMutex.Lock()
+	defer w.clientsMutex.Unlock()
+	if !w.authEventGateArmed || w.authEventGateOpen {
+		return false
+	}
+	w.authEventGateOpen = true
+	applyPendingConfig = w.pendingConfigEvent
+	w.pendingConfigEvent = false
+	return applyPendingConfig
+}
+
+func (w *Watcher) markPendingConfigEvent() {
+	w.clientsMutex.Lock()
+	w.pendingConfigEvent = true
+	w.clientsMutex.Unlock()
 }
 
 func (w *Watcher) advancePathGenerationLocked(path string) uint64 {

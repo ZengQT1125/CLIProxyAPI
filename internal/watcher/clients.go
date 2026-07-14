@@ -58,12 +58,19 @@ func (w *Watcher) reloadClients(rescanAuth bool, affectedOAuthProviders []string
 	needsFullScan := w.fileAuthLoadingIsEnabled() &&
 		(rescanAuth || len(affectedOAuthProviders) > 0 || forceAuthRefresh || w.AuthLoadStatus().State == AuthLoadStateLoading)
 	if needsFullScan {
+		loadCtx := w.authLoadContext()
+		if w.stopped.Load() || loadCtx.Err() != nil {
+			if w.reloadCallback != nil {
+				w.reloadCallback(cfg)
+			}
+			return
+		}
 		w.cancelAndWaitForAuthLoad()
 		w.publishAuthLoadStatus(AuthLoadStatus{State: AuthLoadStateLoading, StartedAt: time.Now().UTC()})
 		if w.reloadCallback != nil {
 			w.reloadCallback(cfg)
 		}
-		w.StartInitialAuthLoad(context.Background(), cfg.AuthLoadWorkers)
+		w.StartInitialAuthLoad(loadCtx, cfg.AuthLoadWorkers)
 		redisqueue.NotifyUsageRefresh()
 		return
 	}

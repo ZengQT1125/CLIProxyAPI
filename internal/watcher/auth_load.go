@@ -70,8 +70,20 @@ func (w *Watcher) StartInitialAuthLoad(ctx context.Context, workers int) <-chan 
 		close(done)
 		return done
 	}
+	if w.stopped.Load() {
+		close(done)
+		return done
+	}
+	if applyPending := w.activateAuthEventGate(); applyPending {
+		// Apply pending pre-activation config without starting a second scan.
+		_ = w.reloadConfigWithMode(false)
+	}
 	if ctx == nil {
 		ctx = context.Background()
+	}
+	if ctx.Err() != nil {
+		close(done)
+		return done
 	}
 	if workers == 0 {
 		workers = config.DefaultAuthLoadWorkers
