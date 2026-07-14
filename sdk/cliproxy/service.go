@@ -14,6 +14,7 @@ import (
 
 	"github.com/router-for-me/CLIProxyAPI/v7/internal/api"
 	"github.com/router-for-me/CLIProxyAPI/v7/internal/constant"
+	"github.com/router-for-me/CLIProxyAPI/v7/internal/store"
 	"github.com/router-for-me/CLIProxyAPI/v7/internal/home"
 	"github.com/router-for-me/CLIProxyAPI/v7/internal/homeplugins"
 	"github.com/router-for-me/CLIProxyAPI/v7/internal/logging"
@@ -781,17 +782,31 @@ func (s *Service) configureCooldownStateStore(cfg *config.Config) {
 		s.coreManager.SetCooldownStateStore(nil)
 		return
 	}
-	authDir, errResolve := resolveCooldownStateAuthDir(cfg)
-	if errResolve != nil {
-		log.Warnf("failed to resolve cooldown state directory: %v", errResolve)
-		s.coreManager.SetCooldownStateStore(nil)
-		return
+	authDir := ""
+	if _, isPG := sdkAuth.GetTokenStore().(*store.PostgresStore); !isPG {
+		var errResolve error
+		authDir, errResolve = resolveCooldownStateAuthDir(cfg)
+		if errResolve != nil {
+			log.Warnf("failed to resolve cooldown state directory: %v", errResolve)
+			s.coreManager.SetCooldownStateStore(nil)
+			return
+		}
 	}
-	if authDir == "" {
-		s.coreManager.SetCooldownStateStore(nil)
-		return
+	s.coreManager.SetCooldownStateStore(cooldownStateStoreForTokenStore(sdkAuth.GetTokenStore(), authDir))
+}
+
+// cooldownStateStoreForTokenStore returns the appropriate CooldownStateStore:
+//   - *store.PostgresStore → PostgresCooldownStateStore (ignores authDir)
+//   - anything else with a non-empty authDir → FileCooldownStateStore
+//   - anything else with empty authDir → nil
+func cooldownStateStoreForTokenStore(tokenStore coreauth.Store, authDir string) coreauth.CooldownStateStore {
+	if pg, ok := tokenStore.(*store.PostgresStore); ok && pg != nil {
+		return store.NewPostgresCooldownStateStore(pg)
 	}
-	s.coreManager.SetCooldownStateStore(coreauth.NewFileCooldownStateStoreWithAuthDir(authDir, authDir))
+	if strings.TrimSpace(authDir) == "" {
+		return nil
+	}
+	return coreauth.NewFileCooldownStateStoreWithAuthDir(authDir, authDir)
 }
 
 func resolveCooldownStateAuthDir(cfg *config.Config) (string, error) {
