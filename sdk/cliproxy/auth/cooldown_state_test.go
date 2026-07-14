@@ -69,6 +69,23 @@ func (s *blockingCooldownStateStore) Apply(ctx context.Context, snapshots []Cool
 	return s.recordingCooldownStateStore.Apply(ctx, snapshots)
 }
 
+type blockingLoadCooldownStateStore struct {
+	started chan struct{}
+	release chan struct{}
+	once    sync.Once
+	recordingCooldownStateStore
+}
+
+func (s *blockingLoadCooldownStateStore) Load(ctx context.Context) ([]CooldownStateSnapshot, error) {
+	s.once.Do(func() { close(s.started) })
+	select {
+	case <-ctx.Done():
+		return nil, ctx.Err()
+	case <-s.release:
+	}
+	return s.recordingCooldownStateStore.Load(ctx)
+}
+
 type failingCooldownStateStore struct {
 	fail atomic.Bool
 	recordingCooldownStateStore
@@ -583,5 +600,200 @@ func TestManager_PrepareCooldownRestoreAppliesAlreadyRegisteredAuth(t *testing.T
 	auth, ok := manager.GetByID("auth-live")
 	if !ok || !auth.Unavailable || !auth.NextRetryAfter.Equal(nextRetry) {
 		t.Fatalf("auth after prepare = %+v", auth)
+	}
+}
+
+func TestManager_PrepareCooldownRestoreIgnoresReplacedStore(t *testing.T) {
+	for _, tc := range []struct {
+		name        string
+		replacement CooldownStateStore
+	}{
+		{name: "disabled"},
+		{name: "replaced", replacement: &recordingCooldownStateStore{}},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			nextRetry := time.Now().Add(time.Hour)
+			store := &blockingLoadCooldownStateStore{
+				started: make(chan struct{}),
+				release: make(chan struct{}),
+				recordingCooldownStateStore: recordingCooldownStateStore{load: []CooldownStateSnapshot{{
+					AuthID: "auth-stale",
+					Records: []CooldownStateRecord{{
+						AuthID: "auth-stale", Model: "grok-stale", NextRetryAfter: nextRetry,
+					}},
+				}}},
+			}
+			manager := NewManager(nil, nil, nil)
+			manager.SetCooldownStateStore(store)
+
+			errPrepare := make(chan error, 1)
+			go func() {
+				errPrepare <- manager.PrepareCooldownRestore(context.Background())
+			}()
+			select {
+			case <-store.started:
+			case <-time.After(time.Second):
+				t.Fatal("PrepareCooldownRestore() did not start loading")
+			}
+			manager.SetCooldownStateStore(tc.replacement)
+			close(store.release)
+			if err := <-errPrepare; err != nil {
+				t.Fatalf("PrepareCooldownRestore() error = %v", err)
+			}
+
+			if _, errRegister := manager.Register(WithSkipPersist(context.Background()), &Auth{ID: "auth-stale", Provider: "xai"}); errRegister != nil {
+				t.Fatalf("Register() error = %v", errRegister)
+			}
+			auth, ok := manager.GetByID("auth-stale")
+			if !ok {
+				t.Fatal("registered auth was not found")
+			}
+			if state := auth.ModelStates["grok-stale"]; state != nil && state.Unavailable {
+				t.Fatalf("stale store cooldown was restored: %+v", state)
+			}
+		})
+	}
+}
+
+func TestManager_PrepareCooldownRestoreMergesDuplicateSnapshots(t *testing.T) {
+	nextRetry := time.Now().Add(time.Hour)
+	store := &recordingCooldownStateStore{load: []CooldownStateSnapshot{
+		{AuthID: "auth-1", Records: []CooldownStateRecord{{AuthID: "auth-1", Model: "grok-3", NextRetryAfter: nextRetry}}},
+		{AuthID: "auth-1", Records: []CooldownStateRecord{{AuthID: "auth-1", Model: "grok-4", NextRetryAfter: nextRetry}}},
+	}}
+	manager := NewManager(nil, nil, nil)
+	manager.SetCooldownStateStore(store)
+	if errPrepare := manager.PrepareCooldownRestore(context.Background()); errPrepare != nil {
+		t.Fatal(errPrepare)
+	}
+	if _, errRegister := manager.Register(WithSkipPersist(context.Background()), &Auth{ID: "auth-1", Provider: "xai"}); errRegister != nil {
+		t.Fatal(errRegister)
+	}
+	auth, ok := manager.GetByID("auth-1")
+	if !ok {
+		t.Fatal("registered auth was not found")
+	}
+	for _, model := range []string{"grok-3", "grok-4"} {
+		if state := auth.ModelStates[model]; state == nil || !state.Unavailable {
+			t.Fatalf("model %q state = %+v, want merged cooldown", model, state)
+		}
+	}
+}
+
+func TestManager_RestoreCooldownStatesAppliesAuthLevelAfterModels(t *testing.T) {
+	modelRetry := time.Now().Add(time.Hour)
+	authRetry := modelRetry.Add(time.Hour)
+	store := &recordingCooldownStateStore{load: []CooldownStateSnapshot{{
+		AuthID: "auth-1",
+		Records: []CooldownStateRecord{
+			{AuthID: "auth-1", NextRetryAfter: authRetry, Reason: "auth-level"},
+			{AuthID: "auth-1", Model: "grok-4", NextRetryAfter: modelRetry, Reason: "model-level"},
+		},
+	}}}
+	manager := NewManager(nil, nil, nil)
+	manager.SetCooldownStateStore(store)
+	if _, errRegister := manager.Register(WithSkipPersist(context.Background()), &Auth{ID: "auth-1", Provider: "xai"}); errRegister != nil {
+		t.Fatal(errRegister)
+	}
+	if errRestore := manager.RestoreCooldownStates(context.Background()); errRestore != nil {
+		t.Fatal(errRestore)
+	}
+	auth, ok := manager.GetByID("auth-1")
+	if !ok {
+		t.Fatal("restored auth was not found")
+	}
+	if !auth.NextRetryAfter.Equal(authRetry) || auth.StatusMessage != "auth-level" {
+		t.Fatalf("auth-level cooldown = %+v, want retry %v and auth-level reason", auth, authRetry)
+	}
+	if state := auth.ModelStates["grok-4"]; state == nil || !state.NextRetryAfter.Equal(modelRetry) {
+		t.Fatalf("model-level cooldown = %+v, want retry %v", state, modelRetry)
+	}
+}
+
+func TestManager_PreparedCooldownDisabledRegisterDefersCleanup(t *testing.T) {
+	for _, tc := range []struct {
+		name string
+		auth *Auth
+	}{
+		{name: "disabled", auth: &Auth{ID: "auth-1", Provider: "xai", Disabled: true}},
+		{name: "cooldown-disabled", auth: &Auth{ID: "auth-1", Provider: "xai", Metadata: map[string]any{"disable_cooling": true}}},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			nextRetry := time.Now().Add(time.Hour)
+			store := &recordingCooldownStateStore{load: []CooldownStateSnapshot{{
+				AuthID:  "auth-1",
+				Records: []CooldownStateRecord{{AuthID: "auth-1", NextRetryAfter: nextRetry}},
+			}}}
+			manager := NewManager(nil, nil, nil)
+			manager.SetCooldownStateStore(store)
+			if errPrepare := manager.PrepareCooldownRestore(context.Background()); errPrepare != nil {
+				t.Fatal(errPrepare)
+			}
+			tc.auth.Unavailable = true
+			tc.auth.NextRetryAfter = nextRetry
+			if _, errRegister := manager.Register(WithSkipPersist(context.Background()), tc.auth); errRegister != nil {
+				t.Fatal(errRegister)
+			}
+			if errFlush := manager.FlushCooldownStates(context.Background()); errFlush != nil {
+				t.Fatal(errFlush)
+			}
+			if got := store.applyCount.Load(); got != 0 {
+				t.Fatalf("Apply count before completion = %d, want 0", got)
+			}
+			if errComplete := manager.CompleteCooldownRestore(context.Background()); errComplete != nil {
+				t.Fatal(errComplete)
+			}
+			if got := store.applyCount.Load(); got != 1 {
+				t.Fatalf("Apply count after completion = %d, want 1", got)
+			}
+		})
+	}
+}
+
+func TestManager_PreparedCooldownDisabledUpdateDefersCleanup(t *testing.T) {
+	for _, tc := range []struct {
+		name   string
+		mutate func(*Auth)
+	}{
+		{name: "disabled", mutate: func(auth *Auth) { auth.Disabled = true }},
+		{name: "cooldown-disabled", mutate: func(auth *Auth) {
+			auth.Metadata = map[string]any{"disable_cooling": true}
+		}},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			nextRetry := time.Now().Add(time.Hour)
+			store := &recordingCooldownStateStore{load: []CooldownStateSnapshot{{
+				AuthID:  "auth-1",
+				Records: []CooldownStateRecord{{AuthID: "auth-1", NextRetryAfter: nextRetry}},
+			}}}
+			manager := NewManager(nil, nil, nil)
+			manager.SetCooldownStateStore(store)
+			if _, errRegister := manager.Register(WithSkipPersist(context.Background()), &Auth{ID: "auth-1", Provider: "xai"}); errRegister != nil {
+				t.Fatal(errRegister)
+			}
+			if errPrepare := manager.PrepareCooldownRestore(context.Background()); errPrepare != nil {
+				t.Fatal(errPrepare)
+			}
+			auth, ok := manager.GetByID("auth-1")
+			if !ok {
+				t.Fatal("registered auth was not found")
+			}
+			tc.mutate(auth)
+			if _, errUpdate := manager.Update(WithSkipPersist(context.Background()), auth); errUpdate != nil {
+				t.Fatal(errUpdate)
+			}
+			if errFlush := manager.FlushCooldownStates(context.Background()); errFlush != nil {
+				t.Fatal(errFlush)
+			}
+			if got := store.applyCount.Load(); got != 0 {
+				t.Fatalf("Apply count before completion = %d, want 0", got)
+			}
+			if errComplete := manager.CompleteCooldownRestore(context.Background()); errComplete != nil {
+				t.Fatal(errComplete)
+			}
+			if got := store.applyCount.Load(); got != 1 {
+				t.Fatalf("Apply count after completion = %d, want 1", got)
+			}
+		})
 	}
 }

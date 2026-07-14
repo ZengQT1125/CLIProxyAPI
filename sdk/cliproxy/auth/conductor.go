@@ -225,6 +225,7 @@ func (NoopHook) OnResult(context.Context, Result) {}
 type Manager struct {
 	store                  Store
 	cooldownStore          CooldownStateStore
+	cooldownStoreVersion   uint64
 	pendingCooldownRestore map[string][]CooldownStateRecord
 	cooldownRestoreIDs     map[string]struct{}
 	cooldownPersister      *cooldownStatePersister
@@ -506,10 +507,9 @@ func (m *Manager) SetCooldownStateStore(store CooldownStateStore) {
 	m.mu.Lock()
 	defer m.mu.Unlock()
 	m.cooldownStore = store
-	if store == nil {
-		m.pendingCooldownRestore = nil
-		m.cooldownRestoreIDs = nil
-	}
+	m.cooldownStoreVersion++
+	m.pendingCooldownRestore = nil
+	m.cooldownRestoreIDs = nil
 }
 
 // SetRoundTripperProvider register a provider that returns a per-auth RoundTripper.
@@ -585,12 +585,19 @@ func (m *Manager) PrepareCooldownRestore(ctx context.Context) error {
 	}
 	m.mu.RLock()
 	store := m.cooldownStore
+	storeVersion := m.cooldownStoreVersion
 	m.mu.RUnlock()
 	if store == nil {
 		return nil
 	}
 	snapshots, errLoad := store.Load(ctx)
 	if errLoad != nil {
+		m.mu.RLock()
+		storeChanged := storeVersion != m.cooldownStoreVersion
+		m.mu.RUnlock()
+		if storeChanged {
+			return nil
+		}
 		return fmt.Errorf("load cooldown snapshots: %w", errLoad)
 	}
 	pending := make(map[string][]CooldownStateRecord, len(snapshots))
@@ -607,9 +614,13 @@ func (m *Manager) PrepareCooldownRestore(ctx context.Context) error {
 				records[i].AuthID = authID
 			}
 		}
-		pending[authID] = records
+		pending[authID] = append(pending[authID], records...)
 	}
 	m.mu.Lock()
+	if storeVersion != m.cooldownStoreVersion {
+		m.mu.Unlock()
+		return nil
+	}
 	m.pendingCooldownRestore = pending
 	m.cooldownRestoreIDs = ids
 	now := time.Now()
@@ -729,7 +740,14 @@ func (m *Manager) applyPendingCooldownRestoreLocked(auth *Auth, now time.Time) {
 	delete(m.pendingCooldownRestore, auth.ID)
 	disabled := m.cooldownDisabledForAuth(auth)
 	for _, record := range records {
-		restoreCooldownRecord(auth, record, now, disabled)
+		if strings.TrimSpace(record.Model) != "" {
+			restoreCooldownRecord(auth, record, now, disabled)
+		}
+	}
+	for _, record := range records {
+		if strings.TrimSpace(record.Model) == "" {
+			restoreCooldownRecord(auth, record, now, disabled)
+		}
 	}
 }
 
@@ -2260,6 +2278,7 @@ func (m *Manager) Register(ctx context.Context, auth *Auth) (*Auth, error) {
 	}
 	now := time.Now()
 	m.mu.Lock()
+	_, deferCooldownCleanup := m.cooldownRestoreIDs[auth.ID]
 	m.applyPendingCooldownRestoreLocked(auth, now)
 	clearedCooldown := false
 	if m.cooldownDisabledForAuth(auth) || auth.Disabled || auth.Status == StatusDisabled {
@@ -2278,7 +2297,7 @@ func (m *Manager) Register(ctx context.Context, auth *Auth) (*Auth, error) {
 	m.queueRefreshReschedule(auth.ID)
 	_ = m.persist(ctx, auth)
 	m.hook.OnAuthRegistered(ctx, auth.Clone())
-	if clearedCooldown {
+	if clearedCooldown && !deferCooldownCleanup {
 		m.queueCooldownStatePersist(auth.ID)
 	}
 	return auth.Clone(), nil
@@ -2319,7 +2338,7 @@ func (m *Manager) Update(ctx context.Context, auth *Auth) (*Auth, error) {
 			auth.ModelStates = existing.ModelStates
 		}
 	}
-	_, pendingCooldownRestore := m.pendingCooldownRestore[auth.ID]
+	_, deferCooldownCleanup := m.cooldownRestoreIDs[auth.ID]
 	m.applyPendingCooldownRestoreLocked(auth, now)
 	clearedCooldown := false
 	if m.cooldownDisabledForAuth(auth) || auth.Disabled || auth.Status == StatusDisabled {
@@ -2330,7 +2349,7 @@ func (m *Manager) Update(ctx context.Context, auth *Auth) (*Auth, error) {
 	m.auths[auth.ID] = authClone
 	if trackCooldownState {
 		cooldownRecordsAfter := m.cooldownStateRecordsForAuthLocked(authClone, now)
-		cooldownStateChanged = !pendingCooldownRestore && !cooldownStateRecordsEqual(cooldownRecordsBefore, cooldownRecordsAfter)
+		cooldownStateChanged = !cooldownStateRecordsEqual(cooldownRecordsBefore, cooldownRecordsAfter)
 	}
 	m.mu.Unlock()
 	if !shouldDeferAPIKeyModelAliasRebuild(ctx) {
@@ -2342,7 +2361,7 @@ func (m *Manager) Update(ctx context.Context, auth *Auth) (*Auth, error) {
 	m.queueRefreshReschedule(auth.ID)
 	_ = m.persist(ctx, auth)
 	m.hook.OnAuthUpdated(ctx, auth.Clone())
-	if clearedCooldown || cooldownStateChanged {
+	if !deferCooldownCleanup && (clearedCooldown || cooldownStateChanged) {
 		m.queueCooldownStatePersist(auth.ID)
 	}
 	for _, model := range resumeModels {
