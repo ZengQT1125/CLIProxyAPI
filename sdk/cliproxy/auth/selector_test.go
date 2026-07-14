@@ -208,6 +208,30 @@ func TestSequentialFillSelectorPick_StickyBehavior(t *testing.T) {
 	}
 }
 
+func TestSequentialFillSelectorPick_HonorsMetadataPriority(t *testing.T) {
+	t.Parallel()
+
+	selector := &SequentialFillSelector{}
+	low := &Auth{ID: "low", Metadata: map[string]any{"priority": float64(-2)}}
+	high := &Auth{ID: "high", Metadata: map[string]any{"priority": float64(-1)}}
+
+	first, err := selector.Pick(context.Background(), "codex", "", cliproxyexecutor.Options{}, []*Auth{low})
+	if err != nil {
+		t.Fatalf("Pick() setup error = %v", err)
+	}
+	if first.ID != low.ID {
+		t.Fatalf("Pick() setup auth.ID = %q, want %q", first.ID, low.ID)
+	}
+
+	second, err := selector.Pick(context.Background(), "codex", "", cliproxyexecutor.Options{}, []*Auth{low, high})
+	if err != nil {
+		t.Fatalf("Pick() error = %v", err)
+	}
+	if second.ID != high.ID {
+		t.Fatalf("Pick() auth.ID = %q, want highest metadata priority %q", second.ID, high.ID)
+	}
+}
+
 func TestSequentialFillSelectorPick_AdvanceOnUnavailable(t *testing.T) {
 	t.Parallel()
 
