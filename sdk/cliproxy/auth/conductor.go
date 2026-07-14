@@ -581,11 +581,11 @@ func (m *Manager) RestoreCooldownStates(ctx context.Context) error {
 	if store == nil {
 		return nil
 	}
-	records, errLoad := store.Load(ctx)
+	snapshots, errLoad := store.Load(ctx)
 	if errLoad != nil {
 		return errLoad
 	}
-	if len(records) == 0 {
+	if len(snapshots) == 0 {
 		return nil
 	}
 
@@ -594,14 +594,16 @@ func (m *Manager) RestoreCooldownStates(ctx context.Context) error {
 	snapshotsByID := make(map[string]*Auth)
 
 	m.mu.Lock()
-	for _, record := range records {
-		if strings.TrimSpace(record.Model) == "" {
-			authLevelRecords = append(authLevelRecords, record)
-			continue
-		}
-		if m.restoreCooldownRecordLocked(record, now) {
-			if auth := m.auths[strings.TrimSpace(record.AuthID)]; auth != nil {
-				snapshotsByID[auth.ID] = auth.Clone()
+	for _, snapshot := range snapshots {
+		for _, record := range snapshot.Records {
+			if strings.TrimSpace(record.Model) == "" {
+				authLevelRecords = append(authLevelRecords, record)
+				continue
+			}
+			if m.restoreCooldownRecordLocked(record, now) {
+				if auth := m.auths[strings.TrimSpace(record.AuthID)]; auth != nil {
+					snapshotsByID[auth.ID] = auth.Clone()
+				}
 			}
 		}
 	}
@@ -820,18 +822,18 @@ func (m *Manager) persistCooldownStates(ctx context.Context) {
 	if ctx == nil {
 		ctx = context.Background()
 	}
-	records, store := m.cooldownStateSnapshot()
+	snapshots, store := m.cooldownStateSnapshot()
 	if store == nil {
 		return
 	}
-	if errSave := store.Save(ctx, records); errSave != nil {
+	if errSave := store.Apply(ctx, snapshots); errSave != nil {
 		logEntryWithRequestID(ctx).Warnf("failed to persist cooldown state: %v", errSave)
 	}
 }
 
-func (m *Manager) cooldownStateSnapshot() ([]CooldownStateRecord, CooldownStateStore) {
+func (m *Manager) cooldownStateSnapshot() ([]CooldownStateSnapshot, CooldownStateStore) {
 	now := time.Now()
-	records := make([]CooldownStateRecord, 0)
+	snapshots := make([]CooldownStateSnapshot, 0)
 
 	m.mu.RLock()
 	store := m.cooldownStore
@@ -840,20 +842,20 @@ func (m *Manager) cooldownStateSnapshot() ([]CooldownStateRecord, CooldownStateS
 		return nil, nil
 	}
 	for _, auth := range m.auths {
-		records = append(records, m.cooldownStateRecordsForAuthLocked(auth, now)...)
+		if auth == nil || strings.TrimSpace(auth.ID) == "" {
+			continue
+		}
+		snapshots = append(snapshots, CooldownStateSnapshot{
+			AuthID:  auth.ID,
+			Records: m.cooldownStateRecordsForAuthLocked(auth, now),
+		})
 	}
 	m.mu.RUnlock()
 
-	sort.Slice(records, func(i, j int) bool {
-		if records[i].Provider != records[j].Provider {
-			return records[i].Provider < records[j].Provider
-		}
-		if records[i].AuthID != records[j].AuthID {
-			return records[i].AuthID < records[j].AuthID
-		}
-		return records[i].Model < records[j].Model
+	sort.Slice(snapshots, func(i, j int) bool {
+		return snapshots[i].AuthID < snapshots[j].AuthID
 	})
-	return records, store
+	return snapshots, store
 }
 
 func (m *Manager) cooldownStateRecordsForAuthLocked(auth *Auth, now time.Time) []CooldownStateRecord {

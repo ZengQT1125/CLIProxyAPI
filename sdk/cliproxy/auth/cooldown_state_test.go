@@ -12,34 +12,38 @@ import (
 )
 
 type recordingCooldownStateStore struct {
-	saveCount atomic.Int32
-	mu        sync.Mutex
-	records   []CooldownStateRecord
-	load      []CooldownStateRecord
+	applyCount atomic.Int32
+	mu         sync.Mutex
+	snapshots  []CooldownStateSnapshot
+	load       []CooldownStateSnapshot
 }
 
-func (s *recordingCooldownStateStore) Load(context.Context) ([]CooldownStateRecord, error) {
+func (s *recordingCooldownStateStore) Load(context.Context) ([]CooldownStateSnapshot, error) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	return cloneCooldownStateRecords(s.load), nil
+	return cloneCooldownStateSnapshots(s.load), nil
 }
 
-func (s *recordingCooldownStateStore) Save(_ context.Context, records []CooldownStateRecord) error {
-	s.saveCount.Add(1)
+func (s *recordingCooldownStateStore) Apply(_ context.Context, snapshots []CooldownStateSnapshot) error {
+	s.applyCount.Add(1)
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	s.records = cloneCooldownStateRecords(records)
+	s.snapshots = cloneCooldownStateSnapshots(snapshots)
 	return nil
 }
 
-func cloneCooldownStateRecords(records []CooldownStateRecord) []CooldownStateRecord {
-	if len(records) == 0 {
+func cloneCooldownStateSnapshots(snapshots []CooldownStateSnapshot) []CooldownStateSnapshot {
+	if len(snapshots) == 0 {
 		return nil
 	}
-	cloned := make([]CooldownStateRecord, len(records))
-	for i := range records {
-		cloned[i] = records[i]
-		cloned[i].LastError = cloneError(records[i].LastError)
+	cloned := make([]CooldownStateSnapshot, len(snapshots))
+	for i := range snapshots {
+		cloned[i].AuthID = snapshots[i].AuthID
+		cloned[i].Records = make([]CooldownStateRecord, len(snapshots[i].Records))
+		for j := range snapshots[i].Records {
+			cloned[i].Records[j] = snapshots[i].Records[j]
+			cloned[i].Records[j].LastError = cloneError(snapshots[i].Records[j].LastError)
+		}
 	}
 	return cloned
 }
@@ -103,22 +107,17 @@ func TestFileCooldownStateStore_StateRelativePath(t *testing.T) {
 	}
 }
 
-func TestFileCooldownStateStore_SaveLoadAndCleanStale(t *testing.T) {
+func TestFileCooldownStateStore_ApplyOnlyChangesNamedAuth(t *testing.T) {
 	authDir := t.TempDir()
 	store := NewFileCooldownStateStoreWithAuthDir(authDir, authDir)
 	ctx := context.Background()
 
-	stalePath := filepath.Join(authDir, "stale.cds")
-	if errWrite := os.WriteFile(stalePath, []byte("{}\n"), 0o600); errWrite != nil {
-		t.Fatalf("write stale file: %v", errWrite)
-	}
-
 	nextRetry := time.Now().Add(time.Hour).UTC().Truncate(time.Second)
 	updatedAt := time.Now().UTC().Truncate(time.Second)
-	record := CooldownStateRecord{
+	record1 := CooldownStateRecord{
 		Provider:       "xai",
 		AuthID:         "auth-1",
-		AuthFile:       filepath.Join(authDir, "xai.json"),
+		AuthFile:       filepath.Join(authDir, "xai-1.json"),
 		Model:          "grok-4",
 		Status:         "cooling",
 		NextRetryAfter: nextRetry,
@@ -132,40 +131,59 @@ func TestFileCooldownStateStore_SaveLoadAndCleanStale(t *testing.T) {
 		LastError: &Error{Message: "rate limited", HTTPStatus: 429},
 		UpdatedAt: updatedAt,
 	}
+	record2 := record1
+	record2.AuthID = "auth-2"
+	record2.AuthFile = filepath.Join(authDir, "xai-2.json")
+	record2.Model = "grok-3"
 
-	if errSave := store.Save(ctx, []CooldownStateRecord{record}); errSave != nil {
-		t.Fatalf("Save() returned error: %v", errSave)
+	if errApply := store.Apply(ctx, []CooldownStateSnapshot{
+		{AuthID: record1.AuthID, Records: []CooldownStateRecord{record1}},
+		{AuthID: record2.AuthID, Records: []CooldownStateRecord{record2}},
+	}); errApply != nil {
+		t.Fatalf("Apply() returned error: %v", errApply)
 	}
-	if _, errStat := os.Stat(filepath.Join(authDir, "xai.cds")); errStat != nil {
-		t.Fatalf("expected xai.cds to exist: %v", errStat)
+	if _, errStat := os.Stat(filepath.Join(authDir, "xai-1.cds")); errStat != nil {
+		t.Fatalf("expected xai-1.cds to exist: %v", errStat)
 	}
-	if _, errStat := os.Stat(stalePath); !errors.Is(errStat, os.ErrNotExist) {
-		t.Fatalf("expected stale.cds to be removed, stat error = %v", errStat)
+	if _, errStat := os.Stat(filepath.Join(authDir, "xai-2.cds")); errStat != nil {
+		t.Fatalf("expected xai-2.cds to exist: %v", errStat)
 	}
 
 	loaded, errLoad := store.Load(ctx)
 	if errLoad != nil {
 		t.Fatalf("Load() returned error: %v", errLoad)
 	}
-	if len(loaded) != 1 {
-		t.Fatalf("loaded records = %d, want 1", len(loaded))
-	}
-	if loaded[0].AuthID != record.AuthID || loaded[0].Model != record.Model || !loaded[0].NextRetryAfter.Equal(nextRetry) {
-		t.Fatalf("loaded record = %+v, want auth/model/retry from %+v", loaded[0], record)
-	}
-	if loaded[0].LastError == nil || loaded[0].LastError.HTTPStatus != 429 {
-		t.Fatalf("loaded last error = %+v, want HTTP 429", loaded[0].LastError)
+	if len(loaded) != 2 {
+		t.Fatalf("loaded snapshots = %d, want 2", len(loaded))
 	}
 
-	if errSave := store.Save(ctx, nil); errSave != nil {
-		t.Fatalf("Save(nil) returned error: %v", errSave)
+	if errApply := store.Apply(ctx, []CooldownStateSnapshot{{AuthID: record1.AuthID}}); errApply != nil {
+		t.Fatalf("Apply(clear auth-1) returned error: %v", errApply)
 	}
-	if _, errStat := os.Stat(filepath.Join(authDir, "xai.cds")); !errors.Is(errStat, os.ErrNotExist) {
-		t.Fatalf("expected xai.cds to be removed, stat error = %v", errStat)
+	if _, errStat := os.Stat(filepath.Join(authDir, "xai-1.cds")); !errors.Is(errStat, os.ErrNotExist) {
+		t.Fatalf("expected xai-1.cds to be removed, stat error = %v", errStat)
+	}
+	if _, errStat := os.Stat(filepath.Join(authDir, "xai-2.cds")); errStat != nil {
+		t.Fatalf("expected xai-2.cds to remain: %v", errStat)
+	}
+
+	loaded, errLoad = store.Load(ctx)
+	if errLoad != nil {
+		t.Fatalf("Load() after clear returned error: %v", errLoad)
+	}
+	if len(loaded) != 1 || loaded[0].AuthID != record2.AuthID || len(loaded[0].Records) != 1 {
+		t.Fatalf("loaded snapshots = %+v, want only auth-2", loaded)
+	}
+	loadedRecord := loaded[0].Records[0]
+	if loadedRecord.Model != record2.Model || !loadedRecord.NextRetryAfter.Equal(nextRetry) {
+		t.Fatalf("loaded record = %+v, want %+v", loadedRecord, record2)
+	}
+	if loadedRecord.LastError == nil || loadedRecord.LastError.HTTPStatus != 429 {
+		t.Fatalf("loaded last error = %+v, want HTTP 429", loadedRecord.LastError)
 	}
 }
 
-func TestFileCooldownStateStore_ConcurrentSave(t *testing.T) {
+func TestFileCooldownStateStore_ConcurrentApply(t *testing.T) {
 	authDir := t.TempDir()
 	store := NewFileCooldownStateStoreWithAuthDir(authDir, authDir)
 	ctx := context.Background()
@@ -178,8 +196,8 @@ func TestFileCooldownStateStore_ConcurrentSave(t *testing.T) {
 		wg.Add(1)
 		go func() {
 			defer wg.Done()
-			errs <- store.Save(ctx, []CooldownStateRecord{
-				{
+			errs <- store.Apply(ctx, []CooldownStateSnapshot{
+				{AuthID: "auth-1", Records: []CooldownStateRecord{{
 					Provider:       "xai",
 					AuthID:         "auth-1",
 					AuthFile:       filepath.Join(authDir, "xai.json"),
@@ -187,15 +205,15 @@ func TestFileCooldownStateStore_ConcurrentSave(t *testing.T) {
 					Status:         "cooling",
 					NextRetryAfter: nextRetry.Add(time.Duration(i) * time.Second),
 					UpdatedAt:      nextRetry,
-				},
+				}}},
 			})
 		}()
 	}
 	wg.Wait()
 	close(errs)
-	for errSave := range errs {
-		if errSave != nil {
-			t.Fatalf("Save() returned error: %v", errSave)
+	for errApply := range errs {
+		if errApply != nil {
+			t.Fatalf("Apply() returned error: %v", errApply)
 		}
 	}
 
@@ -203,8 +221,8 @@ func TestFileCooldownStateStore_ConcurrentSave(t *testing.T) {
 	if errLoad != nil {
 		t.Fatalf("Load() returned error: %v", errLoad)
 	}
-	if len(loaded) != 1 {
-		t.Fatalf("loaded records = %d, want 1", len(loaded))
+	if len(loaded) != 1 || len(loaded[0].Records) != 1 {
+		t.Fatalf("loaded snapshots = %+v, want one auth with one record", loaded)
 	}
 
 	tmpMatches, errGlob := filepath.Glob(filepath.Join(authDir, "*.tmp"))
@@ -227,7 +245,7 @@ func TestManager_MarkResult_PersistsCooldownOnlyWhenStateChanges(t *testing.T) {
 	}
 
 	manager.MarkResult(context.Background(), Result{AuthID: auth.ID, Provider: "xai", Model: "grok-4", Success: true})
-	if got := store.saveCount.Load(); got != 0 {
+	if got := store.applyCount.Load(); got != 0 {
 		t.Fatalf("healthy success saved cooldown state %d times, want 0", got)
 	}
 
@@ -238,17 +256,17 @@ func TestManager_MarkResult_PersistsCooldownOnlyWhenStateChanges(t *testing.T) {
 		Success:  false,
 		Error:    &Error{Message: "upstream unavailable", HTTPStatus: 500},
 	})
-	if got := store.saveCount.Load(); got != 1 {
+	if got := store.applyCount.Load(); got != 1 {
 		t.Fatalf("cooldown failure saved cooldown state %d times, want 1", got)
 	}
 
 	manager.MarkResult(context.Background(), Result{AuthID: auth.ID, Provider: "xai", Model: "grok-4", Success: true})
-	if got := store.saveCount.Load(); got != 2 {
+	if got := store.applyCount.Load(); got != 2 {
 		t.Fatalf("cooldown clear saved cooldown state %d times, want 2", got)
 	}
 
 	manager.MarkResult(context.Background(), Result{AuthID: auth.ID, Provider: "xai", Model: "grok-4", Success: true})
-	if got := store.saveCount.Load(); got != 2 {
+	if got := store.applyCount.Load(); got != 2 {
 		t.Fatalf("clean success saved cooldown state %d times, want 2", got)
 	}
 }
@@ -256,8 +274,8 @@ func TestManager_MarkResult_PersistsCooldownOnlyWhenStateChanges(t *testing.T) {
 func TestManager_RestoreCooldownStates(t *testing.T) {
 	nextRetry := time.Now().Add(time.Hour).UTC().Truncate(time.Second)
 	store := &recordingCooldownStateStore{
-		load: []CooldownStateRecord{
-			{
+		load: []CooldownStateSnapshot{
+			{AuthID: "auth-1", Records: []CooldownStateRecord{{
 				Provider:       "xai",
 				AuthID:         "auth-1",
 				Model:          "grok-4",
@@ -271,7 +289,7 @@ func TestManager_RestoreCooldownStates(t *testing.T) {
 				},
 				LastError: &Error{Message: "rate limited", HTTPStatus: 429},
 				UpdatedAt: nextRetry.Add(-time.Minute),
-			},
+			}}},
 		},
 	}
 	manager := NewManager(nil, nil, nil)
@@ -298,7 +316,7 @@ func TestManager_RestoreCooldownStates(t *testing.T) {
 	if state.LastError == nil || state.LastError.HTTPStatus != 429 {
 		t.Fatalf("restored last error = %+v, want HTTP 429", state.LastError)
 	}
-	if got := store.saveCount.Load(); got != 1 {
+	if got := store.applyCount.Load(); got != 1 {
 		t.Fatalf("restore cleanup saved cooldown state %d times, want 1", got)
 	}
 }

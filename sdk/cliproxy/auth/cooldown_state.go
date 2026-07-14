@@ -29,10 +29,17 @@ type CooldownStateRecord struct {
 	UpdatedAt      time.Time  `json:"updated_at"`
 }
 
+// CooldownStateSnapshot replaces persisted cooldown state for one auth.
+// An empty Records slice removes persisted state for AuthID.
+type CooldownStateSnapshot struct {
+	AuthID  string
+	Records []CooldownStateRecord
+}
+
 // CooldownStateStore persists runtime cooldown state independently from auth tokens.
 type CooldownStateStore interface {
-	Load(context.Context) ([]CooldownStateRecord, error)
-	Save(context.Context, []CooldownStateRecord) error
+	Load(context.Context) ([]CooldownStateSnapshot, error)
+	Apply(context.Context, []CooldownStateSnapshot) error
 }
 
 type cooldownStateFile struct {
@@ -48,6 +55,7 @@ type FileCooldownStateStore struct {
 	mu      sync.Mutex
 	dir     string
 	authDir string
+	paths   map[string]string
 }
 
 // NewFileCooldownStateStore creates a file-backed cooldown state store rooted at dir.
@@ -61,11 +69,12 @@ func NewFileCooldownStateStoreWithAuthDir(dir, authDir string) *FileCooldownStat
 	return &FileCooldownStateStore{
 		dir:     strings.TrimSpace(dir),
 		authDir: strings.TrimSpace(authDir),
+		paths:   make(map[string]string),
 	}
 }
 
 // Load reads all cooldown state files. A missing directory is treated as empty state.
-func (s *FileCooldownStateStore) Load(ctx context.Context) ([]CooldownStateRecord, error) {
+func (s *FileCooldownStateStore) Load(ctx context.Context) ([]CooldownStateSnapshot, error) {
 	if s == nil || s.dir == "" {
 		return nil, nil
 	}
@@ -76,7 +85,13 @@ func (s *FileCooldownStateStore) Load(ctx context.Context) ([]CooldownStateRecor
 		return nil, errCtx
 	}
 
-	records := make([]CooldownStateRecord, 0)
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if s.paths == nil {
+		s.paths = make(map[string]string)
+	}
+
+	snapshots := make([]CooldownStateSnapshot, 0)
 	errWalk := filepath.WalkDir(s.dir, func(path string, entry fs.DirEntry, err error) error {
 		if err != nil {
 			if errors.Is(err, os.ErrNotExist) {
@@ -90,11 +105,15 @@ func (s *FileCooldownStateStore) Load(ctx context.Context) ([]CooldownStateRecor
 		if !strings.EqualFold(filepath.Ext(entry.Name()), ".cds") {
 			return nil
 		}
-		fileRecords, errRead := readCooldownStateFile(ctx, path)
+		snapshot, errRead := readCooldownStateFile(ctx, path)
 		if errRead != nil {
 			return errRead
 		}
-		records = append(records, fileRecords...)
+		if snapshot.AuthID == "" {
+			return nil
+		}
+		s.paths[snapshot.AuthID] = filepath.Clean(path)
+		snapshots = append(snapshots, snapshot)
 		return nil
 	})
 	if errWalk != nil {
@@ -103,32 +122,39 @@ func (s *FileCooldownStateStore) Load(ctx context.Context) ([]CooldownStateRecor
 		}
 		return nil, fmt.Errorf("read cooldown state directory: %w", errWalk)
 	}
-	return records, nil
+	sort.Slice(snapshots, func(i, j int) bool {
+		return snapshots[i].AuthID < snapshots[j].AuthID
+	})
+	return snapshots, nil
 }
 
-func readCooldownStateFile(ctx context.Context, path string) ([]CooldownStateRecord, error) {
+func readCooldownStateFile(ctx context.Context, path string) (CooldownStateSnapshot, error) {
 	if errCtx := ctx.Err(); errCtx != nil {
-		return nil, errCtx
+		return CooldownStateSnapshot{}, errCtx
 	}
 	data, errRead := os.ReadFile(path)
 	if errRead != nil {
 		if errors.Is(errRead, os.ErrNotExist) {
-			return nil, nil
+			return CooldownStateSnapshot{}, nil
 		}
-		return nil, fmt.Errorf("read cooldown state %s: %w", path, errRead)
+		return CooldownStateSnapshot{}, fmt.Errorf("read cooldown state %s: %w", path, errRead)
 	}
 	if len(strings.TrimSpace(string(data))) == 0 {
-		return nil, nil
+		return CooldownStateSnapshot{}, nil
 	}
 	var envelope cooldownStateFile
 	if errUnmarshal := json.Unmarshal(data, &envelope); errUnmarshal != nil {
-		return nil, fmt.Errorf("parse cooldown state %s: %w", path, errUnmarshal)
+		return CooldownStateSnapshot{}, fmt.Errorf("parse cooldown state %s: %w", path, errUnmarshal)
 	}
-	return envelope.Records, nil
+	authID := strings.TrimSpace(envelope.AuthID)
+	if authID == "" && len(envelope.Records) > 0 {
+		authID = strings.TrimSpace(envelope.Records[0].AuthID)
+	}
+	return CooldownStateSnapshot{AuthID: authID, Records: envelope.Records}, nil
 }
 
-// Save atomically writes one cooldown state file per auth and removes stale files.
-func (s *FileCooldownStateStore) Save(ctx context.Context, records []CooldownStateRecord) error {
+// Apply replaces cooldown state for the auth IDs present in snapshots.
+func (s *FileCooldownStateStore) Apply(ctx context.Context, snapshots []CooldownStateSnapshot) error {
 	if s == nil || s.dir == "" {
 		return nil
 	}
@@ -141,35 +167,74 @@ func (s *FileCooldownStateStore) Save(ctx context.Context, records []CooldownSta
 
 	s.mu.Lock()
 	defer s.mu.Unlock()
+	if s.paths == nil {
+		s.paths = make(map[string]string)
+	}
 
-	groups := make(map[string][]CooldownStateRecord)
-	for _, record := range records {
-		authID := strings.TrimSpace(record.AuthID)
+	type operation struct {
+		authID  string
+		path    string
+		records []CooldownStateRecord
+	}
+	operations := make([]operation, 0, len(snapshots))
+	seen := make(map[string]struct{}, len(snapshots))
+	for _, snapshot := range snapshots {
+		authID := strings.TrimSpace(snapshot.AuthID)
 		if authID == "" {
+			return fmt.Errorf("cooldown state: missing auth id")
+		}
+		if _, ok := seen[authID]; ok {
+			return fmt.Errorf("cooldown state: duplicate auth id %s", authID)
+		}
+		seen[authID] = struct{}{}
+
+		records := append([]CooldownStateRecord(nil), snapshot.Records...)
+		if len(records) == 0 {
+			operations = append(operations, operation{authID: authID})
 			continue
 		}
-		path, errPath := s.statePath(record)
+		for i := range records {
+			recordAuthID := strings.TrimSpace(records[i].AuthID)
+			if recordAuthID == "" {
+				records[i].AuthID = authID
+				continue
+			}
+			if recordAuthID != authID {
+				return fmt.Errorf("cooldown state: record auth id %s does not match snapshot %s", recordAuthID, authID)
+			}
+		}
+		path, errPath := s.statePath(records[0])
 		if errPath != nil {
 			return errPath
 		}
-		groups[path] = append(groups[path], record)
+		operations = append(operations, operation{authID: authID, path: filepath.Clean(path), records: records})
 	}
 
-	if len(groups) == 0 {
-		return s.removeAllStateFiles(ctx)
-	}
-	if errMkdir := os.MkdirAll(s.dir, 0o700); errMkdir != nil {
-		return fmt.Errorf("create cooldown state directory: %w", errMkdir)
-	}
-
-	desired := make(map[string]struct{}, len(groups))
-	for path, groupedRecords := range groups {
-		if errSave := writeCooldownStateGroup(ctx, path, groupedRecords); errSave != nil {
+	for _, op := range operations {
+		if errCtx := ctx.Err(); errCtx != nil {
+			return errCtx
+		}
+		oldPath := s.paths[op.authID]
+		if len(op.records) == 0 {
+			if oldPath != "" {
+				if errRemove := os.Remove(oldPath); errRemove != nil && !errors.Is(errRemove, os.ErrNotExist) {
+					return fmt.Errorf("remove cooldown state %s: %w", oldPath, errRemove)
+				}
+			}
+			delete(s.paths, op.authID)
+			continue
+		}
+		if errSave := writeCooldownStateGroup(ctx, op.path, op.records); errSave != nil {
 			return errSave
 		}
-		desired[filepath.Clean(path)] = struct{}{}
+		if oldPath != "" && oldPath != op.path {
+			if errRemove := os.Remove(oldPath); errRemove != nil && !errors.Is(errRemove, os.ErrNotExist) {
+				return fmt.Errorf("remove old cooldown state %s: %w", oldPath, errRemove)
+			}
+		}
+		s.paths[op.authID] = op.path
 	}
-	return s.removeStaleStateFiles(ctx, desired)
+	return nil
 }
 
 func writeCooldownStateGroup(ctx context.Context, path string, records []CooldownStateRecord) error {
@@ -219,43 +284,6 @@ func writeCooldownStateGroup(ctx context.Context, path string, records []Cooldow
 	if errRename := os.Rename(tmp, path); errRename != nil {
 		_ = os.Remove(tmp)
 		return fmt.Errorf("replace cooldown state file: %w", errRename)
-	}
-	return nil
-}
-
-func (s *FileCooldownStateStore) removeAllStateFiles(ctx context.Context) error {
-	return s.removeStaleStateFiles(ctx, nil)
-}
-
-func (s *FileCooldownStateStore) removeStaleStateFiles(ctx context.Context, desired map[string]struct{}) error {
-	errWalk := filepath.WalkDir(s.dir, func(path string, entry fs.DirEntry, err error) error {
-		if err != nil {
-			if errors.Is(err, os.ErrNotExist) {
-				return nil
-			}
-			return err
-		}
-		if errCtx := ctx.Err(); errCtx != nil {
-			return errCtx
-		}
-		if entry == nil || entry.IsDir() {
-			return nil
-		}
-		if !strings.EqualFold(filepath.Ext(entry.Name()), ".cds") {
-			return nil
-		}
-		if desired != nil {
-			if _, ok := desired[filepath.Clean(path)]; ok {
-				return nil
-			}
-		}
-		if errRemove := os.Remove(path); errRemove != nil && !errors.Is(errRemove, os.ErrNotExist) {
-			return fmt.Errorf("remove stale cooldown state %s: %w", path, errRemove)
-		}
-		return nil
-	})
-	if errWalk != nil && !errors.Is(errWalk, os.ErrNotExist) {
-		return fmt.Errorf("clean cooldown state directory: %w", errWalk)
 	}
 	return nil
 }
