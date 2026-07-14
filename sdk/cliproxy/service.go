@@ -1830,6 +1830,9 @@ func (s *Service) Run(ctx context.Context) error {
 		// Home mode does not expose in-process Redis RESP usage output; usage is forwarded to home instead.
 		redisqueue.SetEnabled(true)
 	}
+	if s.hooks.OnBeforeStart != nil {
+		s.hooks.OnBeforeStart(s.cfg)
+	}
 
 	var watcherWrapper *WatcherWrapper
 	if !homeEnabled {
@@ -1880,10 +1883,6 @@ func (s *Service) Run(ctx context.Context) error {
 			}
 			log.Debugf("ws-auth disabled; existing websocket sessions remain connected")
 		})
-	}
-
-	if s.hooks.OnBeforeStart != nil {
-		s.hooks.OnBeforeStart(s.cfg)
 	}
 
 	s.serverErr = make(chan error, 1)

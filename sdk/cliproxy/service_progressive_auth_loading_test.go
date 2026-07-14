@@ -73,6 +73,60 @@ func TestServiceRunListensBeforeInitialAuthLoadCompletes(t *testing.T) {
 	_ = response.Body.Close()
 }
 
+func TestServiceRunAppliesBeforeStartConfigBeforeWatcherSetup(t *testing.T) {
+	oldStore := sdkAuth.GetTokenStore()
+	sdkAuth.RegisterTokenStore(sdkAuth.NewFileTokenStore())
+	t.Cleanup(func() { sdkAuth.RegisterTokenStore(oldStore) })
+	originalAuthDir := t.TempDir()
+	updatedAuthDir := t.TempDir()
+	port := reserveTCPPort(t)
+	configPath := filepath.Join(t.TempDir(), "config.yaml")
+	if errWrite := os.WriteFile(configPath, []byte(fmt.Sprintf("host: 127.0.0.1\nport: %d\nauth-dir: %s\n", port, originalAuthDir)), 0o600); errWrite != nil {
+		t.Fatal(errWrite)
+	}
+	type watcherSetup struct {
+		factoryAuthDir string
+		configAuthDir  string
+	}
+	setup := make(chan watcherSetup, 1)
+	var factoryAuthDir string
+	wrapper := &WatcherWrapper{
+		start:          func(context.Context) error { return nil },
+		stop:           func() error { return nil },
+		setUpdateQueue: func(chan<- watcher.AuthUpdateBatch) {},
+		setConfig: func(cfg *config.Config) {
+			setup <- watcherSetup{factoryAuthDir: factoryAuthDir, configAuthDir: cfg.AuthDir}
+		},
+	}
+	service, errBuild := NewBuilder().
+		WithConfig(&config.Config{Host: "127.0.0.1", Port: port, AuthDir: originalAuthDir}).
+		WithConfigPath(configPath).
+		WithHooks(Hooks{OnBeforeStart: func(cfg *config.Config) { cfg.AuthDir = updatedAuthDir }}).
+		WithWatcherFactory(func(_ string, authDir string, _ func(*config.Config)) (*WatcherWrapper, error) {
+			factoryAuthDir = authDir
+			return wrapper, nil
+		}).
+		Build()
+	if errBuild != nil {
+		t.Fatal(errBuild)
+	}
+	ctx, cancel := context.WithCancel(context.Background())
+	done := make(chan error, 1)
+	go func() { done <- service.Run(ctx) }()
+	defer func() {
+		cancel()
+		<-done
+	}()
+	select {
+	case got := <-setup:
+		if got.factoryAuthDir != updatedAuthDir || got.configAuthDir != updatedAuthDir {
+			t.Fatalf("watcher setup = %+v, want auth dir %q", got, updatedAuthDir)
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatal("watcher setup did not run")
+	}
+}
+
 func reserveTCPPort(t testing.TB) int {
 	t.Helper()
 	listener, errListen := net.Listen("tcp", "127.0.0.1:0")
