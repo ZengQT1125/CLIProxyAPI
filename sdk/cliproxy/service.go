@@ -14,7 +14,6 @@ import (
 
 	"github.com/router-for-me/CLIProxyAPI/v7/internal/api"
 	"github.com/router-for-me/CLIProxyAPI/v7/internal/constant"
-	"github.com/router-for-me/CLIProxyAPI/v7/internal/store"
 	"github.com/router-for-me/CLIProxyAPI/v7/internal/home"
 	"github.com/router-for-me/CLIProxyAPI/v7/internal/homeplugins"
 	"github.com/router-for-me/CLIProxyAPI/v7/internal/logging"
@@ -22,6 +21,7 @@ import (
 	"github.com/router-for-me/CLIProxyAPI/v7/internal/redisqueue"
 	"github.com/router-for-me/CLIProxyAPI/v7/internal/registry"
 	"github.com/router-for-me/CLIProxyAPI/v7/internal/runtime/executor"
+	"github.com/router-for-me/CLIProxyAPI/v7/internal/store"
 	internalusage "github.com/router-for-me/CLIProxyAPI/v7/internal/usage"
 	"github.com/router-for-me/CLIProxyAPI/v7/internal/util"
 	"github.com/router-for-me/CLIProxyAPI/v7/internal/watcher"
@@ -1890,6 +1890,14 @@ func (s *Service) Shutdown(ctx context.Context) error {
 				log.Errorf("error stopping API server: %v", err)
 				if shutdownErr == nil {
 					shutdownErr = err
+				}
+			}
+		}
+		if s.coreManager != nil {
+			if errFlush := s.coreManager.FlushCooldownStates(ctx); errFlush != nil {
+				log.Errorf("failed to flush cooldown state: %v", errFlush)
+				if shutdownErr == nil {
+					shutdownErr = errFlush
 				}
 			}
 		}
