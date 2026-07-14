@@ -1881,6 +1881,44 @@ func TestInitialAuthLoadDirectoryFailureIsDegraded(t *testing.T) {
 	}
 }
 
+func TestFullAuthRescanDirectoryFailurePreservesLoadedAuth(t *testing.T) {
+	authDir := writeInitialLoadAuthFiles(t, 1)
+	queue := make(chan AuthUpdateBatch, 2)
+	w := newInitialLoadTestWatcher(t, authDir, queue)
+	firstDone := w.StartInitialAuthLoad(context.Background(), 1)
+	acknowledgeInitialLoadUntilDone(t, queue, firstDone)
+	if auths := w.SnapshotCoreAuths(); len(auths) != 1 {
+		t.Fatalf("initial auth snapshot = %+v, want one auth", auths)
+	}
+	if errRemove := os.RemoveAll(authDir); errRemove != nil {
+		t.Fatal(errRemove)
+	}
+
+	secondDone := w.StartInitialAuthLoad(context.Background(), 1)
+	var unexpected []AuthUpdate
+	for {
+		select {
+		case batch := <-queue:
+			unexpected = append(unexpected, batch.Updates...)
+			batch.Result <- loadedResults(batch.Updates)
+		case <-secondDone:
+			goto rescanComplete
+		case <-time.After(time.Second):
+			t.Fatal("directory failure rescan did not complete")
+		}
+	}
+rescanComplete:
+	if len(unexpected) != 0 {
+		t.Fatalf("directory failure emitted auth updates: %+v", unexpected)
+	}
+	if auths := w.SnapshotCoreAuths(); len(auths) != 1 {
+		t.Fatalf("directory failure discarded loaded auths: %+v", auths)
+	}
+	if status := w.AuthLoadStatus(); status.State != AuthLoadStateDegraded {
+		t.Fatalf("status = %+v, want degraded", status)
+	}
+}
+
 func TestFullAuthRescanAcceptsStablePreviouslyChangedPath(t *testing.T) {
 	authDir := t.TempDir()
 	path := filepath.Join(authDir, "changed.json")
@@ -2037,6 +2075,45 @@ func TestInitialAuthLoadCancellationNeverDispatchesToReadyQueue(t *testing.T) {
 		select {
 		case batch := <-queue:
 			t.Fatalf("attempt %d dispatched after cancellation: %+v", attempt, batch.Updates)
+		default:
+		}
+	}
+}
+
+func TestInitialAuthLoadCancellationWinsBlockedBatchSend(t *testing.T) {
+	for attempt := 0; attempt < 128; attempt++ {
+		authDir := writeInitialLoadAuthFiles(t, 1)
+		queue := make(chan AuthUpdateBatch, 1)
+		queue <- AuthUpdateBatch{Updates: []AuthUpdate{{Action: AuthUpdateActionAdd, ID: "sentinel"}}}
+		w := newInitialLoadTestWatcher(t, authDir, queue)
+		ctx, cancel := context.WithCancel(context.Background())
+		done := w.StartInitialAuthLoad(ctx, 1)
+		eventually(t, time.Second, func() bool { return len(w.SnapshotCoreAuths()) == 1 })
+
+		start := make(chan struct{})
+		cancelDone := make(chan struct{})
+		drainDone := make(chan struct{})
+		go func() {
+			<-start
+			cancel()
+			close(cancelDone)
+		}()
+		go func() {
+			<-start
+			<-queue
+			close(drainDone)
+		}()
+		close(start)
+		<-cancelDone
+		<-drainDone
+		select {
+		case <-done:
+		case <-time.After(time.Second):
+			t.Fatalf("attempt %d did not stop after cancellation", attempt)
+		}
+		select {
+		case batch := <-queue:
+			t.Fatalf("attempt %d delivered stale batch after cancellation: %+v", attempt, batch.Updates)
 		default:
 		}
 	}

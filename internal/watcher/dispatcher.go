@@ -286,28 +286,29 @@ func (w *Watcher) getAuthQueue() chan<- AuthUpdateBatch {
 }
 
 func (w *Watcher) dispatchInitialAuthBatch(ctx context.Context, sequence uint64, updates []AuthUpdate) ([]AuthUpdateResult, bool) {
-	if ctx == nil || ctx.Err() != nil || !w.authLoadScanActive(ctx, sequence) {
-		return nil, false
-	}
 	if len(updates) == 0 {
-		return nil, true
-	}
-	queue := w.getAuthQueue()
-	if queue == nil {
-		return nil, true
+		return nil, w.authLoadScanActive(ctx, sequence)
 	}
 	resultCh := make(chan []AuthUpdateResult, 1)
 	batch := AuthUpdateBatch{Updates: updates, Result: resultCh, Initial: true}
-	if ctx.Err() != nil || !w.authLoadScanActive(ctx, sequence) {
-		return nil, false
-	}
-	select {
-	case queue <- batch:
-	case <-ctx.Done():
-		return nil, false
-	}
-	if ctx.Err() != nil || !w.authLoadScanActive(ctx, sequence) {
-		return nil, false
+	for {
+		sent, active, configured := w.trySendInitialAuthBatch(ctx, sequence, batch)
+		if !active {
+			return nil, false
+		}
+		if !configured {
+			return nil, true
+		}
+		if sent {
+			break
+		}
+		timer := time.NewTimer(authLoadQueueRetry)
+		select {
+		case <-ctx.Done():
+			timer.Stop()
+			return nil, false
+		case <-timer.C:
+		}
 	}
 	select {
 	case results := <-resultCh:
@@ -317,6 +318,31 @@ func (w *Watcher) dispatchInitialAuthBatch(ctx context.Context, sequence uint64,
 		return results, true
 	case <-ctx.Done():
 		return nil, false
+	}
+}
+
+func (w *Watcher) trySendInitialAuthBatch(ctx context.Context, sequence uint64, batch AuthUpdateBatch) (sent, active, configured bool) {
+	if w == nil || ctx == nil || ctx.Err() != nil {
+		return false, false, false
+	}
+	w.authLoadMu.Lock()
+	defer w.authLoadMu.Unlock()
+	if w.authLoadSequence != sequence || ctx.Err() != nil {
+		return false, false, false
+	}
+	w.clientsMutex.RLock()
+	defer w.clientsMutex.RUnlock()
+	if ctx.Err() != nil {
+		return false, false, false
+	}
+	if w.authQueue == nil {
+		return false, true, false
+	}
+	select {
+	case w.authQueue <- batch:
+		return true, true, true
+	default:
+		return false, true, true
 	}
 }
 

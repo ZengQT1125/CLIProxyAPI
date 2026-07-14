@@ -21,6 +21,7 @@ const (
 	authLoadBatchSize     = 32
 	authLoadFlushInterval = 100 * time.Millisecond
 	authLoadLogInterval   = time.Second
+	authLoadQueueRetry    = 5 * time.Millisecond
 )
 
 var readInitialAuthFile = os.ReadFile
@@ -307,8 +308,10 @@ func (w *Watcher) aggregateInitialAuthResults(ctx context.Context, sequence uint
 				if !flush() {
 					return
 				}
-				if !w.reconcileMissingInitialAuthPaths(ctx, sequence, baseline, seen, &status, &metrics) {
-					return
+				if !enumerationFailed {
+					if !w.reconcileMissingInitialAuthPaths(ctx, sequence, baseline, seen, &status, &metrics) {
+						return
+					}
 				}
 				if after != nil {
 					if !w.authLoadScanActive(ctx, sequence) {
