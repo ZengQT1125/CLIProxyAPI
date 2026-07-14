@@ -9,6 +9,7 @@ import (
 	"net/http/httptest"
 	"os"
 	"path/filepath"
+	"strings"
 	"sync/atomic"
 	"testing"
 	"time"
@@ -259,6 +260,131 @@ func TestCleanupCodexAuthVerifiesCredentialsConcurrently(t *testing.T) {
 	}
 	if got := maxInFlight.Load(); got < 2 {
 		t.Fatalf("max concurrent verify requests = %d, want at least 2", got)
+	}
+}
+
+func TestCleanupAuthByProviderXAIDeletesClientErrorsOnly(t *testing.T) {
+	authDir := t.TempDir()
+	fileName := "xai-invalid.json"
+	filePath := filepath.Join(authDir, fileName)
+	if err := os.WriteFile(filePath, []byte(`{"type":"xai"}`), 0o600); err != nil {
+		t.Fatalf("write auth file: %v", err)
+	}
+
+	var verifyPath string
+	verifyServer := httptest.NewTLSServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		verifyPath = r.URL.Path
+		if got := r.Header.Get("Authorization"); got != "Bearer xai-token" {
+			t.Errorf("authorization header = %q, want Bearer xai-token", got)
+		}
+		w.WriteHeader(http.StatusUnauthorized)
+		_, _ = w.Write([]byte(`{"error":"invalid"}`))
+	}))
+	defer verifyServer.Close()
+
+	oldTransport := http.DefaultTransport
+	http.DefaultTransport = &http.Transport{
+		DialContext: func(ctx context.Context, network, _ string) (net.Conn, error) {
+			var dialer net.Dialer
+			return dialer.DialContext(ctx, network, verifyServer.Listener.Addr().String())
+		},
+		TLSClientConfig: &tls.Config{InsecureSkipVerify: true},
+	}
+	t.Cleanup(func() {
+		http.DefaultTransport = oldTransport
+	})
+
+	manager := coreauth.NewManager(nil, nil, nil)
+	auth := &coreauth.Auth{
+		ID:       "cleanup-xai-invalid",
+		FileName: fileName,
+		Provider: "xai",
+		Status:   coreauth.StatusActive,
+		Attributes: map[string]string{
+			"path": filePath,
+		},
+		Metadata: map[string]any{
+			"access_token": "xai-token",
+		},
+	}
+	if _, err := manager.Register(context.Background(), auth); err != nil {
+		t.Fatalf("register auth: %v", err)
+	}
+
+	// A codex credential must be ignored when cleaning xai.
+	codexName := "codex-keep.json"
+	codexPath := filepath.Join(authDir, codexName)
+	if err := os.WriteFile(codexPath, []byte(`{"type":"codex"}`), 0o600); err != nil {
+		t.Fatalf("write codex auth file: %v", err)
+	}
+	codexAuth := &coreauth.Auth{
+		ID:       "cleanup-codex-keep",
+		FileName: codexName,
+		Provider: "codex",
+		Status:   coreauth.StatusActive,
+		Attributes: map[string]string{
+			"path": codexPath,
+		},
+		Metadata: map[string]any{
+			"access_token": "codex-token",
+		},
+	}
+	if _, err := manager.Register(context.Background(), codexAuth); err != nil {
+		t.Fatalf("register codex auth: %v", err)
+	}
+
+	h := NewHandlerWithoutConfigFilePath(&config.Config{AuthDir: authDir}, manager)
+	h.tokenStore = &memoryAuthStore{}
+
+	gin.SetMode(gin.TestMode)
+	recorder := httptest.NewRecorder()
+	c, _ := gin.CreateTestContext(recorder)
+	c.Request = httptest.NewRequest(
+		http.MethodPost,
+		"/v0/management/custom/codex-cleanup",
+		strings.NewReader(`{"provider":"xai"}`),
+	)
+	c.Request.Header.Set("Content-Type", "application/json")
+
+	h.CleanupCodexAuth(c)
+
+	if recorder.Code != http.StatusOK {
+		t.Fatalf("cleanup status = %d, want %d; body=%s", recorder.Code, http.StatusOK, recorder.Body.String())
+	}
+	if verifyPath != "/v1/models" {
+		t.Fatalf("verify path = %q, want /v1/models", verifyPath)
+	}
+	if _, err := os.Stat(filePath); !os.IsNotExist(err) {
+		t.Fatalf("expected xai auth file removed, stat err: %v", err)
+	}
+	if _, err := os.Stat(codexPath); err != nil {
+		t.Fatalf("expected codex auth file kept, stat err: %v", err)
+	}
+	if _, ok := manager.GetByID(auth.ID); ok {
+		t.Fatalf("expected xai runtime auth removed")
+	}
+	if _, ok := manager.GetByID(codexAuth.ID); !ok {
+		t.Fatalf("expected codex runtime auth kept")
+	}
+}
+
+func TestCleanupAuthRejectsUnsupportedProvider(t *testing.T) {
+	h := NewHandlerWithoutConfigFilePath(&config.Config{AuthDir: t.TempDir()}, coreauth.NewManager(nil, nil, nil))
+
+	gin.SetMode(gin.TestMode)
+	recorder := httptest.NewRecorder()
+	c, _ := gin.CreateTestContext(recorder)
+	c.Request = httptest.NewRequest(
+		http.MethodPost,
+		"/v0/management/custom/codex-cleanup",
+		strings.NewReader(`{"provider":"qwen"}`),
+	)
+	c.Request.Header.Set("Content-Type", "application/json")
+
+	h.CleanupCodexAuth(c)
+
+	if recorder.Code != http.StatusBadRequest {
+		t.Fatalf("cleanup status = %d, want %d; body=%s", recorder.Code, http.StatusBadRequest, recorder.Body.String())
 	}
 }
 

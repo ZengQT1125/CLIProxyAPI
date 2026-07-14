@@ -646,53 +646,110 @@ func buildProxyTransport(proxyStr string) *http.Transport {
 const (
 	codexVerifyURL       = "https://chatgpt.com/backend-api/wham/usage"
 	codexVerifyUserAgent = "codex_cli_rs/0.76.0 (Debian 13.0.0; x86_64) WindowsTerminal"
+	xaiVerifyURL         = "https://api.x.ai/v1/models"
 )
 
-const codexCleanupMaxConcurrency = 8
+const authCleanupMaxConcurrency = 8
 
-// CleanupCodexAuth verifies all codex credentials and removes invalid ones.
+type authCleanupRequest struct {
+	Provider string `json:"provider"`
+}
+
+// isAuthCleanupProviderSupported reports whether the management API can probe
+// credentials of this provider for invalid-token cleanup.
+func isAuthCleanupProviderSupported(provider string) bool {
+	switch strings.ToLower(strings.TrimSpace(provider)) {
+	case "codex", "xai":
+		return true
+	default:
+		return false
+	}
+}
+
+func normalizeAuthCleanupProvider(provider string) string {
+	return strings.ToLower(strings.TrimSpace(provider))
+}
+
+// parseAuthCleanupProvider resolves the target provider from query/body.
+// Empty input defaults to "codex" for backward compatibility with older clients.
+func parseAuthCleanupProvider(c *gin.Context) string {
+	if c == nil {
+		return "codex"
+	}
+	provider := normalizeAuthCleanupProvider(c.Query("provider"))
+	if provider == "" {
+		var body authCleanupRequest
+		if err := c.ShouldBindJSON(&body); err == nil {
+			provider = normalizeAuthCleanupProvider(body.Provider)
+		}
+	}
+	if provider == "" {
+		return "codex"
+	}
+	return provider
+}
+
+// CleanupCodexAuth verifies credentials of a selected provider and removes invalid ones.
 //
 // Endpoint:
 //
 //	POST /v0/management/custom/codex-cleanup
 //
-// For each codex credential, sends a GET request to chatgpt.com to verify token
-// validity. If the upstream returns a 4xx client error, the credential file is
-// deleted and the auth record is disabled. 5xx responses and request errors are
-// treated as transient upstream failures and keep the credential.
+// Request body (optional):
+//
+//	{"provider":"codex"|"xai"}
+//
+// Query (optional, overrides body when present after parse order):
+//
+//	?provider=xai
+//
+// Provider defaults to "codex" when omitted.
+//
+// For each enabled credential of the selected provider, sends a provider-specific
+// verification request. If the upstream returns a 4xx client error, the credential
+// file is deleted and the auth record is removed. 5xx responses and request errors
+// are treated as transient upstream failures and keep the credential.
 //
 // Response: NDJSON stream (application/x-ndjson), one JSON object per line:
 //
-//	{"type":"start","total":N}
+//	{"type":"start","total":N,"provider":"xai"}
 //	{"type":"progress","index":1,"total":N,"name":"...","auth_index":"...","status_code":200,"deleted":false}
-//	{"type":"done","total":N,"deleted":M}
+//	{"type":"done","total":N,"deleted":M,"provider":"xai"}
 func (h *Handler) CleanupCodexAuth(c *gin.Context) {
 	if h.authManager == nil {
 		c.JSON(http.StatusServiceUnavailable, gin.H{"error": "core auth manager unavailable"})
 		return
 	}
 
+	provider := parseAuthCleanupProvider(c)
+	if !isAuthCleanupProviderSupported(provider) {
+		c.JSON(http.StatusBadRequest, gin.H{
+			"error": fmt.Sprintf("unsupported cleanup provider: %s", provider),
+		})
+		return
+	}
+
 	ctx := c.Request.Context()
 	auths := h.authManager.List()
 
-	// Collect codex auths first to know total count.
-	var codexAuths []*coreauth.Auth
+	// Collect matching enabled auths first to know total count.
+	var targetAuths []*coreauth.Auth
 	for _, auth := range auths {
 		if auth == nil {
 			continue
 		}
-		if !strings.EqualFold(strings.TrimSpace(auth.Provider), "codex") {
+		if !strings.EqualFold(strings.TrimSpace(auth.Provider), provider) {
 			continue
 		}
 		if auth.Disabled {
 			continue
 		}
 		auth.EnsureIndex()
-		codexAuths = append(codexAuths, auth)
+		targetAuths = append(targetAuths, auth)
 	}
 
-	total := len(codexAuths)
-	log.Infof("[codex-cleanup] starting cleanup, %d codex credentials", total)
+	total := len(targetAuths)
+	log.Infof("[auth-cleanup] starting cleanup provider=%s total=%d", provider, total)
 
 	c.Writer.Header().Set("Content-Type", "application/x-ndjson")
 	c.Writer.Header().Set("Cache-Control", "no-cache")
@@ -706,10 +763,10 @@ func (h *Handler) CleanupCodexAuth(c *gin.Context) {
 		c.Writer.Flush()
 	}
 
-	writeEvent(gin.H{"type": "start", "total": total})
+	writeEvent(gin.H{"type": "start", "total": total, "provider": provider})
 
 	deleted := 0
-	for result := range h.verifyCodexAuthsForCleanup(ctx, codexAuths) {
+	for result := range h.verifyAuthsForCleanup(ctx, provider, targetAuths) {
 		ev := result.event
 		if result.verifyErr != nil {
 			writeEvent(ev)
@@ -717,39 +774,40 @@ func (h *Handler) CleanupCodexAuth(c *gin.Context) {
 		}
 
 		if result.shouldDelete {
-			log.Infof("[codex-cleanup] %s: token invalid (status %d), removing", result.name, result.statusCode)
+			log.Infof("[auth-cleanup] provider=%s %s: token invalid (status %d), removing", provider, result.name, result.statusCode)
 			if delErr := h.removeCodexAuth(ctx, result.auth); delErr != nil {
-				log.Errorf("[codex-cleanup] %s: delete failed: %v", result.name, delErr)
+				log.Errorf("[auth-cleanup] provider=%s %s: delete failed: %v", provider, result.name, delErr)
 				ev["deleted"] = false
 				ev["error"] = delErr.Error()
 			} else {
-				log.Infof("[codex-cleanup] %s: deleted successfully", result.name)
+				log.Infof("[auth-cleanup] provider=%s %s: deleted successfully", provider, result.name)
 				ev["deleted"] = true
 				deleted++
 			}
 		} else {
 			ev["deleted"] = false
 			if result.statusCode >= http.StatusInternalServerError {
-				log.Warnf("[codex-cleanup] %s: verify returned status %d, keeping credential", result.name, result.statusCode)
+				log.Warnf("[auth-cleanup] provider=%s %s: verify returned status %d, keeping credential", provider, result.name, result.statusCode)
 			} else {
-				log.Debugf("[codex-cleanup] %s: valid (status %d)", result.name, result.statusCode)
+				log.Debugf("[auth-cleanup] provider=%s %s: valid (status %d)", provider, result.name, result.statusCode)
 			}
 		}
 		writeEvent(ev)
 	}
 
-	writeEvent(gin.H{"type": "done", "total": total, "deleted": deleted})
-	log.Infof("[codex-cleanup] finished: checked %d, deleted %d", total, deleted)
+	writeEvent(gin.H{"type": "done", "total": total, "deleted": deleted, "provider": provider})
+	log.Infof("[auth-cleanup] finished provider=%s checked=%d deleted=%d", provider, total, deleted)
 }
 
-type codexCleanupJob struct {
-	index int
-	total int
-	auth  *coreauth.Auth
-	name  string
+type authCleanupJob struct {
+	index    int
+	total    int
+	provider string
+	auth     *coreauth.Auth
+	name     string
 }
 
-type codexCleanupVerifyResult struct {
+type authCleanupVerifyResult struct {
 	auth         *coreauth.Auth
 	name         string
 	statusCode   int
@@ -758,23 +816,23 @@ type codexCleanupVerifyResult struct {
 	event        gin.H
 }
 
-func (h *Handler) verifyCodexAuthsForCleanup(ctx context.Context, auths []*coreauth.Auth) <-chan codexCleanupVerifyResult {
-	results := make(chan codexCleanupVerifyResult, len(auths))
+func (h *Handler) verifyAuthsForCleanup(ctx context.Context, provider string, auths []*coreauth.Auth) <-chan authCleanupVerifyResult {
+	results := make(chan authCleanupVerifyResult, len(auths))
 	total := len(auths)
 	if total == 0 {
 		close(results)
 		return results
 	}
 
-	workers := codexCleanupWorkerCount(total)
-	jobs := make(chan codexCleanupJob)
+	workers := authCleanupWorkerCount(total)
+	jobs := make(chan authCleanupJob)
 	var wg sync.WaitGroup
 	wg.Add(workers)
 	for i := 0; i < workers; i++ {
 		go func() {
 			defer wg.Done()
 			for job := range jobs {
-				results <- h.verifyCodexAuthForCleanup(ctx, job)
+				results <- h.verifyAuthForCleanup(ctx, job)
 			}
 		}()
 	}
@@ -785,11 +843,12 @@ func (h *Handler) verifyCodexAuthsForCleanup(ctx context.Context, auths []*corea
 			if name == "" {
 				name = auth.ID
 			}
-			jobs <- codexCleanupJob{
-				index: i + 1,
-				total: total,
-				auth:  auth,
-				name:  name,
+			jobs <- authCleanupJob{
+				index:    i + 1,
+				total:    total,
+				provider: provider,
+				auth:     auth,
+				name:     name,
 			}
 		}
 		close(jobs)
@@ -800,25 +859,26 @@ func (h *Handler) verifyCodexAuthsForCleanup(ctx context.Context, auths []*corea
 	return results
 }
 
-func codexCleanupWorkerCount(total int) int {
+func authCleanupWorkerCount(total int) int {
 	if total <= 0 {
 		return 0
 	}
-	if total < codexCleanupMaxConcurrency {
+	if total < authCleanupMaxConcurrency {
 		return total
 	}
-	return codexCleanupMaxConcurrency
+	return authCleanupMaxConcurrency
 }
 
-func (h *Handler) verifyCodexAuthForCleanup(ctx context.Context, job codexCleanupJob) codexCleanupVerifyResult {
+func (h *Handler) verifyAuthForCleanup(ctx context.Context, job authCleanupJob) authCleanupVerifyResult {
 	ev := gin.H{
 		"type":       "progress",
 		"index":      job.index,
 		"total":      job.total,
 		"name":       job.name,
 		"auth_index": job.auth.Index,
+		"provider":   job.provider,
 	}
-	result := codexCleanupVerifyResult{
+	result := authCleanupVerifyResult{
 		auth:  job.auth,
 		name:  job.name,
 		event: ev,
@@ -830,18 +890,17 @@ func (h *Handler) verifyCodexAuthForCleanup(ctx context.Context, job codexCleanu
 		if tokenErr != nil {
 			errMsg = tokenErr.Error()
 		}
-		log.Warnf("[codex-cleanup] %s: token resolve failed: %s", job.name, errMsg)
+		log.Warnf("[auth-cleanup] provider=%s %s: token resolve failed: %s", job.provider, job.name, errMsg)
 		ev["error"] = errMsg
 		result.verifyErr = fmt.Errorf("%s", errMsg)
 		return result
 	}
 
-	accountID := extractCodexAccountID(job.auth)
-	statusCode, verifyErr := h.verifyCodexToken(ctx, job.auth, token, accountID)
+	statusCode, verifyErr := h.verifyProviderToken(ctx, job.provider, job.auth, token)
 	ev["status_code"] = statusCode
 	result.statusCode = statusCode
 	if verifyErr != nil {
-		log.Warnf("[codex-cleanup] %s: verify request failed: %v", job.name, verifyErr)
+		log.Warnf("[auth-cleanup] provider=%s %s: verify request failed: %v", job.provider, job.name, verifyErr)
 		ev["error"] = verifyErr.Error()
 		result.verifyErr = verifyErr
 		return result
@@ -849,6 +908,17 @@ func (h *Handler) verifyCodexAuthForCleanup(ctx context.Context, job codexCleanu
 
 	result.shouldDelete = statusCode >= http.StatusBadRequest && statusCode < http.StatusInternalServerError
 	return result
+}
+
+func (h *Handler) verifyProviderToken(ctx context.Context, provider string, auth *coreauth.Auth, token string) (int, error) {
+	switch normalizeAuthCleanupProvider(provider) {
+	case "codex":
+		return h.verifyCodexToken(ctx, auth, token, extractCodexAccountID(auth))
+	case "xai":
+		return h.verifyXAIToken(ctx, auth, token)
+	default:
+		return 0, fmt.Errorf("unsupported cleanup provider: %s", provider)
+	}
 }
 
 func (h *Handler) verifyCodexToken(ctx context.Context, auth *coreauth.Auth, token, accountID string) (int, error) {
@@ -878,6 +948,31 @@ func (h *Handler) verifyCodexToken(ctx context.Context, auth *coreauth.Auth, tok
 	return resp.StatusCode, nil
 }
 
+func (h *Handler) verifyXAIToken(ctx context.Context, auth *coreauth.Auth, token string) (int, error) {
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, xaiVerifyURL, nil)
+	if err != nil {
+		return 0, fmt.Errorf("failed to build request: %w", err)
+	}
+	req.Header.Set("Authorization", "Bearer "+token)
+	req.Header.Set("Accept", "application/json")
+
+	client := &http.Client{
+		Timeout:   defaultAPICallTimeout,
+		Transport: h.apiCallTransport(auth),
+	}
+	resp, err := client.Do(req)
+	if err != nil {
+		return 0, fmt.Errorf("request failed: %w", err)
+	}
+	defer func() { _ = resp.Body.Close() }()
+
+	_, _ = io.Copy(io.Discard, resp.Body)
+
+	return resp.StatusCode, nil
+}
+
+// removeCodexAuth deletes a credential file and its runtime auth record.
+// Name kept for historical call sites; works for any provider auth file.
 func (h *Handler) removeCodexAuth(ctx context.Context, auth *coreauth.Auth) error {
 	path := strings.TrimSpace(authAttribute(auth, "path"))
 	if path == "" {
