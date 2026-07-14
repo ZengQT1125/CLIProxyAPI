@@ -48,6 +48,22 @@
 - 解析 `groundingMetadata` 并转换为兼容格式的结果
 - 同时支持 Claude `tool_result` 和 OpenAI function response 格式
 
+### 渐进式并行凭证加载
+
+默认文件存储启动路径会先绑定 HTTP 并安装文件系统监听，再扫描磁盘凭证：
+
+- 有效凭证按批次逐步变为可路由；后续文件仍可在后台继续加载
+- 请求尚未加载到的模型时，仍返回既有的不可用 / 凭证未找到响应
+- `GET /v0/management/auth-files/load-status` 返回 `idle`、`loading`、`ready` 或 `degraded` 及聚合计数
+- `auth-load-workers: 1` 是低资源回退值；仍保持渐进加载，不会恢复重复全量扫描
+- 非文件存储与自定义 Manager 仍走同步 `Store.List` 加载
+
+配置：
+```yaml
+# 初始/全量凭证目录扫描并发。范围：1-64；默认：16。
+auth-load-workers: 16
+```
+
 ### Sequential Fill (SF) 路由策略
 
 一种粘性凭证选择策略（`sf` 或 `sequential-fill`），优化凭证使用：

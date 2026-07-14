@@ -125,6 +125,19 @@ func TestServiceRunAppliesBeforeStartConfigBeforeWatcherSetup(t *testing.T) {
 	case <-time.After(2 * time.Second):
 		t.Fatal("watcher setup did not run")
 	}
+	// Wait until the HTTP listener is serving so Shutdown does not race Server.Start setup.
+	deadline := time.Now().Add(2 * time.Second)
+	for {
+		response, errGet := http.Get(fmt.Sprintf("http://127.0.0.1:%d/v1/models", port))
+		if errGet == nil {
+			_ = response.Body.Close()
+			break
+		}
+		if time.Now().After(deadline) {
+			t.Fatalf("listener never became ready: %v", errGet)
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
 }
 
 func reserveTCPPort(t testing.TB) int {
