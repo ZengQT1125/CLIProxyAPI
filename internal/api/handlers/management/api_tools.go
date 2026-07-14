@@ -646,7 +646,6 @@ func buildProxyTransport(proxyStr string) *http.Transport {
 const (
 	codexVerifyURL       = "https://chatgpt.com/backend-api/wham/usage"
 	codexVerifyUserAgent = "codex_cli_rs/0.76.0 (Debian 13.0.0; x86_64) WindowsTerminal"
-	xaiVerifyURL         = "https://api.x.ai/v1/models"
 )
 
 const authCleanupMaxConcurrency = 8
@@ -658,11 +657,17 @@ type authCleanupRequest struct {
 // isAuthCleanupProviderSupported reports whether the management API can probe
 // credentials of this provider for invalid-token cleanup.
 func isAuthCleanupProviderSupported(provider string) bool {
-	switch strings.ToLower(strings.TrimSpace(provider)) {
-	case "codex", "xai":
-		return true
+	return normalizeAuthCleanupProvider(provider) == "codex"
+}
+
+// authCleanupUnsupportedMessage returns a stable user-facing error for providers
+// that are intentionally not cleaned up by this endpoint.
+func authCleanupUnsupportedMessage(provider string) string {
+	switch normalizeAuthCleanupProvider(provider) {
+	case "xai":
+		return "xai credential cleanup is not supported yet"
 	default:
-		return false
+		return fmt.Sprintf("unsupported cleanup provider: %s", provider)
 	}
 }
 
@@ -689,7 +694,7 @@ func parseAuthCleanupProvider(c *gin.Context) string {
 	return provider
 }
 
-// CleanupCodexAuth verifies credentials of a selected provider and removes invalid ones.
+// CleanupCodexAuth verifies Codex credentials and removes invalid ones.
 //
 // Endpoint:
 //
@@ -697,24 +702,24 @@ func parseAuthCleanupProvider(c *gin.Context) string {
 //
 // Request body (optional):
 //
-//	{"provider":"codex"|"xai"}
+//	{"provider":"codex"}
 //
-// Query (optional, overrides body when present after parse order):
+// Query (optional):
 //
-//	?provider=xai
+//	?provider=codex
 //
-// Provider defaults to "codex" when omitted.
+// Provider defaults to "codex" when omitted. xAI and other providers return
+// "not supported yet" / unsupported without probing or deleting credentials.
 //
-// For each enabled credential of the selected provider, sends a provider-specific
-// verification request. If the upstream returns a 4xx client error, the credential
-// file is deleted and the auth record is removed. 5xx responses and request errors
-// are treated as transient upstream failures and keep the credential.
+// For each enabled Codex credential, sends a verification request. 4xx client
+// errors delete the credential. 5xx responses and request errors are treated as
+// transient upstream failures and keep the credential.
 //
 // Response: NDJSON stream (application/x-ndjson), one JSON object per line:
 //
-//	{"type":"start","total":N,"provider":"xai"}
+//	{"type":"start","total":N,"provider":"codex"}
 //	{"type":"progress","index":1,"total":N,"name":"...","auth_index":"...","status_code":200,"deleted":false}
-//	{"type":"done","total":N,"deleted":M,"provider":"xai"}
+//	{"type":"done","total":N,"deleted":M,"provider":"codex"}
 func (h *Handler) CleanupCodexAuth(c *gin.Context) {
 	if h.authManager == nil {
 		c.JSON(http.StatusServiceUnavailable, gin.H{"error": "core auth manager unavailable"})
@@ -724,7 +729,7 @@ func (h *Handler) CleanupCodexAuth(c *gin.Context) {
 	provider := parseAuthCleanupProvider(c)
 	if !isAuthCleanupProviderSupported(provider) {
 		c.JSON(http.StatusBadRequest, gin.H{
-			"error": fmt.Sprintf("unsupported cleanup provider: %s", provider),
+			"error": authCleanupUnsupportedMessage(provider),
 		})
 		return
 	}
@@ -914,8 +919,6 @@ func (h *Handler) verifyProviderToken(ctx context.Context, provider string, auth
 	switch normalizeAuthCleanupProvider(provider) {
 	case "codex":
 		return h.verifyCodexToken(ctx, auth, token, extractCodexAccountID(auth))
-	case "xai":
-		return h.verifyXAIToken(ctx, auth, token)
 	default:
 		return 0, fmt.Errorf("unsupported cleanup provider: %s", provider)
 	}
@@ -932,29 +935,6 @@ func (h *Handler) verifyCodexToken(ctx context.Context, auth *coreauth.Auth, tok
 	if accountID != "" {
 		req.Header.Set("Chatgpt-Account-Id", accountID)
 	}
-
-	client := &http.Client{
-		Timeout:   defaultAPICallTimeout,
-		Transport: h.apiCallTransport(auth),
-	}
-	resp, err := client.Do(req)
-	if err != nil {
-		return 0, fmt.Errorf("request failed: %w", err)
-	}
-	defer func() { _ = resp.Body.Close() }()
-
-	_, _ = io.Copy(io.Discard, resp.Body)
-
-	return resp.StatusCode, nil
-}
-
-func (h *Handler) verifyXAIToken(ctx context.Context, auth *coreauth.Auth, token string) (int, error) {
-	req, err := http.NewRequestWithContext(ctx, http.MethodGet, xaiVerifyURL, nil)
-	if err != nil {
-		return 0, fmt.Errorf("failed to build request: %w", err)
-	}
-	req.Header.Set("Authorization", "Bearer "+token)
-	req.Header.Set("Accept", "application/json")
 
 	client := &http.Client{
 		Timeout:   defaultAPICallTimeout,

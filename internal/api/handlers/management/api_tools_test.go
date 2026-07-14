@@ -325,40 +325,17 @@ func TestCleanupCodexAuthVerifiesCredentialsConcurrently(t *testing.T) {
 	}
 }
 
-func TestCleanupAuthByProviderXAIDeletesClientErrorsOnly(t *testing.T) {
+func TestCleanupAuthRejectsXAIProviderNotSupported(t *testing.T) {
 	authDir := t.TempDir()
-	fileName := "xai-invalid.json"
+	fileName := "xai-keep.json"
 	filePath := filepath.Join(authDir, fileName)
 	if err := os.WriteFile(filePath, []byte(`{"type":"xai"}`), 0o600); err != nil {
 		t.Fatalf("write auth file: %v", err)
 	}
 
-	var verifyPath string
-	verifyServer := httptest.NewTLSServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		verifyPath = r.URL.Path
-		if got := r.Header.Get("Authorization"); got != "Bearer xai-token" {
-			t.Errorf("authorization header = %q, want Bearer xai-token", got)
-		}
-		w.WriteHeader(http.StatusUnauthorized)
-		_, _ = w.Write([]byte(`{"error":"invalid"}`))
-	}))
-	defer verifyServer.Close()
-
-	oldTransport := http.DefaultTransport
-	http.DefaultTransport = &http.Transport{
-		DialContext: func(ctx context.Context, network, _ string) (net.Conn, error) {
-			var dialer net.Dialer
-			return dialer.DialContext(ctx, network, verifyServer.Listener.Addr().String())
-		},
-		TLSClientConfig: &tls.Config{InsecureSkipVerify: true},
-	}
-	t.Cleanup(func() {
-		http.DefaultTransport = oldTransport
-	})
-
 	manager := coreauth.NewManager(nil, nil, nil)
 	auth := &coreauth.Auth{
-		ID:       "cleanup-xai-invalid",
+		ID:       "cleanup-xai-keep",
 		FileName: fileName,
 		Provider: "xai",
 		Status:   coreauth.StatusActive,
@@ -371,28 +348,6 @@ func TestCleanupAuthByProviderXAIDeletesClientErrorsOnly(t *testing.T) {
 	}
 	if _, err := manager.Register(context.Background(), auth); err != nil {
 		t.Fatalf("register auth: %v", err)
-	}
-
-	// A codex credential must be ignored when cleaning xai.
-	codexName := "codex-keep.json"
-	codexPath := filepath.Join(authDir, codexName)
-	if err := os.WriteFile(codexPath, []byte(`{"type":"codex"}`), 0o600); err != nil {
-		t.Fatalf("write codex auth file: %v", err)
-	}
-	codexAuth := &coreauth.Auth{
-		ID:       "cleanup-codex-keep",
-		FileName: codexName,
-		Provider: "codex",
-		Status:   coreauth.StatusActive,
-		Attributes: map[string]string{
-			"path": codexPath,
-		},
-		Metadata: map[string]any{
-			"access_token": "codex-token",
-		},
-	}
-	if _, err := manager.Register(context.Background(), codexAuth); err != nil {
-		t.Fatalf("register codex auth: %v", err)
 	}
 
 	h := NewHandlerWithoutConfigFilePath(&config.Config{AuthDir: authDir}, manager)
@@ -410,23 +365,17 @@ func TestCleanupAuthByProviderXAIDeletesClientErrorsOnly(t *testing.T) {
 
 	h.CleanupCodexAuth(c)
 
-	if recorder.Code != http.StatusOK {
-		t.Fatalf("cleanup status = %d, want %d; body=%s", recorder.Code, http.StatusOK, recorder.Body.String())
+	if recorder.Code != http.StatusBadRequest {
+		t.Fatalf("cleanup status = %d, want %d; body=%s", recorder.Code, http.StatusBadRequest, recorder.Body.String())
 	}
-	if verifyPath != "/v1/models" {
-		t.Fatalf("verify path = %q, want /v1/models", verifyPath)
+	if !strings.Contains(recorder.Body.String(), "xai credential cleanup is not supported yet") {
+		t.Fatalf("expected not-supported message, body=%s", recorder.Body.String())
 	}
-	if _, err := os.Stat(filePath); !os.IsNotExist(err) {
-		t.Fatalf("expected xai auth file removed, stat err: %v", err)
+	if _, err := os.Stat(filePath); err != nil {
+		t.Fatalf("expected xai auth file kept, stat err: %v", err)
 	}
-	if _, err := os.Stat(codexPath); err != nil {
-		t.Fatalf("expected codex auth file kept, stat err: %v", err)
-	}
-	if _, ok := manager.GetByID(auth.ID); ok {
-		t.Fatalf("expected xai runtime auth removed")
-	}
-	if _, ok := manager.GetByID(codexAuth.ID); !ok {
-		t.Fatalf("expected codex runtime auth kept")
+	if _, ok := manager.GetByID(auth.ID); !ok {
+		t.Fatalf("expected xai runtime auth kept")
 	}
 }
 
@@ -447,6 +396,9 @@ func TestCleanupAuthRejectsUnsupportedProvider(t *testing.T) {
 
 	if recorder.Code != http.StatusBadRequest {
 		t.Fatalf("cleanup status = %d, want %d; body=%s", recorder.Code, http.StatusBadRequest, recorder.Body.String())
+	}
+	if !strings.Contains(recorder.Body.String(), "unsupported cleanup provider: qwen") {
+		t.Fatalf("expected unsupported provider message, body=%s", recorder.Body.String())
 	}
 }
 
