@@ -145,8 +145,12 @@ disable-cooling: false
 # (30 minutes by default) but keeps the record intact so it can be repaired/reused later.
 delete-unauthorized-auth: false
 
-# When true, persist per-auth cooldown status as .cds files next to auth files.
+# When true, persist per-auth cooldown status across restarts.
+# - File / git / object token store: write .cds files next to auth files under auth-dir.
+# - PostgreSQL token store (PGSTORE_DSN): write rows to cooldown_store (not .cds).
+#   Local spool authDir is wiped on bootstrap, so file-based .cds cannot survive restart under PG.
 # Default is false; when false, cooldown status is kept in memory only.
+# Disabled automatically when home mode is enabled.
 save-cooldown-status: false
 
 # Cooldown duration in seconds for transient upstream errors (408/500/502/503/504).
