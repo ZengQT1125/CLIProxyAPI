@@ -510,3 +510,78 @@ func TestManager_RestoreCooldownStates(t *testing.T) {
 		t.Fatalf("restore cleanup saved cooldown state %d times, want 1", got)
 	}
 }
+
+func TestManager_PreparedCooldownAppliedDuringRegister(t *testing.T) {
+	nextRetry := time.Now().Add(time.Hour).UTC().Truncate(time.Second)
+	store := &recordingCooldownStateStore{load: []CooldownStateSnapshot{{
+		AuthID: "auth-1",
+		Records: []CooldownStateRecord{{
+			AuthID: "auth-1", Provider: "xai", Model: "grok-4",
+			Status: "cooling", NextRetryAfter: nextRetry,
+			Quota: QuotaState{Exceeded: true, NextRecoverAt: nextRetry},
+		}},
+	}}}
+	manager := NewManager(nil, nil, nil)
+	manager.SetCooldownStateStore(store)
+	if errPrepare := manager.PrepareCooldownRestore(context.Background()); errPrepare != nil {
+		t.Fatalf("PrepareCooldownRestore() error = %v", errPrepare)
+	}
+	if _, errRegister := manager.Register(WithSkipPersist(context.Background()), &Auth{ID: "auth-1", Provider: "xai"}); errRegister != nil {
+		t.Fatalf("Register() error = %v", errRegister)
+	}
+	auth, ok := manager.GetByID("auth-1")
+	if !ok || auth.ModelStates["grok-4"] == nil || !auth.ModelStates["grok-4"].Unavailable {
+		t.Fatalf("registered auth = %+v, want persisted cooldown before scheduler registration", auth)
+	}
+	if got := store.applyCount.Load(); got != 0 {
+		t.Fatalf("Apply count before completion = %d, want 0", got)
+	}
+	if errComplete := manager.CompleteCooldownRestore(context.Background()); errComplete != nil {
+		t.Fatalf("CompleteCooldownRestore() error = %v", errComplete)
+	}
+	if got := store.applyCount.Load(); got != 1 {
+		t.Fatalf("Apply count after completion = %d, want 1", got)
+	}
+}
+
+func TestManager_CompleteCooldownRestoreClearsStaleSnapshot(t *testing.T) {
+	store := &recordingCooldownStateStore{load: []CooldownStateSnapshot{{
+		AuthID: "missing-auth",
+		Records: []CooldownStateRecord{{
+			AuthID: "missing-auth", NextRetryAfter: time.Now().Add(time.Hour),
+		}},
+	}}}
+	manager := NewManager(nil, nil, nil)
+	manager.SetCooldownStateStore(store)
+	if errPrepare := manager.PrepareCooldownRestore(context.Background()); errPrepare != nil {
+		t.Fatal(errPrepare)
+	}
+	if errComplete := manager.CompleteCooldownRestore(context.Background()); errComplete != nil {
+		t.Fatal(errComplete)
+	}
+	batches := store.recordedBatches()
+	last := batches[len(batches)-1]
+	if len(last) != 1 || last[0].AuthID != "missing-auth" || len(last[0].Records) != 0 {
+		t.Fatalf("cleanup batch = %+v, want empty missing-auth snapshot", last)
+	}
+}
+
+func TestManager_PrepareCooldownRestoreAppliesAlreadyRegisteredAuth(t *testing.T) {
+	nextRetry := time.Now().Add(time.Hour)
+	store := &recordingCooldownStateStore{load: []CooldownStateSnapshot{{
+		AuthID:  "auth-live",
+		Records: []CooldownStateRecord{{AuthID: "auth-live", NextRetryAfter: nextRetry}},
+	}}}
+	manager := NewManager(nil, nil, nil)
+	manager.SetCooldownStateStore(store)
+	if _, errRegister := manager.Register(WithSkipPersist(context.Background()), &Auth{ID: "auth-live", Provider: "xai"}); errRegister != nil {
+		t.Fatal(errRegister)
+	}
+	if errPrepare := manager.PrepareCooldownRestore(context.Background()); errPrepare != nil {
+		t.Fatal(errPrepare)
+	}
+	auth, ok := manager.GetByID("auth-live")
+	if !ok || !auth.Unavailable || !auth.NextRetryAfter.Equal(nextRetry) {
+		t.Fatalf("auth after prepare = %+v", auth)
+	}
+}

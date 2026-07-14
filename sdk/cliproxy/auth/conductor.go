@@ -223,15 +223,17 @@ func (NoopHook) OnResult(context.Context, Result) {}
 
 // Manager orchestrates auth lifecycle, selection, execution, and persistence.
 type Manager struct {
-	store             Store
-	cooldownStore     CooldownStateStore
-	cooldownPersister *cooldownStatePersister
-	executors         map[string]ProviderExecutor
-	selector          Selector
-	hook              Hook
-	mu                sync.RWMutex
-	auths             map[string]*Auth
-	scheduler         *authScheduler
+	store                  Store
+	cooldownStore          CooldownStateStore
+	pendingCooldownRestore map[string][]CooldownStateRecord
+	cooldownRestoreIDs     map[string]struct{}
+	cooldownPersister      *cooldownStatePersister
+	executors              map[string]ProviderExecutor
+	selector               Selector
+	hook                   Hook
+	mu                     sync.RWMutex
+	auths                  map[string]*Auth
+	scheduler              *authScheduler
 	// pluginScheduler runs outside m.mu before falling back to native selection.
 	pluginScheduler PluginScheduler
 	// homeRuntimeAuths caches auths returned by Home so websocket sessions can
@@ -504,6 +506,10 @@ func (m *Manager) SetCooldownStateStore(store CooldownStateStore) {
 	m.mu.Lock()
 	defer m.mu.Unlock()
 	m.cooldownStore = store
+	if store == nil {
+		m.pendingCooldownRestore = nil
+		m.cooldownRestoreIDs = nil
+	}
 }
 
 // SetRoundTripperProvider register a provider that returns a per-auth RoundTripper.
@@ -569,8 +575,8 @@ func (m *Manager) clearDisabledCooldownStates(cfg *internalconfig.Config) []stri
 	return authIDs
 }
 
-// RestoreCooldownStates restores unexpired persisted cooldown records into registered auths.
-func (m *Manager) RestoreCooldownStates(ctx context.Context) error {
+// PrepareCooldownRestore loads persisted cooldown records before auth registration begins.
+func (m *Manager) PrepareCooldownRestore(ctx context.Context) error {
 	if m == nil {
 		return nil
 	}
@@ -585,70 +591,86 @@ func (m *Manager) RestoreCooldownStates(ctx context.Context) error {
 	}
 	snapshots, errLoad := store.Load(ctx)
 	if errLoad != nil {
-		return errLoad
+		return fmt.Errorf("load cooldown snapshots: %w", errLoad)
 	}
-	now := time.Now()
-	authLevelRecords := make([]CooldownStateRecord, 0)
-	snapshotsByID := make(map[string]*Auth)
-	reconcileAuthIDs := make(map[string]struct{}, len(snapshots))
+	pending := make(map[string][]CooldownStateRecord, len(snapshots))
+	ids := make(map[string]struct{}, len(snapshots))
 	for _, snapshot := range snapshots {
-		if authID := strings.TrimSpace(snapshot.AuthID); authID != "" {
-			reconcileAuthIDs[authID] = struct{}{}
+		authID := strings.TrimSpace(snapshot.AuthID)
+		if authID == "" {
+			continue
 		}
+		ids[authID] = struct{}{}
+		records := append([]CooldownStateRecord(nil), snapshot.Records...)
+		for i := range records {
+			if strings.TrimSpace(records[i].AuthID) == "" {
+				records[i].AuthID = authID
+			}
+		}
+		pending[authID] = records
 	}
-
 	m.mu.Lock()
-	for _, snapshot := range snapshots {
-		for _, loadedRecord := range snapshot.Records {
-			record := loadedRecord
-			if strings.TrimSpace(record.AuthID) == "" {
-				record.AuthID = strings.TrimSpace(snapshot.AuthID)
-			}
-			if strings.TrimSpace(record.Model) == "" {
-				authLevelRecords = append(authLevelRecords, record)
-				continue
-			}
-			if m.restoreCooldownRecordLocked(record, now) {
-				if auth := m.auths[strings.TrimSpace(record.AuthID)]; auth != nil {
-					snapshotsByID[auth.ID] = auth.Clone()
-				}
-			}
-		}
-	}
-	for _, record := range authLevelRecords {
-		if m.restoreCooldownRecordLocked(record, now) {
-			if auth := m.auths[strings.TrimSpace(record.AuthID)]; auth != nil {
-				snapshotsByID[auth.ID] = auth.Clone()
-			}
-		}
-	}
-	for authID, auth := range m.auths {
+	m.pendingCooldownRestore = pending
+	m.cooldownRestoreIDs = ids
+	now := time.Now()
+	schedulerSnapshots := make([]*Auth, 0, len(m.auths))
+	for _, auth := range m.auths {
+		m.applyPendingCooldownRestoreLocked(auth, now)
 		if len(m.cooldownStateRecordsForAuthLocked(auth, now)) > 0 {
-			reconcileAuthIDs[authID] = struct{}{}
+			m.cooldownRestoreIDs[auth.ID] = struct{}{}
 		}
+		schedulerSnapshots = append(schedulerSnapshots, auth.Clone())
 	}
 	m.mu.Unlock()
-
 	if m.scheduler != nil {
-		for _, snapshot := range snapshotsByID {
-			m.scheduler.upsertAuth(snapshot)
+		for _, auth := range schedulerSnapshots {
+			m.scheduler.upsertAuth(auth)
 		}
 	}
-	authIDs := make([]string, 0, len(reconcileAuthIDs))
-	for authID := range reconcileAuthIDs {
-		authIDs = append(authIDs, authID)
+	return nil
+}
+
+// CompleteCooldownRestore reconciles persisted cooldown records after auth registration.
+func (m *Manager) CompleteCooldownRestore(ctx context.Context) error {
+	if m == nil {
+		return nil
 	}
-	m.queueCooldownStatePersist(authIDs...)
+	m.mu.Lock()
+	idSet := make(map[string]struct{}, len(m.cooldownRestoreIDs)+len(m.auths))
+	for authID := range m.cooldownRestoreIDs {
+		idSet[authID] = struct{}{}
+	}
+	now := time.Now()
+	for authID, auth := range m.auths {
+		if len(m.cooldownStateRecordsForAuthLocked(auth, now)) > 0 {
+			idSet[authID] = struct{}{}
+		}
+	}
+	m.pendingCooldownRestore = nil
+	m.cooldownRestoreIDs = nil
+	m.mu.Unlock()
+	ids := make([]string, 0, len(idSet))
+	for authID := range idSet {
+		ids = append(ids, authID)
+	}
+	sort.Strings(ids)
+	m.queueCooldownStatePersist(ids...)
 	return m.FlushCooldownStates(ctx)
 }
 
-func (m *Manager) restoreCooldownRecordLocked(record CooldownStateRecord, now time.Time) bool {
-	authID := strings.TrimSpace(record.AuthID)
-	if authID == "" || record.NextRetryAfter.IsZero() || !record.NextRetryAfter.After(now) {
+// RestoreCooldownStates restores unexpired persisted cooldown records into registered auths.
+func (m *Manager) RestoreCooldownStates(ctx context.Context) error {
+	if errPrepare := m.PrepareCooldownRestore(ctx); errPrepare != nil {
+		return errPrepare
+	}
+	return m.CompleteCooldownRestore(ctx)
+}
+
+func restoreCooldownRecord(auth *Auth, record CooldownStateRecord, now time.Time, cooldownDisabled bool) bool {
+	if auth == nil || auth.Disabled || auth.Status == StatusDisabled || cooldownDisabled {
 		return false
 	}
-	auth := m.auths[authID]
-	if auth == nil || auth.Disabled || auth.Status == StatusDisabled || m.cooldownDisabledForAuth(auth) {
+	if record.NextRetryAfter.IsZero() || !record.NextRetryAfter.After(now) {
 		return false
 	}
 	updatedAt := record.UpdatedAt
@@ -661,7 +683,6 @@ func (m *Manager) restoreCooldownRecordLocked(record CooldownStateRecord, now ti
 	if quota.Exceeded && quota.NextRecoverAt.IsZero() {
 		quota.NextRecoverAt = record.NextRetryAfter
 	}
-
 	if model == "" {
 		auth.Unavailable = true
 		auth.Status = StatusError
@@ -674,7 +695,6 @@ func (m *Manager) restoreCooldownRecordLocked(record CooldownStateRecord, now ti
 		auth.LastError = cloneError(record.LastError)
 		return true
 	}
-
 	state := ensureModelState(auth, model)
 	state.Unavailable = true
 	state.Status = StatusError
@@ -687,6 +707,30 @@ func (m *Manager) restoreCooldownRecordLocked(record CooldownStateRecord, now ti
 	state.LastError = cloneError(record.LastError)
 	updateAggregatedAvailability(auth, now)
 	return true
+}
+
+func (m *Manager) restoreCooldownRecordLocked(record CooldownStateRecord, now time.Time) bool {
+	authID := strings.TrimSpace(record.AuthID)
+	if authID == "" {
+		return false
+	}
+	auth := m.auths[authID]
+	return restoreCooldownRecord(auth, record, now, m.cooldownDisabledForAuth(auth))
+}
+
+func (m *Manager) applyPendingCooldownRestoreLocked(auth *Auth, now time.Time) {
+	if auth == nil || auth.ID == "" || m.pendingCooldownRestore == nil {
+		return
+	}
+	records, ok := m.pendingCooldownRestore[auth.ID]
+	if !ok {
+		return
+	}
+	delete(m.pendingCooldownRestore, auth.ID)
+	disabled := m.cooldownDisabledForAuth(auth)
+	for _, record := range records {
+		restoreCooldownRecord(auth, record, now, disabled)
+	}
 }
 
 func clearCooldownStateForAuth(auth *Auth, now time.Time) bool {
@@ -2215,13 +2259,14 @@ func (m *Manager) Register(ctx context.Context, auth *Auth) (*Auth, error) {
 		auth.ID = uuid.NewString()
 	}
 	now := time.Now()
+	m.mu.Lock()
+	m.applyPendingCooldownRestoreLocked(auth, now)
 	clearedCooldown := false
 	if m.cooldownDisabledForAuth(auth) || auth.Disabled || auth.Status == StatusDisabled {
 		clearedCooldown = clearCooldownStateForAuth(auth, now)
 	}
 	auth.EnsureIndex()
 	authClone := auth.Clone()
-	m.mu.Lock()
 	m.auths[auth.ID] = authClone
 	m.mu.Unlock()
 	if !shouldDeferAPIKeyModelAliasRebuild(ctx) {
@@ -2274,6 +2319,8 @@ func (m *Manager) Update(ctx context.Context, auth *Auth) (*Auth, error) {
 			auth.ModelStates = existing.ModelStates
 		}
 	}
+	_, pendingCooldownRestore := m.pendingCooldownRestore[auth.ID]
+	m.applyPendingCooldownRestoreLocked(auth, now)
 	clearedCooldown := false
 	if m.cooldownDisabledForAuth(auth) || auth.Disabled || auth.Status == StatusDisabled {
 		clearedCooldown = clearCooldownStateForAuth(auth, now)
@@ -2283,7 +2330,7 @@ func (m *Manager) Update(ctx context.Context, auth *Auth) (*Auth, error) {
 	m.auths[auth.ID] = authClone
 	if trackCooldownState {
 		cooldownRecordsAfter := m.cooldownStateRecordsForAuthLocked(authClone, now)
-		cooldownStateChanged = !cooldownStateRecordsEqual(cooldownRecordsBefore, cooldownRecordsAfter)
+		cooldownStateChanged = !pendingCooldownRestore && !cooldownStateRecordsEqual(cooldownRecordsBefore, cooldownRecordsAfter)
 	}
 	m.mu.Unlock()
 	if !shouldDeferAPIKeyModelAliasRebuild(ctx) {
