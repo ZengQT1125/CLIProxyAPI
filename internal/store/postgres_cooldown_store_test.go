@@ -81,7 +81,11 @@ func TestPostgresCooldownStateStore_SaveLoadCleanStale(t *testing.T) {
 		t.Fatalf("EnsureSchema: %v", err)
 	}
 
-	store := NewPostgresCooldownStateStore(pg)
+	cooldownStore := NewPostgresCooldownStateStore(pg)
+	store, ok := cooldownStore.(*PostgresCooldownStateStore)
+	if !ok {
+		t.Fatalf("NewPostgresCooldownStateStore returned unexpected type %T", cooldownStore)
+	}
 	next := time.Now().Add(time.Hour).UTC().Truncate(time.Second)
 	rec := cliproxyauth.CooldownStateRecord{
 		Provider: "xai", AuthID: "pg-cooldown-test-auth", Model: "grok-4",

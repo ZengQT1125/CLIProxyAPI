@@ -2,6 +2,7 @@ package store
 
 import (
 	"context"
+	"database/sql"
 	"encoding/json"
 	"fmt"
 	"sort"
@@ -22,7 +23,9 @@ type PostgresCooldownStateStore struct {
 
 // NewPostgresCooldownStateStore wraps an existing PostgresStore to provide
 // cooldown state persistence via the cooldown_store table.
-func NewPostgresCooldownStateStore(s *PostgresStore) *PostgresCooldownStateStore {
+// Returns a true interface nil when s is nil, avoiding the non-nil interface
+// holding a nil pointer trap.
+func NewPostgresCooldownStateStore(s *PostgresStore) cliproxyauth.CooldownStateStore {
 	if s == nil {
 		return nil
 	}
@@ -123,6 +126,11 @@ func (c *PostgresCooldownStateStore) Load(ctx context.Context) ([]cliproxyauth.C
 
 // Save persists a full snapshot of cooldown records, grouped by AuthID, and
 // deletes any rows no longer present in the snapshot (full-wipe semantics).
+// All upserts and stale deletes run inside a single DB transaction so one
+// Save call is atomic for single-process consistency: a partial failure
+// rolls back the whole batch instead of leaving a half-written snapshot.
+// This does NOT provide multi-instance strong consistency; Mode A
+// (last-write-wins across instances) remains the documented behavior.
 func (c *PostgresCooldownStateStore) Save(ctx context.Context, records []cliproxyauth.CooldownStateRecord) error {
 	if c == nil || c.s == nil || c.s.db == nil {
 		return nil
@@ -140,39 +148,55 @@ func (c *PostgresCooldownStateStore) Save(ctx context.Context, records []cliprox
 	groups := groupCooldownRecordsByAuthID(records)
 	table := c.tableName()
 
+	tx, err := c.s.db.BeginTx(ctx, nil)
+	if err != nil {
+		return fmt.Errorf("postgres cooldown: begin tx: %w", err)
+	}
+	defer func() {
+		if err != nil {
+			_ = tx.Rollback()
+		}
+	}()
+
 	desired := make(map[string]struct{}, len(groups))
 	for authID, group := range groups {
 		provider := ""
 		if len(group) > 0 {
 			provider = strings.TrimSpace(group[0].Provider)
 		}
-		payload, errMarshal := marshalCooldownEnvelope(authID, provider, group)
-		if errMarshal != nil {
-			return fmt.Errorf("postgres cooldown: marshal %s: %w", authID, errMarshal)
+		var payload []byte
+		payload, err = marshalCooldownEnvelope(authID, provider, group)
+		if err != nil {
+			return fmt.Errorf("postgres cooldown: marshal %s: %w", authID, err)
 		}
+		// Mark as desired once the envelope is ready to write; if the
+		// upsert below fails we return immediately and the whole
+		// transaction rolls back, so the set never outlives a partial write.
+		desired[authID] = struct{}{}
 		query := fmt.Sprintf(`
 			INSERT INTO %s (id, content, created_at, updated_at)
 			VALUES ($1, $2, NOW(), NOW())
 			ON CONFLICT (id)
 			DO UPDATE SET content = EXCLUDED.content, updated_at = NOW()
 		`, table)
-		if _, err := c.s.db.ExecContext(ctx, query, authID, json.RawMessage(payload)); err != nil {
+		if _, err = tx.ExecContext(ctx, query, authID, json.RawMessage(payload)); err != nil {
 			return fmt.Errorf("postgres cooldown: upsert %s: %w", authID, err)
 		}
-		desired[authID] = struct{}{}
 	}
 
-	// Stale cleanup: remove rows not present in this snapshot.
-	rows, err := c.s.db.QueryContext(ctx, fmt.Sprintf(`SELECT id FROM %s`, table))
+	// Stale cleanup: remove rows not present in this snapshot, within the
+	// same transaction as the upserts above.
+	var rows *sql.Rows
+	rows, err = tx.QueryContext(ctx, fmt.Sprintf(`SELECT id FROM %s`, table))
 	if err != nil {
 		return fmt.Errorf("postgres cooldown: list ids: %w", err)
 	}
-	defer rows.Close()
 
 	stale := make([]string, 0)
 	for rows.Next() {
 		var id string
 		if err = rows.Scan(&id); err != nil {
+			_ = rows.Close()
 			return fmt.Errorf("postgres cooldown: scan id: %w", err)
 		}
 		if _, ok := desired[id]; !ok {
@@ -180,12 +204,22 @@ func (c *PostgresCooldownStateStore) Save(ctx context.Context, records []cliprox
 		}
 	}
 	if err = rows.Err(); err != nil {
+		_ = rows.Close()
 		return fmt.Errorf("postgres cooldown: iterate ids: %w", err)
 	}
+	_ = rows.Close()
+
 	for _, id := range stale {
-		if _, err = c.s.db.ExecContext(ctx, fmt.Sprintf(`DELETE FROM %s WHERE id = $1`, table), id); err != nil {
+		if err = ctx.Err(); err != nil {
+			return err
+		}
+		if _, err = tx.ExecContext(ctx, fmt.Sprintf(`DELETE FROM %s WHERE id = $1`, table), id); err != nil {
 			return fmt.Errorf("postgres cooldown: delete %s: %w", id, err)
 		}
+	}
+
+	if err = tx.Commit(); err != nil {
+		return fmt.Errorf("postgres cooldown: commit: %w", err)
 	}
 	return nil
 }
