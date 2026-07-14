@@ -972,6 +972,11 @@ func TestManager_InitializesSchedulerForBuiltInSelector(t *testing.T) {
 	if manager.scheduler.strategy != schedulerStrategyFillFirst {
 		t.Fatalf("manager.scheduler.strategy = %v, want %v", manager.scheduler.strategy, schedulerStrategyFillFirst)
 	}
+
+	manager.SetSelector(&SequentialFillSelector{})
+	if manager.scheduler.strategy != schedulerStrategyFillFirst {
+		t.Fatalf("manager.scheduler.strategy after SF = %v, want %v", manager.scheduler.strategy, schedulerStrategyFillFirst)
+	}
 }
 
 func TestManager_SchedulerTracksRegisterAndUpdate(t *testing.T) {

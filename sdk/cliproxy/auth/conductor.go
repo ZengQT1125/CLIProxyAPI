@@ -325,7 +325,7 @@ func (m *Manager) hasPluginScheduler() bool {
 
 func isBuiltInSelector(selector Selector) bool {
 	switch selector.(type) {
-	case *RoundRobinSelector, *FillFirstSelector:
+	case *RoundRobinSelector, *FillFirstSelector, *SequentialFillSelector:
 		return true
 	default:
 		return false
