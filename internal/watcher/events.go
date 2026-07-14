@@ -27,6 +27,7 @@ func matchProvider(provider string, targets []string) (string, bool) {
 }
 
 func (w *Watcher) start(ctx context.Context) error {
+	w.setLifecycleContext(ctx)
 	if errAddConfig := w.watcher.Add(w.configPath); errAddConfig != nil {
 		log.Errorf("failed to watch config file %s: %v", w.configPath, errAddConfig)
 		return errAddConfig
@@ -40,8 +41,6 @@ func (w *Watcher) start(ctx context.Context) error {
 	log.Debugf("watching auth directory: %s", w.authDir)
 
 	go w.processEvents(ctx)
-
-	w.reloadClients(true, nil, false)
 	return nil
 }
 
@@ -84,13 +83,26 @@ func (w *Watcher) handleEvent(event fsnotify.Event) {
 	// Handle config file changes
 	if isConfigEvent {
 		log.Debugf("config file change details - operation: %s, timestamp: %s", event.Op.String(), now.Format("2006-01-02 15:04:05.000"))
+		if w.authEventGateBlocks() {
+			// Before progressive activation: remember the change, do not reload yet.
+			w.markPendingConfigEvent()
+			return
+		}
 		w.scheduleConfigReload()
 		return
 	}
 
 	// Handle auth directory changes incrementally (.json only)
+	if w.authEventGateBlocks() {
+		// Before progressive activation: do not read credentials or advance generations.
+		// The first StartInitialAuthLoad scan observes the final disk state.
+		return
+	}
 	w.authRescanMu.Lock()
 	defer w.authRescanMu.Unlock()
+	w.clientsMutex.Lock()
+	w.advancePathGenerationLocked(normalizedName)
+	w.clientsMutex.Unlock()
 
 	if event.Op&(fsnotify.Remove|fsnotify.Rename) != 0 {
 		if w.shouldDebounceRemove(normalizedName, now) {

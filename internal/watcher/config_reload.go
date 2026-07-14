@@ -86,6 +86,10 @@ func (w *Watcher) reloadConfigIfChanged() {
 }
 
 func (w *Watcher) reloadConfig() bool {
+	return w.reloadConfigWithMode(true)
+}
+
+func (w *Watcher) reloadConfigWithMode(rescanAuth bool) bool {
 	log.Debug("=========================== CONFIG RELOAD ============================")
 	log.Debugf("starting config reload from: %s", w.configPath)
 
@@ -139,6 +143,16 @@ func (w *Watcher) reloadConfig() bool {
 	forceAuthRefresh := oldConfig != nil && (oldConfig.ForceModelPrefix != newConfig.ForceModelPrefix || !reflect.DeepEqual(oldConfig.OAuthModelAlias, newConfig.OAuthModelAlias) || retryConfigChanged)
 
 	log.Infof("config successfully reloaded, triggering client reload")
-	w.reloadClients(authDirChanged, affectedOAuthProviders, forceAuthRefresh)
+	if rescanAuth {
+		w.reloadClients(authDirChanged, affectedOAuthProviders, forceAuthRefresh)
+		return true
+	}
+	// Apply config + callback only. Caller owns the single progressive scan.
+	w.clientsMutex.RLock()
+	cfg := w.config
+	w.clientsMutex.RUnlock()
+	if w.reloadCallback != nil {
+		w.reloadCallback(cfg)
+	}
 	return true
 }

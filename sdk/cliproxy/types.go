@@ -101,13 +101,18 @@ type WatcherWrapper struct {
 	start func(ctx context.Context) error
 	stop  func() error
 
-	setConfig             func(cfg *config.Config)
-	snapshotAuths         func() []*coreauth.Auth
-	setUpdateQueue        func(queue chan<- watcher.AuthUpdate)
-	dispatchRuntimeUpdate func(update watcher.AuthUpdate) bool
-	dispatchPersistedAuth func(update watcher.AuthUpdate) bool
-	setPluginAuthParser   func(parser PluginAuthParser)
-	reloadConfigIfChanged func()
+	setConfig                 func(cfg *config.Config)
+	snapshotAuths             func() []*coreauth.Auth
+	setUpdateQueue            func(queue chan<- watcher.AuthUpdateBatch)
+	dispatchRuntimeUpdate     func(update watcher.AuthUpdate) bool
+	dispatchPersistedAuth     func(update watcher.AuthUpdate) bool
+	setPluginAuthParser       func(parser PluginAuthParser)
+	reloadConfigIfChanged     func()
+	startInitialAuthLoad      func(context.Context, int) <-chan struct{}
+	authLoadStatus            func() watcher.AuthLoadStatus
+	markAuthPathChanged       func(string)
+	setAuthLoadHooks          func(watcher.AuthLoadHooks)
+	setFileAuthLoadingEnabled func(bool)
 }
 
 // Start proxies to the underlying watcher Start implementation.
@@ -184,9 +189,43 @@ func (w *WatcherWrapper) SnapshotAuths() []*coreauth.Auth {
 }
 
 // SetAuthUpdateQueue registers the channel used to propagate auth updates.
-func (w *WatcherWrapper) SetAuthUpdateQueue(queue chan<- watcher.AuthUpdate) {
+func (w *WatcherWrapper) SetAuthUpdateQueue(queue chan<- watcher.AuthUpdateBatch) {
 	if w == nil || w.setUpdateQueue == nil {
 		return
 	}
 	w.setUpdateQueue(queue)
+}
+
+func (w *WatcherWrapper) StartInitialAuthLoad(ctx context.Context, workers int) <-chan struct{} {
+	if w == nil || w.startInitialAuthLoad == nil {
+		done := make(chan struct{})
+		close(done)
+		return done
+	}
+	return w.startInitialAuthLoad(ctx, workers)
+}
+
+func (w *WatcherWrapper) AuthLoadStatus() watcher.AuthLoadStatus {
+	if w == nil || w.authLoadStatus == nil {
+		return watcher.AuthLoadStatus{State: watcher.AuthLoadStateIdle}
+	}
+	return w.authLoadStatus()
+}
+
+func (w *WatcherWrapper) MarkAuthPathChanged(path string) {
+	if w != nil && w.markAuthPathChanged != nil {
+		w.markAuthPathChanged(path)
+	}
+}
+
+func (w *WatcherWrapper) SetAuthLoadHooks(hooks watcher.AuthLoadHooks) {
+	if w != nil && w.setAuthLoadHooks != nil {
+		w.setAuthLoadHooks(hooks)
+	}
+}
+
+func (w *WatcherWrapper) SetFileAuthLoadingEnabled(enabled bool) {
+	if w != nil && w.setFileAuthLoadingEnabled != nil {
+		w.setFileAuthLoadingEnabled(enabled)
+	}
 }

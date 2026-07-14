@@ -24,6 +24,9 @@ const (
 	DefaultPanelGitHubRepository = "https://github.com/caidaoli/Cli-Proxy-API-Management-Center"
 	DefaultPprofAddr             = "127.0.0.1:8316"
 	DefaultAuthDir               = "~/.cli-proxy-api"
+	DefaultAuthLoadWorkers       = 16
+	MinAuthLoadWorkers           = 1
+	MaxAuthLoadWorkers           = 64
 )
 
 // Config represents the application's configuration, loaded from a YAML file.
@@ -49,6 +52,9 @@ type Config struct {
 
 	// AuthDir is the directory where authentication token files are stored.
 	AuthDir string `yaml:"auth-dir" json:"-"`
+
+	// AuthLoadWorkers bounds concurrent credential file reads during a full auth scan.
+	AuthLoadWorkers int `yaml:"auth-load-workers" json:"auth-load-workers"`
 
 	// Debug enables or disables debug-level logging and other debug features.
 	Debug bool `yaml:"debug" json:"debug"`
@@ -740,6 +746,7 @@ func LoadConfigOptional(configFile string, optional bool) (*Config, error) {
 			if os.IsNotExist(err) || errors.Is(err, syscall.EISDIR) {
 				// Missing and optional: return empty config (cloud deploy standby).
 				cfg := &Config{}
+				cfg.normalizeAuthLoadWorkers()
 				cfg.NormalizePluginsConfig()
 				return cfg, nil
 			}
@@ -750,6 +757,7 @@ func LoadConfigOptional(configFile string, optional bool) (*Config, error) {
 	// In cloud deploy mode (optional=true), if file is empty or contains only whitespace, return empty config.
 	if optional && len(data) == 0 {
 		cfg := &Config{}
+		cfg.normalizeAuthLoadWorkers()
 		cfg.NormalizePluginsConfig()
 		return cfg, nil
 	}
@@ -772,10 +780,12 @@ func LoadConfigOptional(configFile string, optional bool) (*Config, error) {
 	cfg.Pprof.Enable = false
 	cfg.Pprof.Addr = DefaultPprofAddr
 	cfg.RemoteManagement.PanelGitHubRepository = DefaultPanelGitHubRepository
+	cfg.AuthLoadWorkers = DefaultAuthLoadWorkers
 	if err = yaml.Unmarshal(data, &cfg); err != nil {
 		if optional {
 			// In cloud deploy mode, if YAML parsing fails, return empty config instead of error.
 			cfgOptional := &Config{}
+			cfgOptional.normalizeAuthLoadWorkers()
 			cfgOptional.NormalizePluginsConfig()
 			return cfgOptional, nil
 		}
@@ -825,6 +835,8 @@ func LoadConfigOptional(configFile string, optional bool) (*Config, error) {
 		cfg.MaxRetryCredentials = 0
 	}
 
+	cfg.normalizeAuthLoadWorkers()
+
 	cfg.NormalizePluginsConfig()
 
 	// Sanitize Gemini API key configuration and migrate legacy entries.
@@ -865,6 +877,22 @@ func LoadConfigOptional(configFile string, optional bool) (*Config, error) {
 
 	// Return the populated configuration struct.
 	return &cfg, nil
+}
+
+func (cfg *Config) normalizeAuthLoadWorkers() {
+	if cfg.AuthLoadWorkers == 0 {
+		cfg.AuthLoadWorkers = DefaultAuthLoadWorkers
+		return
+	}
+	if cfg.AuthLoadWorkers < MinAuthLoadWorkers {
+		log.WithField("value", cfg.AuthLoadWorkers).Warn("auth-load-workers too small; clamping to 1")
+		cfg.AuthLoadWorkers = MinAuthLoadWorkers
+		return
+	}
+	if cfg.AuthLoadWorkers > MaxAuthLoadWorkers {
+		log.WithField("value", cfg.AuthLoadWorkers).Warn("auth-load-workers too large; clamping to 64")
+		cfg.AuthLoadWorkers = MaxAuthLoadWorkers
+	}
 }
 
 // NormalizePluginsConfig applies default plugin configuration values.

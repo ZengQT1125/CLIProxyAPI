@@ -46,6 +46,37 @@ func uploadMultipartAuthFile(t *testing.T, h *Handler, name string, content stri
 	}
 }
 
+func TestUploadAuthFileNotifiesMutationBeforeRuntimeAuthUpdate(t *testing.T) {
+	t.Setenv("MANAGEMENT_PASSWORD", "")
+	gin.SetMode(gin.TestMode)
+
+	authDir := t.TempDir()
+	manager := coreauth.NewManager(nil, nil, nil)
+	h := NewHandlerWithoutConfigFilePath(&config.Config{AuthDir: authDir}, manager)
+	name := "codex-user@example.com.json"
+	var notifiedPath string
+	h.SetAuthFileMutationHook(func(path string) {
+		notifiedPath = path
+		if _, ok := manager.GetByID(name); ok {
+			t.Error("runtime auth changed before mutation hook")
+		}
+	})
+
+	uploadMultipartAuthFile(t, h, name, `{"type":"codex","email":"user@example.com"}`)
+
+	normalizedAuthDir, errEval := filepath.EvalSymlinks(authDir)
+	if errEval != nil {
+		t.Fatalf("resolve auth dir: %v", errEval)
+	}
+	wantPath := filepath.Join(normalizedAuthDir, name)
+	if got := notifiedPath; got != wantPath {
+		t.Fatalf("mutation path = %q, want %q", got, wantPath)
+	}
+	if _, ok := manager.GetByID(name); !ok {
+		t.Fatalf("expected uploaded auth record %q to exist", name)
+	}
+}
+
 func TestUploadAuthFile_PreservesPriorityAttributes(t *testing.T) {
 	t.Setenv("MANAGEMENT_PASSWORD", "")
 	gin.SetMode(gin.TestMode)

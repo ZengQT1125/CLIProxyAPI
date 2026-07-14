@@ -34,6 +34,7 @@ import (
 	"github.com/router-for-me/CLIProxyAPI/v7/internal/pluginhost"
 	"github.com/router-for-me/CLIProxyAPI/v7/internal/registry"
 	"github.com/router-for-me/CLIProxyAPI/v7/internal/util"
+	"github.com/router-for-me/CLIProxyAPI/v7/internal/watcher"
 	"github.com/router-for-me/CLIProxyAPI/v7/internal/watcher/synthesizer"
 	sdkAuth "github.com/router-for-me/CLIProxyAPI/v7/sdk/auth"
 	coreauth "github.com/router-for-me/CLIProxyAPI/v7/sdk/cliproxy/auth"
@@ -417,6 +418,18 @@ func (h *Handler) GetAuthFileModels(c *gin.Context) {
 	}
 
 	c.JSON(200, gin.H{"models": result})
+}
+
+// GetAuthFileLoadStatus returns the current progressive auth-file load status.
+func (h *Handler) GetAuthFileLoadStatus(c *gin.Context) {
+	h.mu.Lock()
+	provider := h.authLoadStatusProvider
+	h.mu.Unlock()
+	if provider == nil {
+		c.JSON(http.StatusOK, watcher.AuthLoadStatus{State: watcher.AuthLoadStateIdle})
+		return
+	}
+	c.JSON(http.StatusOK, provider())
 }
 
 // List auth files from disk when the auth manager is unavailable.
@@ -1185,6 +1198,7 @@ func (h *Handler) deleteFilteredAuthFile(ctx context.Context, candidate filtered
 		}
 		return name, http.StatusInternalServerError, fmt.Errorf("failed to remove file: %w", errRemove)
 	}
+	h.notifyAuthFileMutation(candidate.path)
 	if errDeleteRecord := h.deleteTokenRecord(ctx, candidate.path); errDeleteRecord != nil {
 		return name, http.StatusInternalServerError, errDeleteRecord
 	}
@@ -1256,6 +1270,7 @@ func (h *Handler) writeAuthFile(ctx context.Context, name string, data []byte) e
 	if errWrite := os.WriteFile(dst, data, 0o600); errWrite != nil {
 		return fmt.Errorf("failed to write file: %w", errWrite)
 	}
+	h.notifyAuthFileMutation(dst)
 	if err := h.upsertAuthRecord(coreauth.WithAuthMaterialReplacement(ctx), auth); err != nil {
 		return err
 	}
@@ -1391,6 +1406,7 @@ func (h *Handler) deleteAuthFileByName(ctx context.Context, name string) (string
 		}
 		return filepath.Base(name), http.StatusInternalServerError, fmt.Errorf("failed to remove file: %w", errRemove)
 	}
+	h.notifyAuthFileMutation(targetPath)
 	if errDeleteRecord := h.deleteTokenRecord(ctx, targetPath); errDeleteRecord != nil {
 		return filepath.Base(name), http.StatusInternalServerError, errDeleteRecord
 	}
@@ -2244,12 +2260,25 @@ func (h *Handler) saveTokenRecord(ctx context.Context, record *coreauth.Auth) (s
 	if errSave != nil {
 		return savedPath, errSave
 	}
+	h.notifyAuthFileMutation(savedPath)
 	if h.postAuthPersistHook != nil {
 		if errHook := h.postAuthPersistHook(ctx, record); errHook != nil {
 			return savedPath, fmt.Errorf("post-auth persist hook failed: %w", errHook)
 		}
 	}
 	return savedPath, nil
+}
+
+func (h *Handler) notifyAuthFileMutation(path string) {
+	if h == nil {
+		return
+	}
+	h.mu.Lock()
+	hook := h.authFileMutationHook
+	h.mu.Unlock()
+	if hook != nil {
+		hook(cleanAuthFilePath(path))
+	}
 }
 
 func (h *Handler) RequestAnthropicToken(c *gin.Context) {
@@ -3079,7 +3108,9 @@ func (h *Handler) rollbackSavedTokenRecords(ctx context.Context, savedPaths []st
 		}
 		if errDelete := h.deleteTokenRecord(ctx, path); errDelete != nil {
 			log.WithError(errDelete).WithField("path", path).Warn("failed to roll back plugin auth token")
+			continue
 		}
+		h.notifyAuthFileMutation(path)
 		h.removeAuthsForPath(ctx, path, path)
 	}
 }

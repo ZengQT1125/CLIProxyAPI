@@ -49,6 +49,22 @@ Enables web search capabilities for Antigravity provider through Gemini's google
 - Parses `groundingMetadata` and transforms results to compatible format
 - Supports both Claude `tool_result` and OpenAI function response formats
 
+### Progressive Parallel Auth Loading
+
+Default file-store startup binds HTTP and installs filesystem watches before scanning credentials on disk:
+
+- Valid credentials become routable batch by batch while later files are still loading
+- Requests for models without a loaded credential keep the existing unavailable / auth-not-found response
+- `GET /v0/management/auth-files/load-status` reports `idle`, `loading`, `ready`, or `degraded` with aggregate counts
+- `auth-load-workers: 1` is the low-resource fallback; it remains progressive and does not restore duplicate scans
+- Non-file stores and custom Managers keep synchronous `Store.List` loading
+
+Configuration:
+```yaml
+# Initial/full auth directory scan concurrency. Range: 1-64; default: 16.
+auth-load-workers: 16
+```
+
 ### Sequential Fill (SF) Routing Strategy
 
 A sticky credential selection strategy (`sf` or `sequential-fill`) that optimizes credential usage:

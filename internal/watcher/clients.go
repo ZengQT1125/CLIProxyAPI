@@ -15,7 +15,6 @@ import (
 
 	"github.com/router-for-me/CLIProxyAPI/v7/internal/config"
 	"github.com/router-for-me/CLIProxyAPI/v7/internal/redisqueue"
-	"github.com/router-for-me/CLIProxyAPI/v7/internal/util"
 	"github.com/router-for-me/CLIProxyAPI/v7/internal/watcher/diff"
 	"github.com/router-for-me/CLIProxyAPI/v7/internal/watcher/synthesizer"
 	coreauth "github.com/router-for-me/CLIProxyAPI/v7/sdk/cliproxy/auth"
@@ -56,106 +55,44 @@ func (w *Watcher) reloadClients(rescanAuth bool, affectedOAuthProviders []string
 		w.clientsMutex.Unlock()
 	}
 
-	geminiAPIKeyCount, vertexCompatAPIKeyCount, claudeAPIKeyCount, codexAPIKeyCount, xaiAPIKeyCount, openAICompatCount := BuildAPIKeyClients(cfg)
-	totalAPIKeyClients := geminiAPIKeyCount + vertexCompatAPIKeyCount + claudeAPIKeyCount + codexAPIKeyCount + xaiAPIKeyCount + openAICompatCount
-	log.Debugf("loaded %d API key clients", totalAPIKeyClients)
-
-	var authFileCount int
-	if rescanAuth {
-		authFileCount = w.loadFileClients(cfg)
-		log.Debugf("loaded %d file-based clients", authFileCount)
-	} else {
-		w.clientsMutex.RLock()
-		authFileCount = len(w.lastAuthHashes)
-		w.clientsMutex.RUnlock()
-		log.Debugf("skipping auth directory rescan; retaining %d existing auth files", authFileCount)
-	}
-
-	if rescanAuth {
-		w.authRescanMu.Lock()
-		cacheAuthContents := log.IsLevelEnabled(log.DebugLevel)
-		newAuthHashes := make(map[string]string)
-		var newAuthContents map[string]*coreauth.Auth
-		if cacheAuthContents {
-			newAuthContents = make(map[string]*coreauth.Auth)
-		}
-		newFileAuthsByPath := make(map[string]map[string]*coreauth.Auth)
-
-		w.clientsMutex.RLock()
-		parser := w.pluginAuthParser
-		w.clientsMutex.RUnlock()
-
-		if resolvedAuthDir, errResolveAuthDir := util.ResolveAuthDir(cfg.AuthDir); errResolveAuthDir != nil {
-			log.Errorf("failed to resolve auth directory for hash cache: %v", errResolveAuthDir)
-		} else if resolvedAuthDir != "" {
-			entries, errReadDir := os.ReadDir(resolvedAuthDir)
-			if errReadDir != nil {
-				log.Errorf("failed to read auth directory for hash cache: %v", errReadDir)
-			} else {
-				for _, entry := range entries {
-					if entry == nil || entry.IsDir() {
-						continue
-					}
-					name := entry.Name()
-					if !strings.HasSuffix(strings.ToLower(name), ".json") {
-						continue
-					}
-					fullPath := filepath.Join(resolvedAuthDir, name)
-					if data, errReadFile := os.ReadFile(fullPath); errReadFile == nil && len(data) > 0 {
-						sum := sha256.Sum256(data)
-						normalizedPath := w.normalizeAuthPath(fullPath)
-						newAuthHashes[normalizedPath] = hex.EncodeToString(sum[:])
-						// Parse and cache auth content for future diff comparisons (debug only).
-						if cacheAuthContents {
-							var auth coreauth.Auth
-							if errParse := json.Unmarshal(data, &auth); errParse == nil {
-								newAuthContents[normalizedPath] = &auth
-							}
-						}
-						ctx := &synthesizer.SynthesisContext{
-							Config:           cfg,
-							AuthDir:          resolvedAuthDir,
-							Now:              time.Now(),
-							IDGenerator:      synthesizer.NewStableIDGenerator(),
-							PluginAuthParser: parser,
-						}
-						if generated := synthesizer.SynthesizeAuthFile(ctx, fullPath, data); len(generated) > 0 {
-							if pathAuths := authSliceToMap(generated); len(pathAuths) > 0 {
-								newFileAuthsByPath[normalizedPath] = authIDSet(pathAuths)
-							}
-						}
-					}
-				}
+	needsFullScan := w.fileAuthLoadingIsEnabled() &&
+		(rescanAuth || len(affectedOAuthProviders) > 0 || forceAuthRefresh || w.AuthLoadStatus().State == AuthLoadStateLoading)
+	if needsFullScan {
+		loadCtx := w.authLoadContext()
+		if w.stopped.Load() || loadCtx.Err() != nil {
+			if w.reloadCallback != nil {
+				w.reloadCallback(cfg)
 			}
+			return
 		}
-		w.clientsMutex.Lock()
-		w.lastAuthHashes = newAuthHashes
-		w.lastAuthContents = newAuthContents
-		w.fileAuthsByPath = newFileAuthsByPath
-		w.clientsMutex.Unlock()
-		w.authRescanMu.Unlock()
+		w.cancelAndWaitForAuthLoad()
+		w.publishAuthLoadStatus(AuthLoadStatus{State: AuthLoadStateLoading, StartedAt: time.Now().UTC()})
+		if w.reloadCallback != nil {
+			w.reloadCallback(cfg)
+		}
+		w.StartInitialAuthLoad(loadCtx, cfg.AuthLoadWorkers)
+		redisqueue.NotifyUsageRefresh()
+		return
 	}
-
-	totalNewClients := authFileCount + geminiAPIKeyCount + vertexCompatAPIKeyCount + claudeAPIKeyCount + codexAPIKeyCount + xaiAPIKeyCount + openAICompatCount
 
 	if w.reloadCallback != nil {
-		log.Debugf("triggering server update callback before auth refresh")
 		w.reloadCallback(cfg)
 	}
-
 	w.refreshAuthState(forceAuthRefresh)
 	redisqueue.NotifyUsageRefresh()
+}
 
-	log.Infof("full client load complete - %d clients (%d auth files + %d Gemini API keys + %d Vertex API keys + %d Claude API keys + %d Codex keys + %d xAI keys + %d OpenAI-compat)",
-		totalNewClients,
-		authFileCount,
-		geminiAPIKeyCount,
-		vertexCompatAPIKeyCount,
-		claudeAPIKeyCount,
-		codexAPIKeyCount,
-		xaiAPIKeyCount,
-		openAICompatCount,
-	)
+func (w *Watcher) cancelAndWaitForAuthLoad() {
+	w.authLoadMu.Lock()
+	cancel := w.authLoadCancel
+	done := w.authLoadDone
+	w.authLoadMu.Unlock()
+	if cancel != nil {
+		cancel()
+	}
+	if done != nil {
+		<-done
+	}
 }
 
 func (w *Watcher) addOrUpdateClient(path string) {
@@ -254,7 +191,7 @@ func (w *Watcher) addOrUpdateClientLocked(path string) {
 	newByID := authSliceToMap(generated)
 	w.clientsMutex.Lock()
 	if len(newByID) > 0 {
-		w.fileAuthsByPath[normalized] = authIDSet(newByID)
+		w.fileAuthsByPath[normalized] = cloneAuthMap(newByID)
 	} else {
 		delete(w.fileAuthsByPath, normalized)
 	}
@@ -328,51 +265,6 @@ func authSliceToMap(auths []*coreauth.Auth) map[string]*coreauth.Auth {
 		byID[a.ID] = a
 	}
 	return byID
-}
-
-func authIDSet(auths map[string]*coreauth.Auth) map[string]*coreauth.Auth {
-	set := make(map[string]*coreauth.Auth, len(auths))
-	for id := range auths {
-		set[id] = nil
-	}
-	return set
-}
-
-func (w *Watcher) loadFileClients(cfg *config.Config) int {
-	authFileCount := 0
-	successfulAuthCount := 0
-
-	authDir, errResolveAuthDir := util.ResolveAuthDir(cfg.AuthDir)
-	if errResolveAuthDir != nil {
-		log.Errorf("failed to resolve auth directory: %v", errResolveAuthDir)
-		return 0
-	}
-	if authDir == "" {
-		return 0
-	}
-
-	entries, errReadDir := os.ReadDir(authDir)
-	if errReadDir != nil {
-		log.Errorf("error reading auth directory: %v", errReadDir)
-		return 0
-	}
-	for _, entry := range entries {
-		if entry == nil || entry.IsDir() {
-			continue
-		}
-		name := entry.Name()
-		if !strings.HasSuffix(strings.ToLower(name), ".json") {
-			continue
-		}
-		authFileCount++
-		log.Debugf("processing auth file %d: %s", authFileCount, name)
-		fullPath := filepath.Join(authDir, name)
-		if data, errReadFile := os.ReadFile(fullPath); errReadFile == nil && len(data) > 0 {
-			successfulAuthCount++
-		}
-	}
-	log.Debugf("auth directory scan complete - found %d .json files, %d readable", authFileCount, successfulAuthCount)
-	return authFileCount
 }
 
 func BuildAPIKeyClients(cfg *config.Config) (int, int, int, int, int, int) {

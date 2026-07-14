@@ -83,6 +83,64 @@ func TestSavePluginLoginRecordsRollsBackSavedAuthsOnFailure(t *testing.T) {
 	}
 }
 
+func TestSavePluginLoginRecordsRollbackNotifiesOnlySuccessfulDeletes(t *testing.T) {
+	authDir := t.TempDir()
+	firstPath := filepath.Join(authDir, "geminicli.json")
+	secondPath := filepath.Join(authDir, "geminicli-project-a.json")
+	store := &pluginLoginRollbackStore{
+		failAt:  2,
+		baseDir: authDir,
+		deleteErrors: map[string]error{
+			secondPath: errors.New("delete failed"),
+		},
+	}
+	manager := coreauth.NewManager(nil, nil, nil)
+	for _, record := range []*coreauth.Auth{
+		{ID: "geminicli.json", FileName: "geminicli.json", Provider: "gemini-cli", Attributes: map[string]string{"path": firstPath}},
+		{ID: "geminicli-project-a.json", FileName: "geminicli-project-a.json", Provider: "gemini-cli", Attributes: map[string]string{"path": secondPath}},
+	} {
+		if _, errRegister := manager.Register(context.Background(), record); errRegister != nil {
+			t.Fatalf("register auth %s: %v", record.ID, errRegister)
+		}
+	}
+	h := NewHandlerWithoutConfigFilePath(&config.Config{AuthDir: authDir}, manager)
+	h.tokenStore = store
+	notifications := make(map[string]int)
+	h.SetAuthFileMutationHook(func(path string) {
+		notifications[path]++
+		if _, ok := manager.GetByID(filepath.Base(path)); !ok {
+			t.Errorf("runtime auth %q changed before mutation hook", filepath.Base(path))
+		}
+	})
+
+	records := []*coreauth.Auth{
+		{ID: "geminicli.json", FileName: "geminicli.json", Provider: "gemini-cli", Metadata: map[string]any{"type": "gemini-cli"}},
+		{ID: "geminicli-project-a.json", FileName: "geminicli-project-a.json", Provider: "gemini-cli", Metadata: map[string]any{"type": "gemini-cli", "project_id": "project-a"}},
+	}
+	errSave := h.savePluginLoginRecords(context.Background(), records)
+	if errSave == nil {
+		t.Fatal("savePluginLoginRecords() error = nil, want rollback-triggering error")
+	}
+	normalizedAuthDir, errEval := filepath.EvalSymlinks(authDir)
+	if errEval != nil {
+		t.Fatalf("resolve auth dir: %v", errEval)
+	}
+	normalizedFirstPath := filepath.Join(normalizedAuthDir, filepath.Base(firstPath))
+	normalizedSecondPath := filepath.Join(normalizedAuthDir, filepath.Base(secondPath))
+	if got := notifications[normalizedFirstPath]; got != 2 {
+		t.Fatalf("successful path notifications = %d, want save and rollback delete notifications", got)
+	}
+	if got := notifications[normalizedSecondPath]; got != 0 {
+		t.Fatalf("failed delete path notifications = %d, want 0", got)
+	}
+	if _, ok := manager.GetByID(filepath.Base(firstPath)); ok {
+		t.Fatal("successfully rolled back runtime auth still registered")
+	}
+	if _, ok := manager.GetByID(filepath.Base(secondPath)); !ok {
+		t.Fatal("runtime auth removed despite token-store delete failure")
+	}
+}
+
 func TestPatchPluginVirtualAuthStatusReturnsConflictForVirtualChild(t *testing.T) {
 	manager := coreauth.NewManager(nil, nil, nil)
 	auth := pluginVirtualAuthForTest(t.TempDir(), "source.json", "auth-1")
@@ -227,9 +285,11 @@ func pluginVirtualAuthForTest(authDir, fileName, id string) *coreauth.Auth {
 }
 
 type pluginLoginRollbackStore struct {
-	failAt  int
-	saved   []string
-	deleted map[string]bool
+	failAt       int
+	baseDir      string
+	saved        []string
+	deleted      map[string]bool
+	deleteErrors map[string]error
 }
 
 func (s *pluginLoginRollbackStore) List(context.Context) ([]*coreauth.Auth, error) {
@@ -241,6 +301,9 @@ func (s *pluginLoginRollbackStore) Save(_ context.Context, auth *coreauth.Auth) 
 	if path == "" {
 		path = strings.TrimSpace(auth.ID)
 	}
+	if s.baseDir != "" && !filepath.IsAbs(path) {
+		path = filepath.Join(s.baseDir, path)
+	}
 	s.saved = append(s.saved, path)
 	if len(s.saved) == s.failAt {
 		return path, errors.New("save failed after write")
@@ -249,6 +312,9 @@ func (s *pluginLoginRollbackStore) Save(_ context.Context, auth *coreauth.Auth) 
 }
 
 func (s *pluginLoginRollbackStore) Delete(_ context.Context, id string) error {
+	if errDelete := s.deleteErrors[id]; errDelete != nil {
+		return errDelete
+	}
 	if s.deleted == nil {
 		s.deleted = make(map[string]bool)
 	}

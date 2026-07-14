@@ -65,12 +65,74 @@ func TestRemoveCodexAuthRemovesRuntimeAuth(t *testing.T) {
 
 	h := NewHandlerWithoutConfigFilePath(&config.Config{AuthDir: authDir}, manager)
 	h.tokenStore = &memoryAuthStore{}
+	var notifiedPath string
+	h.SetAuthFileMutationHook(func(path string) {
+		notifiedPath = path
+		if _, ok := manager.GetByID(auth.ID); !ok {
+			t.Error("runtime auth changed before mutation hook")
+		}
+		if _, errStat := os.Stat(filePath); !os.IsNotExist(errStat) {
+			t.Errorf("auth file still exists when mutation hook ran: %v", errStat)
+		}
+	})
 
 	if err := h.removeCodexAuth(context.Background(), auth); err != nil {
 		t.Fatalf("removeCodexAuth returned error: %v", err)
 	}
+	normalizedAuthDir, errEval := filepath.EvalSymlinks(authDir)
+	if errEval != nil {
+		t.Fatalf("resolve auth dir: %v", errEval)
+	}
+	wantPath := filepath.Join(normalizedAuthDir, fileName)
+	if notifiedPath != wantPath {
+		t.Fatalf("mutation path = %q, want %q", notifiedPath, wantPath)
+	}
 	if _, err := os.Stat(filePath); !os.IsNotExist(err) {
 		t.Fatalf("expected auth file to be removed, stat err: %v", err)
+	}
+	if _, ok := manager.GetByID(auth.ID); ok {
+		t.Fatalf("expected runtime auth %q to be removed", auth.ID)
+	}
+}
+
+func TestRemoveCodexAuthNotifiesMutationWhenFileAlreadyMissing(t *testing.T) {
+	authDir := t.TempDir()
+	fileName := "already-missing.json"
+	filePath := filepath.Join(authDir, fileName)
+	manager := coreauth.NewManager(nil, nil, nil)
+	auth := &coreauth.Auth{
+		ID:       "already-missing-runtime-auth",
+		FileName: fileName,
+		Provider: "codex",
+		Status:   coreauth.StatusActive,
+		Attributes: map[string]string{
+			"path": filePath,
+		},
+	}
+	if _, errRegister := manager.Register(context.Background(), auth); errRegister != nil {
+		t.Fatalf("register auth: %v", errRegister)
+	}
+
+	h := NewHandlerWithoutConfigFilePath(&config.Config{AuthDir: authDir}, manager)
+	h.tokenStore = &memoryAuthStore{}
+	var notifiedPath string
+	h.SetAuthFileMutationHook(func(path string) {
+		notifiedPath = path
+		if _, ok := manager.GetByID(auth.ID); !ok {
+			t.Error("runtime auth changed before mutation hook")
+		}
+	})
+
+	if errRemove := h.removeCodexAuth(context.Background(), auth); errRemove != nil {
+		t.Fatalf("removeCodexAuth returned error: %v", errRemove)
+	}
+	normalizedAuthDir, errEval := filepath.EvalSymlinks(authDir)
+	if errEval != nil {
+		t.Fatalf("resolve auth dir: %v", errEval)
+	}
+	wantPath := filepath.Join(normalizedAuthDir, fileName)
+	if notifiedPath != wantPath {
+		t.Fatalf("mutation path = %q, want %q", notifiedPath, wantPath)
 	}
 	if _, ok := manager.GetByID(auth.ID); ok {
 		t.Fatalf("expected runtime auth %q to be removed", auth.ID)

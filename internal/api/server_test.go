@@ -5,6 +5,7 @@ import (
 	"context"
 	"encoding/json"
 	"io"
+	"net"
 	"net/http"
 	"net/http/httptest"
 	"os"
@@ -21,6 +22,7 @@ import (
 	"github.com/router-for-me/CLIProxyAPI/v7/internal/pluginhost"
 	"github.com/router-for-me/CLIProxyAPI/v7/internal/redisqueue"
 	"github.com/router-for-me/CLIProxyAPI/v7/internal/registry"
+	"github.com/router-for-me/CLIProxyAPI/v7/internal/watcher"
 	sdkaccess "github.com/router-for-me/CLIProxyAPI/v7/sdk/access"
 	"github.com/router-for-me/CLIProxyAPI/v7/sdk/cliproxy/auth"
 	coreexecutor "github.com/router-for-me/CLIProxyAPI/v7/sdk/cliproxy/executor"
@@ -503,6 +505,140 @@ func TestManagementUsageRequiresManagementAuthAndPopsArray(t *testing.T) {
 	if remaining := redisqueue.PopOldest(1); len(remaining) != 0 {
 		t.Fatalf("remaining queue = %q, want empty", remaining)
 	}
+}
+
+func TestManagementAuthFileLoadStatusRoute(t *testing.T) {
+	t.Setenv("MANAGEMENT_PASSWORD", "test-management-key")
+	want := watcher.AuthLoadStatus{State: watcher.AuthLoadStateLoading, FilesDiscovered: 3, FilesProcessed: 1, AuthsLoaded: 1}
+	server := newTestServerWithOptions(t, WithAuthLoadStatusProvider(func() watcher.AuthLoadStatus { return want }))
+
+	req := httptest.NewRequest(http.MethodGet, "/v0/management/auth-files/load-status", nil)
+	req.Header.Set("Authorization", "Bearer test-management-key")
+	rr := httptest.NewRecorder()
+	server.engine.ServeHTTP(rr, req)
+
+	if rr.Code != http.StatusOK {
+		t.Fatalf("status = %d, want %d body=%s", rr.Code, http.StatusOK, rr.Body.String())
+	}
+	var got watcher.AuthLoadStatus
+	if errDecode := json.Unmarshal(rr.Body.Bytes(), &got); errDecode != nil {
+		t.Fatalf("decode response: %v", errDecode)
+	}
+	if got.State != want.State || got.FilesProcessed != want.FilesProcessed {
+		t.Fatalf("response = %+v, want %+v", got, want)
+	}
+}
+
+func TestServerListening(t *testing.T) {
+	server := newTestServer(t)
+	server.server.Addr = "127.0.0.1:0"
+	startErrCh := make(chan error, 1)
+	go func() {
+		startErrCh <- server.Start()
+	}()
+
+	listening := server.Listening()
+	var addr net.Addr
+	select {
+	case addr = <-listening:
+		if addr == nil {
+			t.Fatal("listening address = nil")
+		}
+	case <-time.After(time.Second):
+		t.Fatal("timed out waiting for listening address")
+	}
+	conn, errDial := net.Dial("tcp", addr.String())
+	if errDial != nil {
+		t.Fatalf("dial listening address: %v", errDial)
+	}
+	if errClose := conn.Close(); errClose != nil {
+		t.Fatalf("close connection: %v", errClose)
+	}
+
+	if errStop := server.Stop(context.Background()); errStop != nil {
+		t.Fatalf("stop server: %v", errStop)
+	}
+	select {
+	case _, ok := <-listening:
+		if ok {
+			t.Fatal("listening channel delivered a second value")
+		}
+	case <-time.After(time.Second):
+		t.Fatal("listening channel did not close")
+	}
+	select {
+	case errStart := <-startErrCh:
+		if errStart != nil {
+			t.Fatalf("start server: %v", errStart)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("server start did not return after stop")
+	}
+}
+
+func TestServerListeningClosesOnStartupFailure(t *testing.T) {
+	assertClosedWithoutAddress := func(t *testing.T, listening <-chan net.Addr) {
+		t.Helper()
+		select {
+		case addr, ok := <-listening:
+			if ok {
+				t.Fatalf("listening channel delivered address %v", addr)
+			}
+		case <-time.After(time.Second):
+			t.Fatal("listening channel did not close")
+		}
+	}
+
+	t.Run("uninitialized server", func(t *testing.T) {
+		server := &Server{}
+		if errStart := server.Start(); errStart == nil {
+			t.Fatal("Start() error = nil")
+		}
+		assertClosedWithoutAddress(t, server.Listening())
+	})
+
+	t.Run("bind failure", func(t *testing.T) {
+		occupied, errListen := net.Listen("tcp", "127.0.0.1:0")
+		if errListen != nil {
+			t.Fatalf("occupy port: %v", errListen)
+		}
+		defer func() {
+			if errClose := occupied.Close(); errClose != nil {
+				t.Errorf("close occupied listener: %v", errClose)
+			}
+		}()
+		server := newTestServer(t)
+		server.server.Addr = occupied.Addr().String()
+		listening := server.Listening()
+		if errStart := server.Start(); errStart == nil {
+			t.Fatal("Start() error = nil")
+		}
+		assertClosedWithoutAddress(t, listening)
+	})
+
+	t.Run("missing TLS config", func(t *testing.T) {
+		server := newTestServer(t)
+		server.server.Addr = "127.0.0.1:0"
+		server.cfg.TLS.Enable = true
+		listening := server.Listening()
+		if errStart := server.Start(); errStart == nil {
+			t.Fatal("Start() error = nil")
+		}
+		assertClosedWithoutAddress(t, listening)
+	})
+
+	t.Run("invalid TLS certificate", func(t *testing.T) {
+		server := newTestServer(t)
+		server.server.Addr = "127.0.0.1:0"
+		server.cfg.TLS.Enable = true
+		server.cfg.TLS.Cert = filepath.Join(t.TempDir(), "missing-cert.pem")
+		server.cfg.TLS.Key = filepath.Join(t.TempDir(), "missing-key.pem")
+		listening := server.Listening()
+		if errStart := server.Start(); errStart == nil {
+			t.Fatal("Start() error = nil")
+		}
+		assertClosedWithoutAddress(t, listening)
+	})
 }
 
 func TestManagementPluginsRouteRegistered(t *testing.T) {

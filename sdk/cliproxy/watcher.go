@@ -25,7 +25,7 @@ func defaultWatcherFactory(configPath, authDir string, reload func(*config.Confi
 			w.SetConfig(cfg)
 		},
 		snapshotAuths: func() []*coreauth.Auth { return w.SnapshotCoreAuths() },
-		setUpdateQueue: func(queue chan<- watcher.AuthUpdate) {
+		setUpdateQueue: func(queue chan<- watcher.AuthUpdateBatch) {
 			w.SetAuthUpdateQueue(queue)
 		},
 		dispatchRuntimeUpdate: func(update watcher.AuthUpdate) bool {
@@ -40,5 +40,10 @@ func defaultWatcherFactory(configPath, authDir string, reload func(*config.Confi
 		reloadConfigIfChanged: func() {
 			w.ReloadConfigIfChanged()
 		},
+		startInitialAuthLoad:      w.StartInitialAuthLoad,
+		authLoadStatus:            w.AuthLoadStatus,
+		markAuthPathChanged:       w.MarkAuthPathChanged,
+		setAuthLoadHooks:          w.SetAuthLoadHooks,
+		setFileAuthLoadingEnabled: w.SetFileAuthLoadingEnabled,
 	}, nil
 }
