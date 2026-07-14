@@ -276,6 +276,9 @@ type Manager struct {
 	// refreshLocks serializes credential refresh per auth ID so concurrent
 	// 401 recoveries and auto-refresh workers do not race the same refresh_token.
 	refreshLocks sync.Map
+	// authLifecycleLocks serialize registration, updates, and terminal deletion
+	// for the same auth ID without holding m.mu during store operations.
+	authLifecycleLocks sync.Map
 }
 
 // NewManager constructs a manager with optional custom selector and hook.
@@ -2335,6 +2338,7 @@ func (m *Manager) Register(ctx context.Context, auth *Auth) (*Auth, error) {
 	if auth.ID == "" {
 		auth.ID = uuid.NewString()
 	}
+	unlockLifecycle := m.lockAuthLifecycle(auth.ID)
 	now := time.Now()
 	m.mu.Lock()
 	_, deferCooldownCleanup := m.cooldownRestoreIDs[auth.ID]
@@ -2355,11 +2359,13 @@ func (m *Manager) Register(ctx context.Context, auth *Auth) (*Auth, error) {
 	}
 	m.queueRefreshReschedule(auth.ID)
 	_ = m.persist(ctx, auth)
-	m.hook.OnAuthRegistered(ctx, auth.Clone())
+	registered := auth.Clone()
 	if clearedCooldown && !deferCooldownCleanup {
 		m.queueCooldownStatePersist(auth.ID)
 	}
-	return auth.Clone(), nil
+	unlockLifecycle()
+	m.hook.OnAuthRegistered(ctx, registered.Clone())
+	return registered, nil
 }
 
 // Update replaces an existing auth entry and notifies hooks.
@@ -2367,12 +2373,14 @@ func (m *Manager) Update(ctx context.Context, auth *Auth) (*Auth, error) {
 	if auth == nil || auth.ID == "" {
 		return nil, nil
 	}
+	unlockLifecycle := m.lockAuthLifecycle(auth.ID)
 	var resumeModels []string
 	cooldownStateChanged := false
 	m.mu.Lock()
 	existing, ok := m.auths[auth.ID]
 	if !ok || existing == nil {
 		m.mu.Unlock()
+		unlockLifecycle()
 		return nil, nil
 	}
 	now := time.Now()
@@ -2419,7 +2427,7 @@ func (m *Manager) Update(ctx context.Context, auth *Auth) (*Auth, error) {
 	}
 	m.queueRefreshReschedule(auth.ID)
 	_ = m.persist(ctx, auth)
-	m.hook.OnAuthUpdated(ctx, auth.Clone())
+	updated := auth.Clone()
 	if !deferCooldownCleanup && (clearedCooldown || cooldownStateChanged) {
 		m.queueCooldownStatePersist(auth.ID)
 	}
@@ -2427,7 +2435,9 @@ func (m *Manager) Update(ctx context.Context, auth *Auth) (*Auth, error) {
 		registry.GetGlobalRegistry().ClearModelQuotaExceeded(auth.ID, model)
 		registry.GetGlobalRegistry().ResumeClientModel(auth.ID, model)
 	}
-	return auth.Clone(), nil
+	unlockLifecycle()
+	m.hook.OnAuthUpdated(ctx, updated.Clone())
+	return updated, nil
 }
 
 func resetRuntimeAvailabilityState(auth *Auth, now time.Time) {
@@ -3937,6 +3947,11 @@ func (m *Manager) MarkResult(ctx context.Context, result Result) {
 	// suffix ("model(high)") so the key matches the scheduler shard and the
 	// registry model ID, which are both canonical.
 	result.Model = canonicalModelKey(result.Model)
+	deleteUnauthorized := shouldDeleteUnauthorizedAuth(result)
+	unlockLifecycle := func() {}
+	if deleteUnauthorized {
+		unlockLifecycle = m.lockAuthLifecycle(result.AuthID)
+	}
 
 	shouldResumeModel := false
 	shouldSuspendModel := false
@@ -3964,7 +3979,7 @@ func (m *Manager) MarkResult(ctx context.Context, result Result) {
 			auth.Failed++
 		}
 
-		if shouldDeleteUnauthorizedAuth(result) {
+		if deleteUnauthorized {
 			deleteAuthID = auth.ID
 			deleteStore = m.store
 			delete(m.auths, auth.ID)
@@ -4111,6 +4126,7 @@ func (m *Manager) MarkResult(ctx context.Context, result Result) {
 	m.mu.Unlock()
 	if shouldDeleteAuth {
 		m.removeDeletedAuth(ctx, deleteAuthID, deleteStore)
+		unlockLifecycle()
 		m.hook.OnResult(ctx, result)
 		return
 	}
@@ -4133,12 +4149,27 @@ func (m *Manager) MarkResult(ctx context.Context, result Result) {
 		registry.GetGlobalRegistry().SuspendClientModel(result.AuthID, result.Model, suspendReason)
 	}
 
+	unlockLifecycle()
 	m.hook.OnResult(ctx, result)
 	m.publishErrorEvent(result, authSnapshot)
 }
 
 func shouldDeleteUnauthorizedAuth(result Result) bool {
 	return !result.Success && deleteUnauthorizedAuth.Load() && statusCodeFromResult(result.Error) == http.StatusUnauthorized
+}
+
+func (m *Manager) lockAuthLifecycle(authID string) func() {
+	if m == nil || authID == "" {
+		return func() {}
+	}
+	value, _ := m.authLifecycleLocks.LoadOrStore(authID, &sync.Mutex{})
+	lock, _ := value.(*sync.Mutex)
+	if lock == nil {
+		lock = &sync.Mutex{}
+		m.authLifecycleLocks.Store(authID, lock)
+	}
+	lock.Lock()
+	return lock.Unlock
 }
 
 func (m *Manager) removeDeletedAuth(ctx context.Context, authID string, store Store) {
@@ -4376,8 +4407,8 @@ func isUnauthorizedError(err error) bool {
 	if err == nil {
 		return false
 	}
-	if statusCodeFromError(err) == http.StatusUnauthorized {
-		return true
+	if status := statusCodeFromError(err); status != 0 {
+		return status == http.StatusUnauthorized
 	}
 	raw := strings.ToLower(err.Error())
 	return strings.Contains(raw, "status 401") || strings.Contains(raw, "401 unauthorized")
@@ -6317,14 +6348,20 @@ func (m *Manager) refreshAuthForRequest(ctx context.Context, id, failedAccessTok
 	now := time.Now()
 	if err != nil {
 		terminal := isPermanentRefreshAuthError(err)
+		deleteTerminal := terminal && deleteUnauthorizedAuth.Load()
+		var unlockLifecycle func()
+		if deleteTerminal {
+			unlockLifecycle = m.lockAuthLifecycle(id)
+			defer unlockLifecycle()
+		}
 		shouldDelete := false
 		shouldReschedule := false
 		shouldUnschedule := false
 		var deleteStore Store
 		m.mu.Lock()
-		if current := m.auths[id]; current != nil {
+		if current := m.auths[id]; current == auth {
 			current.LastError = refreshErrorFromError(err)
-			if terminal && deleteUnauthorizedAuth.Load() {
+			if deleteTerminal {
 				deleteStore = m.store
 				delete(m.auths, id)
 				shouldDelete = true

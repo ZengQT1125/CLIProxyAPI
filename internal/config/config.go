@@ -94,7 +94,8 @@ type Config struct {
 
 	// DeleteUnauthorizedAuth controls whether to delete credentials on 401 responses
 	// or permanently invalid OAuth refresh grants. When false (default), terminal
-	// refresh failures remain stored but are removed from automatic refresh scheduling.
+	// refresh failures remain stored but are removed from automatic refresh scheduling
+	// for the current running instance.
 	// When true, the auth is evicted from memory and removed from the store.
 	DeleteUnauthorizedAuth bool `yaml:"delete-unauthorized-auth" json:"delete-unauthorized-auth"`
 

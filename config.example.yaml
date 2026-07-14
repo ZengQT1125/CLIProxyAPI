@@ -147,7 +147,8 @@ disable-cooling: false
 # When true, credentials returning 401 or a permanently invalid OAuth refresh grant
 # (for example, invalid_grant after a refresh token is revoked) are evicted from memory
 # and deleted from the store. When false (default), the credential remains stored but
-# terminal refresh failures are removed from automatic refresh scheduling.
+# terminal refresh failures are removed from automatic refresh scheduling for the
+# current running instance.
 delete-unauthorized-auth: false
 
 # When true, persist per-auth cooldown status across restarts.

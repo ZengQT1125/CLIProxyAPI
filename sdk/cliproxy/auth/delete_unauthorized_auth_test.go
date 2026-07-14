@@ -8,6 +8,8 @@ import (
 	"sync/atomic"
 	"testing"
 	"time"
+
+	cliproxyexecutor "github.com/router-for-me/CLIProxyAPI/v7/sdk/cliproxy/executor"
 )
 
 type deleteTrackingStore struct {
@@ -30,6 +32,47 @@ func (s *deleteTrackingStore) deleted() []string {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	return append([]string(nil), s.deletedIDs...)
+}
+
+type blockingDeleteStore struct {
+	mu            sync.Mutex
+	auths         map[string]*Auth
+	deleteStarted chan struct{}
+	allowDelete   chan struct{}
+	deleteOnce    sync.Once
+}
+
+func newBlockingDeleteStore() *blockingDeleteStore {
+	return &blockingDeleteStore{
+		auths:         make(map[string]*Auth),
+		deleteStarted: make(chan struct{}),
+		allowDelete:   make(chan struct{}),
+	}
+}
+
+func (s *blockingDeleteStore) List(context.Context) ([]*Auth, error) { return nil, nil }
+
+func (s *blockingDeleteStore) Save(_ context.Context, auth *Auth) (string, error) {
+	s.mu.Lock()
+	s.auths[auth.ID] = auth.Clone()
+	s.mu.Unlock()
+	return auth.ID, nil
+}
+
+func (s *blockingDeleteStore) Delete(_ context.Context, id string) error {
+	s.deleteOnce.Do(func() { close(s.deleteStarted) })
+	<-s.allowDelete
+	s.mu.Lock()
+	delete(s.auths, id)
+	s.mu.Unlock()
+	return nil
+}
+
+func (s *blockingDeleteStore) auth(id string) (*Auth, bool) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	auth, ok := s.auths[id]
+	return auth.Clone(), ok
 }
 
 type refreshOAuthError struct {
@@ -224,6 +267,7 @@ func TestManagerAutoRefreshKeepsNonInvalidGrantBadRequest(t *testing.T) {
 	manager.RegisterExecutor(executor)
 	registerExpiredRefreshAuth(t, manager, "xai-bad-request", "xai")
 
+	refreshStartedAt := time.Now()
 	manager.StartAutoRefresh(context.Background(), time.Millisecond)
 	t.Cleanup(manager.StopAutoRefresh)
 	waitForAuthCondition(t, func() bool {
@@ -237,5 +281,222 @@ func TestManagerAutoRefreshKeepsNonInvalidGrantBadRequest(t *testing.T) {
 	}
 	if got := store.deleted(); len(got) != 0 {
 		t.Fatalf("deleted auths = %v, want none", got)
+	}
+	if got := retained.NextRefreshAfter; got.Before(refreshStartedAt.Add(4*time.Minute+59*time.Second)) || got.After(time.Now().Add(5*time.Minute+time.Second)) {
+		t.Fatalf("NextRefreshAfter = %s, want approximately five-minute backoff", got)
+	}
+}
+
+func TestManagerAutoRefreshKeepsStructuredBadRequestContainingUnauthorizedText(t *testing.T) {
+	SetDeleteUnauthorizedAuth(true)
+	t.Cleanup(func() { SetDeleteUnauthorizedAuth(false) })
+
+	for _, message := range []string{"upstream status 401", "upstream 401 unauthorized"} {
+		t.Run(message, func(t *testing.T) {
+			store := &deleteTrackingStore{}
+			manager := NewManager(store, nil, nil)
+			executor := &oauthRefreshFailureExecutor{
+				schedulerProviderTestExecutor: schedulerProviderTestExecutor{provider: "xai"},
+				err:                           &refreshOAuthError{status: http.StatusBadRequest, code: "invalid_request", message: message},
+			}
+			manager.RegisterExecutor(executor)
+			registerExpiredRefreshAuth(t, manager, "xai-structured-bad-request", "xai")
+
+			refreshStartedAt := time.Now()
+			manager.StartAutoRefresh(context.Background(), time.Millisecond)
+			t.Cleanup(manager.StopAutoRefresh)
+			waitForAuthCondition(t, func() bool {
+				auth, ok := manager.GetByID("xai-structured-bad-request")
+				return ok && auth.LastError != nil && !auth.NextRefreshAfter.IsZero()
+			}, "structured bad-request backoff")
+
+			retained, ok := manager.GetByID("xai-structured-bad-request")
+			if !ok || retained.LastError.StatusCode() != http.StatusBadRequest {
+				t.Fatalf("expected retained HTTP 400 auth, got %#v", retained)
+			}
+			if got := store.deleted(); len(got) != 0 {
+				t.Fatalf("deleted auths = %v, want none", got)
+			}
+			if got := retained.NextRefreshAfter; got.Before(refreshStartedAt.Add(4*time.Minute+59*time.Second)) || got.After(time.Now().Add(5*time.Minute+time.Second)) {
+				t.Fatalf("NextRefreshAfter = %s, want approximately five-minute backoff", got)
+			}
+		})
+	}
+}
+
+func TestManagerAutoRefreshDeletesUnauthorizedWhenEnabled(t *testing.T) {
+	SetDeleteUnauthorizedAuth(true)
+	t.Cleanup(func() { SetDeleteUnauthorizedAuth(false) })
+
+	store := &deleteTrackingStore{}
+	manager := NewManager(store, nil, nil)
+	executor := &oauthRefreshFailureExecutor{
+		schedulerProviderTestExecutor: schedulerProviderTestExecutor{provider: "xai"},
+		err:                           &refreshOAuthError{status: http.StatusUnauthorized, message: "expired credentials"},
+	}
+	manager.RegisterExecutor(executor)
+	registerExpiredRefreshAuth(t, manager, "xai-unauthorized-delete", "xai")
+
+	manager.StartAutoRefresh(context.Background(), time.Millisecond)
+	t.Cleanup(manager.StopAutoRefresh)
+	waitForAuthCondition(t, func() bool { return len(store.deleted()) == 1 }, "unauthorized auth deletion")
+
+	if _, ok := manager.GetByID("xai-unauthorized-delete"); ok {
+		t.Fatal("expected unauthorized auth to be removed from manager")
+	}
+}
+
+func TestManagerAutoRefreshRetainsUnauthorizedWhenDisabled(t *testing.T) {
+	SetDeleteUnauthorizedAuth(false)
+	t.Cleanup(func() { SetDeleteUnauthorizedAuth(false) })
+
+	store := &deleteTrackingStore{}
+	manager := NewManager(store, nil, nil)
+	executor := &oauthRefreshFailureExecutor{
+		schedulerProviderTestExecutor: schedulerProviderTestExecutor{provider: "xai"},
+		err:                           &refreshOAuthError{status: http.StatusUnauthorized, message: "expired credentials"},
+	}
+	manager.RegisterExecutor(executor)
+	registerExpiredRefreshAuth(t, manager, "xai-unauthorized-retain", "xai")
+
+	manager.StartAutoRefresh(context.Background(), time.Millisecond)
+	t.Cleanup(manager.StopAutoRefresh)
+	waitForAuthCondition(t, func() bool {
+		auth, ok := manager.GetByID("xai-unauthorized-retain")
+		return ok && auth.LastError != nil && auth.LastError.Code == "unauthorized"
+	}, "retained unauthorized state")
+
+	retained, ok := manager.GetByID("xai-unauthorized-retain")
+	if !ok || !retained.Unavailable || retained.Status != StatusError || !retained.NextRefreshAfter.IsZero() {
+		t.Fatalf("retained unauthorized auth = %#v", retained)
+	}
+	if got := store.deleted(); len(got) != 0 {
+		t.Fatalf("deleted auths = %v, want none", got)
+	}
+}
+
+func TestManagerAutoRefreshDeleteDoesNotRemoveReplacementAuth(t *testing.T) {
+	SetDeleteUnauthorizedAuth(true)
+	t.Cleanup(func() { SetDeleteUnauthorizedAuth(false) })
+
+	store := newBlockingDeleteStore()
+	manager := NewManager(store, nil, nil)
+	executor := &oauthRefreshFailureExecutor{
+		schedulerProviderTestExecutor: schedulerProviderTestExecutor{provider: "xai"},
+		err:                           &refreshOAuthError{status: http.StatusBadRequest, code: "invalid_grant", message: "revoked"},
+	}
+	manager.RegisterExecutor(executor)
+	registerExpiredRefreshAuth(t, manager, "xai-replaced", "xai")
+
+	manager.StartAutoRefresh(context.Background(), time.Millisecond)
+	t.Cleanup(manager.StopAutoRefresh)
+	select {
+	case <-store.deleteStarted:
+	case <-time.After(2 * time.Second):
+		t.Fatal("timed out waiting for terminal deletion")
+	}
+
+	replacement := &Auth{
+		ID:       "xai-replaced",
+		Provider: "xai",
+		Metadata: map[string]any{
+			"access_token":  "replacement-access-token",
+			"refresh_token": "replacement-refresh-token",
+		},
+	}
+	registered := make(chan error, 1)
+	go func() {
+		_, errRegister := manager.Register(context.Background(), replacement)
+		registered <- errRegister
+	}()
+
+	select {
+	case errRegister := <-registered:
+		t.Fatalf("replacement registration completed before terminal deletion: %v", errRegister)
+	case <-time.After(20 * time.Millisecond):
+	}
+	close(store.allowDelete)
+	if errRegister := <-registered; errRegister != nil {
+		t.Fatalf("register replacement auth: %v", errRegister)
+	}
+
+	registeredAuth, ok := manager.GetByID("xai-replaced")
+	if !ok || authAccessToken(registeredAuth) != "replacement-access-token" {
+		t.Fatalf("manager auth = %#v, want replacement", registeredAuth)
+	}
+	persisted, ok := store.auth("xai-replaced")
+	if !ok || authAccessToken(persisted) != "replacement-access-token" {
+		t.Fatalf("stored auth = %#v, want replacement", persisted)
+	}
+	selected, errSelect := manager.SelectAuth(context.Background(), "xai", "", cliproxyexecutor.Options{})
+	if errSelect != nil || selected == nil || selected.ID != "xai-replaced" {
+		t.Fatalf("selected auth = %#v, err = %v", selected, errSelect)
+	}
+}
+
+func TestManagerMarkResultDeleteDoesNotRemoveReplacementAuth(t *testing.T) {
+	SetDeleteUnauthorizedAuth(true)
+	t.Cleanup(func() { SetDeleteUnauthorizedAuth(false) })
+
+	store := newBlockingDeleteStore()
+	manager := NewManager(store, nil, nil)
+	manager.RegisterExecutor(schedulerProviderTestExecutor{provider: "xai"})
+	initial := &Auth{
+		ID:       "xai-result-replaced",
+		Provider: "xai",
+		Metadata: map[string]any{"access_token": "initial-access-token", "refresh_token": "initial-refresh-token"},
+	}
+	if _, errRegister := manager.Register(context.Background(), initial); errRegister != nil {
+		t.Fatalf("register initial auth: %v", errRegister)
+	}
+
+	resultDone := make(chan struct{})
+	go func() {
+		manager.MarkResult(context.Background(), Result{
+			AuthID:  initial.ID,
+			Success: false,
+			Error:   &Error{HTTPStatus: http.StatusUnauthorized, Message: "unauthorized"},
+		})
+		close(resultDone)
+	}()
+	select {
+	case <-store.deleteStarted:
+	case <-time.After(2 * time.Second):
+		t.Fatal("timed out waiting for result deletion")
+	}
+
+	replacement := &Auth{
+		ID:       initial.ID,
+		Provider: "xai",
+		Metadata: map[string]any{"access_token": "replacement-access-token", "refresh_token": "replacement-refresh-token"},
+	}
+	registered := make(chan error, 1)
+	go func() {
+		_, errRegister := manager.Register(context.Background(), replacement)
+		registered <- errRegister
+	}()
+
+	select {
+	case errRegister := <-registered:
+		t.Fatalf("replacement registration completed before result deletion: %v", errRegister)
+	case <-time.After(20 * time.Millisecond):
+	}
+	close(store.allowDelete)
+	<-resultDone
+	if errRegister := <-registered; errRegister != nil {
+		t.Fatalf("register replacement auth: %v", errRegister)
+	}
+
+	registeredAuth, ok := manager.GetByID(initial.ID)
+	if !ok || authAccessToken(registeredAuth) != "replacement-access-token" {
+		t.Fatalf("manager auth = %#v, want replacement", registeredAuth)
+	}
+	persisted, ok := store.auth(initial.ID)
+	if !ok || authAccessToken(persisted) != "replacement-access-token" {
+		t.Fatalf("stored auth = %#v, want replacement", persisted)
+	}
+	selected, errSelect := manager.SelectAuth(context.Background(), "xai", "", cliproxyexecutor.Options{})
+	if errSelect != nil || selected == nil || selected.ID != initial.ID {
+		t.Fatalf("selected auth = %#v, err = %v", selected, errSelect)
 	}
 }
