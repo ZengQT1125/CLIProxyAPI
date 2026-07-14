@@ -16,24 +16,29 @@ const (
 )
 
 type cooldownStatePersister struct {
-	apply      func(context.Context, []string) error
+	apply      func(context.Context, []cooldownStatePersistEntry) error
 	mu         sync.Mutex
-	dirty      map[string]struct{}
+	dirty      map[string]uint64
 	running    bool
 	flushToken chan struct{}
 }
 
-func newCooldownStatePersister(apply func(context.Context, []string) error) *cooldownStatePersister {
+type cooldownStatePersistEntry struct {
+	authID       string
+	storeVersion uint64
+}
+
+func newCooldownStatePersister(apply func(context.Context, []cooldownStatePersistEntry) error) *cooldownStatePersister {
 	flushToken := make(chan struct{}, 1)
 	flushToken <- struct{}{}
 	return &cooldownStatePersister{
 		apply:      apply,
-		dirty:      make(map[string]struct{}),
+		dirty:      make(map[string]uint64),
 		flushToken: flushToken,
 	}
 }
 
-func (p *cooldownStatePersister) mark(authIDs ...string) {
+func (p *cooldownStatePersister) mark(storeVersion uint64, authIDs ...string) {
 	if p == nil {
 		return
 	}
@@ -41,7 +46,9 @@ func (p *cooldownStatePersister) mark(authIDs ...string) {
 	for _, authID := range authIDs {
 		authID = strings.TrimSpace(authID)
 		if authID != "" {
-			p.dirty[authID] = struct{}{}
+			if dirtyVersion, ok := p.dirty[authID]; !ok || storeVersion > dirtyVersion {
+				p.dirty[authID] = storeVersion
+			}
 		}
 	}
 	if len(p.dirty) == 0 || p.running {
@@ -91,14 +98,14 @@ func (p *cooldownStatePersister) flush(ctx context.Context) error {
 		case <-p.flushToken:
 		}
 
-		authIDs := p.drain()
-		if len(authIDs) == 0 {
+		entries := p.drain()
+		if len(entries) == 0 {
 			p.flushToken <- struct{}{}
 			return nil
 		}
-		errApply := p.apply(ctx, authIDs)
+		errApply := p.apply(ctx, entries)
 		if errApply != nil {
-			p.requeue(authIDs)
+			p.requeue(entries)
 			p.flushToken <- struct{}{}
 			return errApply
 		}
@@ -106,26 +113,30 @@ func (p *cooldownStatePersister) flush(ctx context.Context) error {
 	}
 }
 
-func (p *cooldownStatePersister) drain() []string {
+func (p *cooldownStatePersister) drain() []cooldownStatePersistEntry {
 	p.mu.Lock()
 	defer p.mu.Unlock()
 	if len(p.dirty) == 0 {
 		return nil
 	}
-	authIDs := make([]string, 0, len(p.dirty))
-	for authID := range p.dirty {
-		authIDs = append(authIDs, authID)
+	entries := make([]cooldownStatePersistEntry, 0, len(p.dirty))
+	for authID, storeVersion := range p.dirty {
+		entries = append(entries, cooldownStatePersistEntry{authID: authID, storeVersion: storeVersion})
 		delete(p.dirty, authID)
 	}
-	sort.Strings(authIDs)
-	return authIDs
+	sort.Slice(entries, func(i, j int) bool {
+		return entries[i].authID < entries[j].authID
+	})
+	return entries
 }
 
-func (p *cooldownStatePersister) requeue(authIDs []string) {
+func (p *cooldownStatePersister) requeue(entries []cooldownStatePersistEntry) {
 	p.mu.Lock()
-	for _, authID := range authIDs {
-		if authID != "" {
-			p.dirty[authID] = struct{}{}
+	for _, entry := range entries {
+		if entry.authID != "" {
+			if dirtyVersion, ok := p.dirty[entry.authID]; !ok || entry.storeVersion > dirtyVersion {
+				p.dirty[entry.authID] = entry.storeVersion
+			}
 		}
 	}
 	p.mu.Unlock()

@@ -299,7 +299,7 @@ func NewManager(store Store, selector Selector, hook Hook) *Manager {
 	manager.runtimeConfig.Store(&internalconfig.Config{})
 	manager.apiKeyModelAlias.Store(apiKeyModelAliasTable(nil))
 	manager.scheduler = newAuthScheduler(selector)
-	manager.cooldownPersister = newCooldownStatePersister(manager.persistCooldownStateIDs)
+	manager.cooldownPersister = newCooldownStatePersister(manager.persistCooldownStateEntries)
 	return manager
 }
 
@@ -653,13 +653,13 @@ func (m *Manager) CompleteCooldownRestore(ctx context.Context) error {
 		return nil
 	}
 	m.cooldownRestoreMu.Lock()
-	defer m.cooldownRestoreMu.Unlock()
 	m.mu.Lock()
 	if m.cooldownRestoreVersion == 0 || m.cooldownRestoreVersion != m.cooldownStoreVersion {
 		m.pendingCooldownRestore = nil
 		m.cooldownRestoreIDs = nil
 		m.cooldownRestoreVersion = 0
 		m.mu.Unlock()
+		m.cooldownRestoreMu.Unlock()
 		return nil
 	}
 	idSet := make(map[string]struct{}, len(m.cooldownRestoreIDs)+len(m.auths))
@@ -682,6 +682,7 @@ func (m *Manager) CompleteCooldownRestore(ctx context.Context) error {
 	}
 	sort.Strings(ids)
 	m.queueCooldownStatePersist(ids...)
+	m.cooldownRestoreMu.Unlock()
 	return m.FlushCooldownStates(ctx)
 }
 
@@ -916,11 +917,12 @@ func (m *Manager) queueCooldownStatePersist(authIDs ...string) {
 	}
 	m.mu.RLock()
 	enabled := m.cooldownStore != nil
+	storeVersion := m.cooldownStoreVersion
 	m.mu.RUnlock()
 	if !enabled {
 		return
 	}
-	m.cooldownPersister.mark(authIDs...)
+	m.cooldownPersister.mark(storeVersion, authIDs...)
 }
 
 // FlushCooldownStates persists all pending cooldown changes before returning.
@@ -931,12 +933,30 @@ func (m *Manager) FlushCooldownStates(ctx context.Context) error {
 	return m.cooldownPersister.flush(ctx)
 }
 
-func (m *Manager) persistCooldownStateIDs(ctx context.Context, authIDs []string) error {
-	if m == nil || len(authIDs) == 0 {
+func (m *Manager) persistCooldownStateEntries(ctx context.Context, entries []cooldownStatePersistEntry) error {
+	if m == nil || len(entries) == 0 {
 		return nil
 	}
 	if ctx == nil {
 		ctx = context.Background()
+	}
+	m.cooldownRestoreMu.Lock()
+	defer m.cooldownRestoreMu.Unlock()
+	m.mu.RLock()
+	storeVersion := m.cooldownStoreVersion
+	storeEnabled := m.cooldownStore != nil
+	m.mu.RUnlock()
+	if !storeEnabled {
+		return nil
+	}
+	authIDs := make([]string, 0, len(entries))
+	for _, entry := range entries {
+		if entry.storeVersion == storeVersion {
+			authIDs = append(authIDs, entry.authID)
+		}
+	}
+	if len(authIDs) == 0 {
+		return nil
 	}
 	snapshots, store := m.cooldownStateSnapshots(authIDs)
 	if store == nil || len(snapshots) == 0 {

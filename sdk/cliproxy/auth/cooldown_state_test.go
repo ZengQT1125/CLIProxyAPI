@@ -826,3 +826,69 @@ func TestManager_CompleteCooldownRestoreDoesNotPersistToReplacedStore(t *testing
 		t.Fatalf("new store Apply count = %d, want 0", got)
 	}
 }
+
+func TestManager_FailedCooldownRestoreDoesNotRetryToReplacedStore(t *testing.T) {
+	nextRetry := time.Now().Add(time.Hour)
+	oldStore := &failingCooldownStateStore{}
+	oldStore.fail.Store(true)
+	oldStore.load = []CooldownStateSnapshot{{
+		AuthID:  "auth-1",
+		Records: []CooldownStateRecord{{AuthID: "auth-1", NextRetryAfter: nextRetry}},
+	}}
+	manager := NewManager(nil, nil, nil)
+	manager.SetCooldownStateStore(oldStore)
+	if _, errRegister := manager.Register(WithSkipPersist(context.Background()), &Auth{ID: "auth-1", Provider: "xai"}); errRegister != nil {
+		t.Fatal(errRegister)
+	}
+	if errPrepare := manager.PrepareCooldownRestore(context.Background()); errPrepare != nil {
+		t.Fatal(errPrepare)
+	}
+	if errComplete := manager.CompleteCooldownRestore(context.Background()); errComplete == nil {
+		t.Fatal("CompleteCooldownRestore() error = nil, want old store failure")
+	}
+
+	newStore := &recordingCooldownStateStore{}
+	manager.SetCooldownStateStore(newStore)
+	if errFlush := manager.FlushCooldownStates(context.Background()); errFlush != nil {
+		t.Fatal(errFlush)
+	}
+	if got := newStore.applyCount.Load(); got != 0 {
+		t.Fatalf("new store Apply count = %d, want 0", got)
+	}
+}
+
+func TestManager_NewCooldownChangeSupersedesFailedRestoreBatch(t *testing.T) {
+	nextRetry := time.Now().Add(time.Hour)
+	oldStore := &failingCooldownStateStore{}
+	oldStore.fail.Store(true)
+	oldStore.load = []CooldownStateSnapshot{{
+		AuthID:  "auth-1",
+		Records: []CooldownStateRecord{{AuthID: "auth-1", NextRetryAfter: nextRetry}},
+	}}
+	manager := NewManager(nil, nil, nil)
+	manager.SetCooldownStateStore(oldStore)
+	if _, errRegister := manager.Register(WithSkipPersist(context.Background()), &Auth{ID: "auth-1", Provider: "xai"}); errRegister != nil {
+		t.Fatal(errRegister)
+	}
+	if errPrepare := manager.PrepareCooldownRestore(context.Background()); errPrepare != nil {
+		t.Fatal(errPrepare)
+	}
+	if errComplete := manager.CompleteCooldownRestore(context.Background()); errComplete == nil {
+		t.Fatal("CompleteCooldownRestore() error = nil, want old store failure")
+	}
+
+	newStore := &recordingCooldownStateStore{}
+	manager.SetCooldownStateStore(newStore)
+	manager.MarkResult(context.Background(), Result{AuthID: "auth-1", Provider: "xai", Success: true})
+	if errFlush := manager.FlushCooldownStates(context.Background()); errFlush != nil {
+		t.Fatal(errFlush)
+	}
+	if got := newStore.applyCount.Load(); got != 1 {
+		t.Fatalf("new store Apply count = %d, want 1", got)
+	}
+	batches := newStore.recordedBatches()
+	last := batches[len(batches)-1]
+	if len(last) != 1 || last[0].AuthID != "auth-1" || len(last[0].Records) != 0 {
+		t.Fatalf("new store batch = %+v, want auth-1 cooldown clear", last)
+	}
+}
