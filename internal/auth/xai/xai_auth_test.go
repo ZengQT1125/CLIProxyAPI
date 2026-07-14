@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/base64"
 	"encoding/json"
+	"errors"
 	"net/http"
 	"net/http/httptest"
 	"net/url"
@@ -317,6 +318,43 @@ func TestRefreshTokens_DeduplicatesConcurrentRefresh(t *testing.T) {
 	}
 	if got := atomic.LoadInt32(&calls); got != 1 {
 		t.Fatalf("expected both refresh callers to share a single upstream call, got %d", got)
+	}
+}
+
+func TestRefreshTokensInvalidGrantReturnsStructuredOAuthError(t *testing.T) {
+	resetXAIRefreshGroupForTest()
+	t.Cleanup(resetXAIRefreshGroupForTest)
+
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(http.StatusBadRequest)
+		_, _ = w.Write([]byte(`{"error":"invalid_grant","error_description":"Refresh token has been revoked"}`))
+	}))
+	defer server.Close()
+
+	auth := NewXAIAuth(nil)
+	_, errRefresh := auth.RefreshTokens(context.Background(), "revoked-refresh-token", server.URL)
+	if errRefresh == nil {
+		t.Fatal("RefreshTokens() error = nil, want invalid_grant")
+	}
+
+	var statusErr interface{ StatusCode() int }
+	if !errors.As(errRefresh, &statusErr) {
+		t.Fatalf("RefreshTokens() error = %T, want StatusCode()", errRefresh)
+	}
+	if got := statusErr.StatusCode(); got != http.StatusBadRequest {
+		t.Fatalf("StatusCode() = %d, want %d", got, http.StatusBadRequest)
+	}
+
+	var oauthErr interface{ OAuthErrorCode() string }
+	if !errors.As(errRefresh, &oauthErr) {
+		t.Fatalf("RefreshTokens() error = %T, want OAuthErrorCode()", errRefresh)
+	}
+	if got := oauthErr.OAuthErrorCode(); got != "invalid_grant" {
+		t.Fatalf("OAuthErrorCode() = %q, want invalid_grant", got)
+	}
+	if !strings.Contains(errRefresh.Error(), "Refresh token has been revoked") {
+		t.Fatalf("RefreshTokens() error = %q, want revoked description", errRefresh)
 	}
 }
 
