@@ -161,3 +161,42 @@ func openAICompatKimiAuth() *coreauth.Auth {
 		},
 	}
 }
+
+// TestRegisterModelsForAuthBatch_BindsExecutorForLoadedPGAuth reproduces the
+// non-home PostgreSQL startup path:
+//
+//	Manager.Load (oauth auths in coreManager) →
+//	registerModelsForAuthBatch / completeModelRegistrationForAuthWithCache
+//
+// prepareCoreAuthForModelRegistration is the only historical path that called
+// ensureExecutorsForAuth. The batch path used on PG (non-progressive) startup
+// skipped it. Models still land in the global registry (so handlers report
+// providers=xai), but pickNextMixed filters out providers with no executor and
+// returns auth_not_found: no auth available — the production symptom.
+func TestRegisterModelsForAuthBatch_BindsExecutorForLoadedPGAuth(t *testing.T) {
+	service := &Service{
+		cfg:         &config.Config{},
+		coreManager: coreauth.NewManager(nil, nil, nil),
+	}
+	auth := &coreauth.Auth{
+		ID:       "pg-xai-oauth-1",
+		Provider: "xai",
+		Status:   coreauth.StatusActive,
+	}
+	if _, err := service.coreManager.Register(coreauth.WithSkipPersist(context.Background()), auth); err != nil {
+		t.Fatalf("Register: %v", err)
+	}
+	if _, ok := service.coreManager.Executor("xai"); ok {
+		t.Fatal("precondition: xai executor must not be bound before model registration")
+	}
+
+	service.registerModelsForAuthBatch(context.Background(), []*coreauth.Auth{auth})
+
+	got, ok := service.coreManager.Executor("xai")
+	if !ok || got == nil {
+		t.Fatal("expected registerModelsForAuthBatch to bind xai executor for a loaded PG oauth auth")
+	}
+	if id := got.Identifier(); id != "xai" {
+		t.Fatalf("executor Identifier() = %q, want xai (type %T)", id, got)
+	}
+}

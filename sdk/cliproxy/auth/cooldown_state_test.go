@@ -9,6 +9,8 @@ import (
 	"sync/atomic"
 	"testing"
 	"time"
+
+	cliproxyexecutor "github.com/router-for-me/CLIProxyAPI/v7/sdk/cliproxy/executor"
 )
 
 type recordingCooldownStateStore struct {
@@ -890,5 +892,241 @@ func TestManager_NewCooldownChangeSupersedesFailedRestoreBatch(t *testing.T) {
 	last := batches[len(batches)-1]
 	if len(last) != 1 || last[0].AuthID != "auth-1" || len(last[0].Records) != 0 {
 		t.Fatalf("new store batch = %+v, want auth-1 cooldown clear", last)
+	}
+}
+
+// TestManager_PGStyleRestoreThenRegisterDoesNotYieldAuthNotFound reproduces the
+// non-progressive (PG) startup order:
+//   Load/Register → RestoreCooldownStates → register models → Reconcile → Refresh → pick
+// User symptom after PG restart with save-cooldown-status=true was:
+//   auth_not_found: no auth available (providers=xai, model=grok-4.5)
+// Restored cooldowns must surface as model_cooldown (or ready), never empty-shard auth_not_found.
+func TestManager_PGStyleRestoreThenRegisterDoesNotYieldAuthNotFound(t *testing.T) {
+	prev := quotaCooldownDisabled.Load()
+	quotaCooldownDisabled.Store(false)
+	t.Cleanup(func() { quotaCooldownDisabled.Store(prev) })
+
+	nextRetry := time.Now().Add(2 * time.Hour).UTC().Truncate(time.Second)
+	authID := "pg-xai-auth-1"
+	model := "grok-4.5"
+
+	cases := []struct {
+		name    string
+		records []CooldownStateRecord
+	}{
+		{
+			name: "model_quota_cooldown",
+			records: []CooldownStateRecord{{
+				Provider:       "xai",
+				AuthID:         authID,
+				Model:          model,
+				Status:         "cooling",
+				NextRetryAfter: nextRetry,
+				Reason:         "quota",
+				Quota: QuotaState{
+					Exceeded:      true,
+					Reason:        "quota",
+					NextRecoverAt: nextRetry,
+				},
+				UpdatedAt: nextRetry.Add(-time.Minute),
+			}},
+		},
+		{
+			name: "auth_level_cooldown",
+			records: []CooldownStateRecord{{
+				Provider:       "xai",
+				AuthID:         authID,
+				Model:          "",
+				Status:         "cooling",
+				NextRetryAfter: nextRetry,
+				Reason:         "quota",
+				Quota: QuotaState{
+					Exceeded:      true,
+					Reason:        "quota",
+					NextRecoverAt: nextRetry,
+				},
+				UpdatedAt: nextRetry.Add(-time.Minute),
+			}},
+		},
+		{
+			name: "model_and_auth_level",
+			records: []CooldownStateRecord{
+				{
+					Provider: "xai", AuthID: authID, Model: model, Status: "cooling",
+					NextRetryAfter: nextRetry, Reason: "quota",
+					Quota:     QuotaState{Exceeded: true, Reason: "quota", NextRecoverAt: nextRetry},
+					UpdatedAt: nextRetry.Add(-time.Minute),
+				},
+				{
+					Provider: "xai", AuthID: authID, Model: "", Status: "cooling",
+					NextRetryAfter: nextRetry, Reason: "quota",
+					Quota:     QuotaState{Exceeded: true, Reason: "quota", NextRecoverAt: nextRetry},
+					UpdatedAt: nextRetry.Add(-time.Minute),
+				},
+			},
+		},
+	}
+
+	for _, tc := range cases {
+		tc := tc
+		t.Run(tc.name, func(t *testing.T) {
+			store := &recordingCooldownStateStore{
+				load: []CooldownStateSnapshot{{AuthID: authID, Records: tc.records}},
+			}
+			manager := NewManager(nil, &RoundRobinSelector{}, nil)
+			manager.RegisterExecutor(schedulerProviderTestExecutor{provider: "xai"})
+			manager.SetCooldownStateStore(store)
+
+			// 1) PG Load equivalent: auth present before restore.
+			if _, err := manager.Register(WithSkipPersist(context.Background()), &Auth{
+				ID:       authID,
+				Provider: "xai",
+				Status:   StatusActive,
+			}); err != nil {
+				t.Fatalf("Register: %v", err)
+			}
+
+			// 2) Non-progressive RestoreCooldownStates (Prepare+Complete) before model registration.
+			if err := manager.RestoreCooldownStates(context.Background()); err != nil {
+				t.Fatalf("RestoreCooldownStates: %v", err)
+			}
+
+			// Before models are registered, pick should be auth_not_found (empty supportedModelSet).
+			_, errBefore := manager.scheduler.pickSingle(context.Background(), "xai", model, cliproxyexecutor.Options{}, nil)
+			var beforeErr *Error
+			if !errors.As(errBefore, &beforeErr) || beforeErr.Code != "auth_not_found" {
+				// Also accept model_cooldown if somehow models leaked into registry from other tests.
+				var cd *modelCooldownError
+				if !errors.As(errBefore, &cd) {
+					t.Logf("pre-registration pick error = %v (auth_not_found expected with empty model set)", errBefore)
+				}
+			}
+
+			// 3) registerModelsForAuthBatch equivalent.
+			registerSchedulerModels(t, "xai", model, authID)
+			manager.ReconcileRegistryModelStates(context.Background(), authID)
+			manager.RefreshSchedulerEntry(authID)
+
+			// 4) Pick must NOT be auth_not_found. Cooldown → model_cooldown; auth-level alone → ready.
+			picked, errPick := manager.scheduler.pickSingle(context.Background(), "xai", model, cliproxyexecutor.Options{}, nil)
+			if errPick == nil {
+				if picked == nil || picked.ID != authID {
+					t.Fatalf("pick auth = %+v, want %s", picked, authID)
+				}
+				// Auth-level cooldown is ignored when selecting a concrete model with no model state.
+				if tc.name == "auth_level_cooldown" {
+					return
+				}
+				t.Fatalf("pick succeeded for cooling model; want model_cooldown (case %s)", tc.name)
+			}
+
+			var authErr *Error
+			if errors.As(errPick, &authErr) && authErr != nil && authErr.Code == "auth_not_found" {
+				t.Fatalf("pick error = %v; restored cooldowns must not empty the scheduler shard (auth_not_found)", errPick)
+			}
+			var cd *modelCooldownError
+			if !errors.As(errPick, &cd) {
+				// auth_unavailable is also acceptable if blocked non-quota; never auth_not_found.
+				if errors.As(errPick, &authErr) && authErr.Code == "auth_unavailable" {
+					return
+				}
+				t.Fatalf("pick error = %v, want model_cooldown or ready auth", errPick)
+			}
+		})
+	}
+}
+
+// TestManager_RestoreThenSyncSchedulerStillSeesModels ensures the pick-time
+// syncScheduler rebuild (shouldRetrySchedulerPick) also does not lose candidates
+// after PG-style restore + model registration.
+func TestManager_RestoreThenSyncSchedulerStillSeesModels(t *testing.T) {
+	prev := quotaCooldownDisabled.Load()
+	quotaCooldownDisabled.Store(false)
+	t.Cleanup(func() { quotaCooldownDisabled.Store(prev) })
+
+	nextRetry := time.Now().Add(2 * time.Hour).UTC().Truncate(time.Second)
+	authID := "pg-xai-sync-1"
+	model := "grok-4.5"
+	store := &recordingCooldownStateStore{
+		load: []CooldownStateSnapshot{{
+			AuthID: authID,
+			Records: []CooldownStateRecord{{
+				Provider: "xai", AuthID: authID, Model: model, Status: "cooling",
+				NextRetryAfter: nextRetry, Reason: "quota",
+				Quota: QuotaState{Exceeded: true, Reason: "quota", NextRecoverAt: nextRetry},
+			}},
+		}},
+	}
+	manager := NewManager(nil, &RoundRobinSelector{}, nil)
+	manager.RegisterExecutor(schedulerProviderTestExecutor{provider: "xai"})
+	manager.SetCooldownStateStore(store)
+	if _, err := manager.Register(WithSkipPersist(context.Background()), &Auth{ID: authID, Provider: "xai"}); err != nil {
+		t.Fatalf("Register: %v", err)
+	}
+	if err := manager.RestoreCooldownStates(context.Background()); err != nil {
+		t.Fatalf("Restore: %v", err)
+	}
+	registerSchedulerModels(t, "xai", model, authID)
+	manager.ReconcileRegistryModelStates(context.Background(), authID)
+	manager.RefreshSchedulerEntry(authID)
+
+	// Force a full rebuild as pick path does on auth_not_found.
+	manager.syncScheduler()
+
+	_, errPick := manager.scheduler.pickSingle(context.Background(), "xai", model, cliproxyexecutor.Options{}, nil)
+	var authErr *Error
+	if errors.As(errPick, &authErr) && authErr != nil && authErr.Code == "auth_not_found" {
+		t.Fatalf("after syncScheduler pick = %v, want model_cooldown not auth_not_found", errPick)
+	}
+	var cd *modelCooldownError
+	if errPick != nil && !errors.As(errPick, &cd) {
+		if errors.As(errPick, &authErr) && authErr.Code == "auth_unavailable" {
+			return
+		}
+		t.Fatalf("pick error = %v, want model_cooldown", errPick)
+	}
+}
+
+// TestManager_PickNextMixedWithoutExecutorYieldsAuthNotFound documents the
+// exact production error chain for PG oauth after restart:
+// models are registered (GetModelProviders → xai) but the provider executor was
+// never bound on non-home startup. pickNextMixed filters providers without an
+// executor out of eligibleProviders and returns auth_not_found — not
+// executor_not_found. That matches:
+//   auth_not_found: no auth available (providers=xai, model=grok-4.5)
+func TestManager_PickNextMixedWithoutExecutorYieldsAuthNotFound(t *testing.T) {
+	authID := "pg-xai-no-exec"
+	model := "grok-4.5"
+	manager := NewManager(nil, &RoundRobinSelector{}, nil)
+	if _, err := manager.Register(WithSkipPersist(context.Background()), &Auth{
+		ID:       authID,
+		Provider: "xai",
+		Status:   StatusActive,
+	}); err != nil {
+		t.Fatalf("Register: %v", err)
+	}
+	registerSchedulerModels(t, "xai", model, authID)
+	manager.RefreshSchedulerEntry(authID)
+
+	// Scheduler alone would pick the auth (model set populated).
+	if picked, errPick := manager.scheduler.pickSingle(context.Background(), "xai", model, cliproxyexecutor.Options{}, nil); errPick != nil || picked == nil {
+		t.Fatalf("scheduler pick precondition failed: auth=%v err=%v", picked, errPick)
+	}
+
+	// No RegisterExecutor — mirrors non-home PG batch path.
+	_, _, _, errMixed := manager.pickNextMixed(context.Background(), []string{"xai"}, model, cliproxyexecutor.Options{}, nil)
+	var authErr *Error
+	if !errors.As(errMixed, &authErr) || authErr == nil || authErr.Code != "auth_not_found" {
+		t.Fatalf("pickNextMixed without executor = %v, want auth_not_found", errMixed)
+	}
+
+	// Binding the executor recovers selection (ready auth).
+	manager.RegisterExecutor(schedulerProviderTestExecutor{provider: "xai"})
+	picked, _, provider, errOK := manager.pickNextMixed(context.Background(), []string{"xai"}, model, cliproxyexecutor.Options{}, nil)
+	if errOK != nil {
+		t.Fatalf("pickNextMixed after RegisterExecutor: %v", errOK)
+	}
+	if picked == nil || picked.ID != authID || provider != "xai" {
+		t.Fatalf("picked=%+v provider=%q, want auth %s provider xai", picked, provider, authID)
 	}
 }

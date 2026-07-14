@@ -768,6 +768,15 @@ func (s *Service) completeModelRegistrationForAuthWithCache(ctx context.Context,
 	if s == nil || s.coreManager == nil || auth == nil || auth.ID == "" {
 		return
 	}
+	// Non-home PG/object/git startup loads oauth auths via Manager.Load then calls
+	// registerModelsForAuthBatch → here. That path never went through
+	// prepareCoreAuthForModelRegistration, so without this bind the provider
+	// executor is missing: models still register (handlers report providers=xai/…)
+	// but pickNextMixed filters out providers with no executor and returns
+	// auth_not_found: no auth available for every credential.
+	if !auth.Disabled {
+		s.ensureExecutorsForAuth(auth)
+	}
 	s.registerModelsForAuthWithCache(ctx, auth, compatCache)
 	s.coreManager.ReconcileRegistryModelStates(ctx, auth.ID)
 
@@ -1793,6 +1802,15 @@ func (s *Service) Run(ctx context.Context) error {
 			if errLoad := s.coreManager.Load(runCtx); errLoad != nil {
 				log.Warnf("failed to load auth store: %v", errLoad)
 			}
+			// Bind provider executors for every auth loaded from the remote token
+			// store (PG/object/git). Home mode uses includeBaseline; progressive
+			// file load uses prepareCoreAuth per auth update. Non-progressive
+			// remote stores only hit Manager.Load — without this, no executor is
+			// registered for oauth credentials and every request fails with
+			// auth_not_found even though models resolve to the right providers.
+			s.registerAvailableExecutors(startupCtx, executorRegistrationOptions{
+				auths: s.coreManager.List(),
+			})
 			s.registerConfigAPIKeyAuths(startupCtx, s.cfg)
 			if s.cfg.SaveCooldownStatus {
 				if errRestoreCooldown := s.coreManager.RestoreCooldownStates(runCtx); errRestoreCooldown != nil {
