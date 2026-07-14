@@ -12,26 +12,6 @@ import (
 	cliproxyauth "github.com/router-for-me/CLIProxyAPI/v7/sdk/cliproxy/auth"
 )
 
-func TestGroupCooldownRecordsByAuthID(t *testing.T) {
-	next := time.Now().UTC().Truncate(time.Second)
-	in := []cliproxyauth.CooldownStateRecord{
-		{AuthID: "a1", Model: "m2", Provider: "xai", NextRetryAfter: next},
-		{AuthID: "a1", Model: "m1", Provider: "xai", NextRetryAfter: next},
-		{AuthID: "", Model: "skip", NextRetryAfter: next},
-		{AuthID: "a2", Model: "", Provider: "claude", NextRetryAfter: next},
-	}
-	groups := groupCooldownRecordsByAuthID(in)
-	if len(groups) != 2 {
-		t.Fatalf("groups = %d, want 2", len(groups))
-	}
-	if len(groups["a1"]) != 2 {
-		t.Fatalf("a1 records = %d, want 2", len(groups["a1"]))
-	}
-	if len(groups["a2"]) != 1 {
-		t.Fatalf("a2 records = %d, want 1", len(groups["a2"]))
-	}
-}
-
 func TestCooldownStateEnvelopeRoundTrip(t *testing.T) {
 	next := time.Now().UTC().Truncate(time.Second)
 	records := []cliproxyauth.CooldownStateRecord{
@@ -62,7 +42,7 @@ func TestCooldownStateEnvelopeRoundTrip(t *testing.T) {
 	}
 }
 
-func TestPostgresCooldownStateStore_SaveLoadCleanStale(t *testing.T) {
+func TestPostgresCooldownStateStore_ApplyOnlyChangesNamedAuth(t *testing.T) {
 	dsn := strings.TrimSpace(os.Getenv("PGSTORE_DSN"))
 	if dsn == "" {
 		t.Skip("PGSTORE_DSN not set")
@@ -86,36 +66,61 @@ func TestPostgresCooldownStateStore_SaveLoadCleanStale(t *testing.T) {
 	if !ok {
 		t.Fatalf("NewPostgresCooldownStateStore returned unexpected type %T", cooldownStore)
 	}
+	suffix := fmt.Sprintf("%d", time.Now().UnixNano())
+	authA := "pg-cooldown-a-" + suffix
+	authB := "pg-cooldown-b-" + suffix
+	t.Cleanup(func() {
+		_, _ = pg.db.ExecContext(context.Background(), fmt.Sprintf(`DELETE FROM %s WHERE id IN ($1, $2)`, store.tableName()), authA, authB)
+	})
+
 	next := time.Now().Add(time.Hour).UTC().Truncate(time.Second)
-	rec := cliproxyauth.CooldownStateRecord{
-		Provider: "xai", AuthID: "pg-cooldown-test-auth", Model: "grok-4",
+	recordA := cliproxyauth.CooldownStateRecord{
+		Provider: "xai", AuthID: authA, Model: "grok-4",
 		Status: "cooling", NextRetryAfter: next, Reason: "quota", UpdatedAt: next,
 	}
-	// seed stale row
-	_, _ = pg.db.ExecContext(ctx, fmt.Sprintf(
-		`INSERT INTO %s (id, content) VALUES ($1, $2) ON CONFLICT (id) DO UPDATE SET content = EXCLUDED.content`,
-		store.tableName()), "pg-cooldown-stale", []byte(`{"version":1,"records":[]}`))
+	recordB := cliproxyauth.CooldownStateRecord{
+		Provider: "xai", AuthID: authB, Model: "grok-3",
+		Status: "cooling", NextRetryAfter: next, Reason: "quota", UpdatedAt: next,
+	}
 
-	if err := store.Save(ctx, []cliproxyauth.CooldownStateRecord{rec}); err != nil {
-		t.Fatalf("Save: %v", err)
+	if errApply := store.Apply(ctx, []cliproxyauth.CooldownStateSnapshot{
+		{AuthID: authA, Records: []cliproxyauth.CooldownStateRecord{recordA}},
+		{AuthID: authB, Records: []cliproxyauth.CooldownStateRecord{recordB}},
+	}); errApply != nil {
+		t.Fatalf("Apply(seed): %v", errApply)
 	}
-	loaded, err := store.Load(ctx)
-	if err != nil {
-		t.Fatalf("Load: %v", err)
+
+	recordA.NextRetryAfter = next.Add(time.Minute)
+	if errApply := store.Apply(ctx, []cliproxyauth.CooldownStateSnapshot{
+		{AuthID: authA, Records: []cliproxyauth.CooldownStateRecord{recordA}},
+	}); errApply != nil {
+		t.Fatalf("Apply(update auth A): %v", errApply)
 	}
-	found := false
-	for _, r := range loaded {
-		if r.AuthID == rec.AuthID && r.Model == rec.Model {
-			found = true
+	loaded, errLoad := store.Load(ctx)
+	if errLoad != nil {
+		t.Fatalf("Load after update: %v", errLoad)
+	}
+	if !cooldownSnapshotsContainAuth(loaded, authA) || !cooldownSnapshotsContainAuth(loaded, authB) {
+		t.Fatalf("Apply(auth A) changed unrelated auth B: %+v", loaded)
+	}
+
+	if errApply := store.Apply(ctx, []cliproxyauth.CooldownStateSnapshot{{AuthID: authA}}); errApply != nil {
+		t.Fatalf("Apply(clear auth A): %v", errApply)
+	}
+	loaded, errLoad = store.Load(ctx)
+	if errLoad != nil {
+		t.Fatalf("Load after clear: %v", errLoad)
+	}
+	if cooldownSnapshotsContainAuth(loaded, authA) || !cooldownSnapshotsContainAuth(loaded, authB) {
+		t.Fatalf("clear(auth A) changed unexpected rows: %+v", loaded)
+	}
+}
+
+func cooldownSnapshotsContainAuth(snapshots []cliproxyauth.CooldownStateSnapshot, authID string) bool {
+	for _, snapshot := range snapshots {
+		if snapshot.AuthID == authID {
+			return true
 		}
-		if r.AuthID == "pg-cooldown-stale" {
-			t.Fatalf("stale auth still present")
-		}
 	}
-	if !found {
-		t.Fatalf("expected record missing: %+v", loaded)
-	}
-	if err := store.Save(ctx, nil); err != nil {
-		t.Fatalf("Save(nil): %v", err)
-	}
+	return false
 }
