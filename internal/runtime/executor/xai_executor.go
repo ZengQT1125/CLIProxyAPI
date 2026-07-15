@@ -124,6 +124,59 @@ func (e *XAIExecutor) HttpRequest(ctx context.Context, auth *cliproxyauth.Auth, 
 	return httpClient.Do(httpReq)
 }
 
+// ProbeCredential verifies the current access token with a minimal Responses
+// conversation. It intentionally reuses Execute so the probe follows the same
+// endpoint, headers, proxy, and payload translation as real traffic.
+func (e *XAIExecutor) ProbeCredential(ctx context.Context, auth *cliproxyauth.Auth) error {
+	if auth == nil {
+		return fmt.Errorf("xai executor: auth is nil")
+	}
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	model := xaiCredentialProbeModel(auth)
+	if model == "" {
+		return fmt.Errorf("xai executor: no chat model available for credential probe")
+	}
+	payload, errMarshal := json.Marshal(map[string]any{
+		"model": model,
+		"input": "Reply with OK.",
+	})
+	if errMarshal != nil {
+		return fmt.Errorf("xai executor: marshal credential probe: %w", errMarshal)
+	}
+	_, errExecute := e.Execute(ctx, auth, cliproxyexecutor.Request{
+		Model:   model,
+		Payload: payload,
+	}, cliproxyexecutor.Options{
+		SourceFormat: sdktranslator.FormatOpenAIResponse,
+	})
+	return errExecute
+}
+
+func xaiCredentialProbeModel(auth *cliproxyauth.Auth) string {
+	if auth != nil && strings.TrimSpace(auth.ID) != "" {
+		if model := firstXAIChatModel(registry.GetGlobalRegistry().GetModelsForClient(auth.ID)); model != "" {
+			return model
+		}
+	}
+	return firstXAIChatModel(registry.GetXAIModels())
+}
+
+func firstXAIChatModel(models []*registry.ModelInfo) string {
+	for _, model := range models {
+		if model == nil {
+			continue
+		}
+		modelID := strings.TrimSpace(model.ID)
+		if modelID == "" || strings.HasPrefix(strings.ToLower(modelID), "grok-imagine-") {
+			continue
+		}
+		return modelID
+	}
+	return ""
+}
+
 func (e *XAIExecutor) Execute(ctx context.Context, auth *cliproxyauth.Auth, req cliproxyexecutor.Request, opts cliproxyexecutor.Options) (resp cliproxyexecutor.Response, err error) {
 	if opts.Alt == "responses/compact" {
 		return e.executeCompact(ctx, auth, req, opts)

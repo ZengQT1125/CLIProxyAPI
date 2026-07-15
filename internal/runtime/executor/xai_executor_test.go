@@ -40,6 +40,52 @@ func (f xaiTestRoundTripper) RoundTrip(req *http.Request) (*http.Response, error
 	return f(req)
 }
 
+func TestXAIExecutorProbeCredentialUsesConversation(t *testing.T) {
+	var gotAuthorization string
+	var gotPath string
+	var gotBody []byte
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		gotAuthorization = r.Header.Get("Authorization")
+		gotPath = r.URL.Path
+		var errRead error
+		gotBody, errRead = io.ReadAll(r.Body)
+		if errRead != nil {
+			t.Fatalf("read request body: %v", errRead)
+		}
+		model := gjson.GetBytes(gotBody, "model").String()
+		w.Header().Set("Content-Type", "text/event-stream")
+		_, _ = fmt.Fprintf(w, "data: {\"type\":\"response.completed\",\"response\":{\"id\":\"resp_probe\",\"object\":\"response\",\"status\":\"completed\",\"model\":%q,\"output\":[]}}\n\n", model)
+	}))
+	defer server.Close()
+
+	exec := NewXAIAutoExecutor(&config.Config{})
+	auth := &cliproxyauth.Auth{
+		ID:       "xai-probe",
+		Provider: "xai",
+		Attributes: map[string]string{
+			"base_url":  server.URL,
+			"auth_kind": "oauth",
+		},
+		Metadata: map[string]any{"access_token": "working-access-token"},
+	}
+
+	if err := exec.ProbeCredential(context.Background(), auth); err != nil {
+		t.Fatalf("ProbeCredential() error = %v", err)
+	}
+	if gotAuthorization != "Bearer working-access-token" {
+		t.Fatalf("Authorization = %q, want bearer access token", gotAuthorization)
+	}
+	if gotPath != "/responses" {
+		t.Fatalf("request path = %q, want /responses", gotPath)
+	}
+	if model := gjson.GetBytes(gotBody, "model").String(); model == "" {
+		t.Fatalf("probe model is empty: %s", string(gotBody))
+	}
+	if input := gjson.GetBytes(gotBody, "input.0.content.0.text").String(); input != "Reply with OK." {
+		t.Fatalf("probe input text = %q, want minimal conversation; body=%s", input, string(gotBody))
+	}
+}
+
 func captureXAIResponsesRequest(t *testing.T, auth *cliproxyauth.Auth, payload []byte, sourceFormat sdktranslator.Format, stream bool) (string, []byte) {
 	t.Helper()
 	var gotBaseURL string
