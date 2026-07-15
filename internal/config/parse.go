@@ -79,6 +79,9 @@ func ParseConfigBytes(data []byte) (*Config, error) {
 	cfg.normalizeAuthLoadWorkers()
 
 	cfg.NormalizePluginsConfig()
+	if errResolvePluginsDir := cfg.ResolvePluginsDir(); errResolvePluginsDir != nil && cfg.Plugins.Enabled {
+		return nil, errResolvePluginsDir
+	}
 
 	// Apply the same sanitization pipeline.
 	cfg.SanitizeGeminiKeys()
