@@ -26,13 +26,14 @@ import (
 )
 
 const (
-	defaultManagementReleaseURL  = "https://api.github.com/repos/caidaoli/Cli-Proxy-API-Management-Center/releases/latest"
-	defaultManagementFallbackURL = "https://cpamc.router-for.me/"
-	managementAssetName          = "management.html"
-	httpUserAgent                = "CLIProxyAPI-management-updater"
-	managementSyncMinInterval    = 30 * time.Second
-	updateCheckInterval          = 3 * time.Hour
-	maxAssetDownloadSize         = 50 << 20 // 10 MB safety limit for management asset downloads
+	defaultManagementReleaseURL       = "https://api.github.com/repos/caidaoli/Cli-Proxy-API-Management-Center/releases/latest"
+	defaultManagementAssetDownloadURL = "https://github.com/caidaoli/Cli-Proxy-API-Management-Center/releases/latest/download/management.html"
+	defaultManagementFallbackURL      = "https://cpamc.router-for.me/"
+	managementAssetName               = "management.html"
+	httpUserAgent                     = "CLIProxyAPI-management-updater"
+	managementSyncMinInterval         = 30 * time.Second
+	updateCheckInterval               = 3 * time.Hour
+	maxAssetDownloadSize              = 50 << 20 // 10 MB safety limit for management asset downloads
 )
 
 // ManagementFileName exposes the control panel asset filename.
@@ -129,16 +130,9 @@ func newHTTPClient(proxyURL string) *http.Client {
 	return client
 }
 
-type releaseAsset struct {
-	Name               string `json:"name"`
-	BrowserDownloadURL string `json:"browser_download_url"`
-	Digest             string `json:"digest"`
-}
-
 type releaseResponse struct {
-	TagName string         `json:"tag_name"`
-	Name    string         `json:"name"`
-	Assets  []releaseAsset `json:"assets"`
+	TagName string `json:"tag_name"`
+	Name    string `json:"name"`
 }
 
 // LatestRelease describes the latest management panel release.
@@ -183,18 +177,10 @@ func UpdateLatestManagementHTML(ctx context.Context, staticDir string, proxyURL 
 	}
 
 	client := newHTTPClient(proxyURL)
-	releaseURL := resolveReleaseURL(panelRepository)
-	asset, remoteHash, err := fetchLatestAsset(ctx, client, releaseURL)
+	downloadURL := resolveAssetDownloadURL(panelRepository)
+	data, downloadedHash, err := downloadAsset(ctx, client, downloadURL)
 	if err != nil {
 		return "", err
-	}
-
-	data, downloadedHash, err := downloadAsset(ctx, client, asset.BrowserDownloadURL)
-	if err != nil {
-		return "", err
-	}
-	if remoteHash != "" && !strings.EqualFold(remoteHash, downloadedHash) {
-		return "", fmt.Errorf("management asset digest mismatch: expected %s got %s", remoteHash, downloadedHash)
 	}
 
 	localPath := filepath.Join(staticDir, managementAssetName)
@@ -297,8 +283,8 @@ func EnsureLatestManagementHTML(ctx context.Context, staticDir string, proxyURL 
 			return nil, nil
 		}
 
-		releaseURL := resolveReleaseURL(panelRepository)
 		client := newHTTPClient(proxyURL)
+		downloadURL := resolveAssetDownloadURL(panelRepository)
 
 		localHash, err := fileSHA256(localPath)
 		if err != nil {
@@ -308,25 +294,7 @@ func EnsureLatestManagementHTML(ctx context.Context, staticDir string, proxyURL 
 			localHash = ""
 		}
 
-		asset, remoteHash, err := fetchLatestAsset(ctx, client, releaseURL)
-		if err != nil {
-			if localFileMissing {
-				log.WithError(err).Warn("failed to fetch latest management release information, trying fallback page")
-				if ensureFallbackManagementHTML(ctx, client, localPath) {
-					return nil, nil
-				}
-				return nil, nil
-			}
-			log.WithError(err).Warn("failed to fetch latest management release information")
-			return nil, nil
-		}
-
-		if remoteHash != "" && localHash != "" && strings.EqualFold(remoteHash, localHash) {
-			log.Debug("management asset is already up to date")
-			return nil, nil
-		}
-
-		data, downloadedHash, err := downloadAsset(ctx, client, asset.BrowserDownloadURL)
+		data, downloadedHash, err := downloadAsset(ctx, client, downloadURL)
 		if err != nil {
 			if localFileMissing {
 				log.WithError(err).Warn("failed to download management asset, trying fallback page")
@@ -339,8 +307,8 @@ func EnsureLatestManagementHTML(ctx context.Context, staticDir string, proxyURL 
 			return nil, nil
 		}
 
-		if remoteHash != "" && !strings.EqualFold(remoteHash, downloadedHash) {
-			log.Errorf("management asset digest mismatch: expected %s got %s — aborting update for safety", remoteHash, downloadedHash)
+		if localHash != "" && strings.EqualFold(localHash, downloadedHash) {
+			log.Debug("management asset is already up to date")
 			return nil, nil
 		}
 
@@ -364,8 +332,7 @@ func ensureFallbackManagementHTML(ctx context.Context, client *http.Client, loca
 		return false
 	}
 
-	log.Warnf("management asset downloaded from fallback URL without digest verification (hash=%s) — "+
-		"enable verified GitHub updates by keeping disable-auto-update-panel set to false", downloadedHash)
+	log.Warnf("management asset downloaded from fallback URL (hash=%s)", downloadedHash)
 
 	if err = atomicWriteFile(localPath, data); err != nil {
 		log.WithError(err).Warn("failed to persist fallback management control panel page")
@@ -412,6 +379,64 @@ func resolveReleaseURL(repo string) string {
 	return defaultManagementReleaseURL
 }
 
+func resolveAssetDownloadURL(repo string) string {
+	repo = strings.TrimSpace(repo)
+	if repo == "" {
+		return defaultManagementAssetDownloadURL
+	}
+
+	parsed, err := url.Parse(repo)
+	if err != nil || parsed.Host == "" {
+		return defaultManagementAssetDownloadURL
+	}
+	parsed.RawQuery = ""
+	parsed.Fragment = ""
+	parsed.Path = strings.TrimSuffix(parsed.Path, "/")
+
+	directSuffix := "/releases/latest/download/" + managementAssetName
+	if strings.HasSuffix(strings.ToLower(parsed.Path), strings.ToLower(directSuffix)) {
+		return parsed.String()
+	}
+
+	host := strings.ToLower(parsed.Host)
+	parts := strings.Split(strings.Trim(parsed.Path, "/"), "/")
+	if host == "api.github.com" {
+		if len(parts) >= 3 && strings.EqualFold(parts[0], "repos") {
+			owner := strings.TrimSpace(parts[1])
+			repository := strings.TrimSuffix(strings.TrimSpace(parts[2]), ".git")
+			if owner != "" && repository != "" {
+				return fmt.Sprintf("https://github.com/%s/%s/releases/latest/download/%s", owner, repository, managementAssetName)
+			}
+		}
+		return defaultManagementAssetDownloadURL
+	}
+
+	if host == "github.com" {
+		if len(parts) >= 2 {
+			owner := strings.TrimSpace(parts[0])
+			repository := strings.TrimSuffix(strings.TrimSpace(parts[1]), ".git")
+			if owner != "" && repository != "" {
+				return fmt.Sprintf("https://github.com/%s/%s/releases/latest/download/%s", owner, repository, managementAssetName)
+			}
+		}
+		return defaultManagementAssetDownloadURL
+	}
+
+	path := strings.Trim(parsed.Path, "/")
+	for _, suffix := range []string{"/releases/latest", "/releases"} {
+		if strings.HasSuffix(strings.ToLower(path), suffix) {
+			path = path[:len(path)-len(suffix)]
+			break
+		}
+	}
+	path = strings.TrimSuffix(strings.Trim(path, "/"), ".git")
+	if path == "" {
+		return defaultManagementAssetDownloadURL
+	}
+	parsed.Path = "/" + path + directSuffix
+	return parsed.String()
+}
+
 func fetchLatestRelease(ctx context.Context, client *http.Client, releaseURL string) (releaseResponse, error) {
 	if strings.TrimSpace(releaseURL) == "" {
 		releaseURL = defaultManagementReleaseURL
@@ -437,23 +462,6 @@ func fetchLatestRelease(ctx context.Context, client *http.Client, releaseURL str
 	}
 
 	return release, nil
-}
-
-func fetchLatestAsset(ctx context.Context, client *http.Client, releaseURL string) (*releaseAsset, string, error) {
-	release, err := fetchLatestRelease(ctx, client, releaseURL)
-	if err != nil {
-		return nil, "", err
-	}
-
-	for i := range release.Assets {
-		asset := &release.Assets[i]
-		if strings.EqualFold(asset.Name, managementAssetName) {
-			remoteHash := parseDigest(asset.Digest)
-			return asset, remoteHash, nil
-		}
-	}
-
-	return nil, "", fmt.Errorf("management asset %s not found in latest release", managementAssetName)
 }
 
 func downloadAsset(ctx context.Context, client *http.Client, downloadURL string) ([]byte, string, error) {
@@ -516,17 +524,4 @@ func atomicWriteFile(path string, data []byte) error {
 	}
 
 	return nil
-}
-
-func parseDigest(digest string) string {
-	digest = strings.TrimSpace(digest)
-	if digest == "" {
-		return ""
-	}
-
-	if idx := strings.Index(digest, ":"); idx >= 0 {
-		digest = digest[idx+1:]
-	}
-
-	return strings.ToLower(strings.TrimSpace(digest))
 }

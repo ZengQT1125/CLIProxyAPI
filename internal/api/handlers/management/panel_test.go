@@ -1,8 +1,6 @@
 package management
 
 import (
-	"crypto/sha256"
-	"encoding/hex"
 	"encoding/json"
 	"net/http"
 	"net/http/httptest"
@@ -51,26 +49,14 @@ func TestGetManagementPanelLatestVersion(t *testing.T) {
 
 func TestUpdateManagementPanelWritesLatestAsset(t *testing.T) {
 	const assetBody = "<!doctype html><title>updated panel</title>"
-	sum := sha256.Sum256([]byte(assetBody))
-	digest := hex.EncodeToString(sum[:])
 
 	assetServer := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path != "/acme/panel/releases/latest/download/management.html" {
+			t.Fatalf("asset path = %q, want direct latest release download", r.URL.Path)
+		}
 		_, _ = w.Write([]byte(assetBody))
 	}))
 	defer assetServer.Close()
-
-	releaseServer := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		w.Header().Set("Content-Type", "application/json")
-		_, _ = w.Write([]byte(`{
-			"tag_name":"v3.2.1",
-			"assets":[{
-				"name":"management.html",
-				"browser_download_url":"` + assetServer.URL + `/management.html",
-				"digest":"sha256:` + digest + `"
-			}]
-		}`))
-	}))
-	defer releaseServer.Close()
 
 	staticDir := t.TempDir()
 	t.Setenv("MANAGEMENT_STATIC_PATH", staticDir)
@@ -78,7 +64,7 @@ func TestUpdateManagementPanelWritesLatestAsset(t *testing.T) {
 	h := &Handler{
 		cfg: &config.Config{
 			RemoteManagement: config.RemoteManagement{
-				PanelGitHubRepository: releaseServer.URL + "/repos/acme/panel/releases/latest",
+				PanelGitHubRepository: assetServer.URL + "/acme/panel",
 			},
 		},
 		configFilePath: writeTestConfigFile(t),
