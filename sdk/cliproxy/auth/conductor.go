@@ -4150,7 +4150,22 @@ func (m *Manager) MarkResult(ctx context.Context, result Result) {
 }
 
 func shouldDeleteUnauthorizedAuth(result Result) bool {
-	return !result.Success && deleteUnauthorizedAuth.Load() && statusCodeFromResult(result.Error) == http.StatusUnauthorized
+	if result.Success || !deleteUnauthorizedAuth.Load() {
+		return false
+	}
+	if statusCodeFromResult(result.Error) == http.StatusUnauthorized {
+		return true
+	}
+	if result.Error == nil || !strings.EqualFold(strings.TrimSpace(result.Provider), "xai") {
+		return false
+	}
+	var payload struct {
+		Code string `json:"code"`
+	}
+	if errUnmarshal := json.Unmarshal([]byte(strings.TrimSpace(result.Error.Message)), &payload); errUnmarshal != nil {
+		return false
+	}
+	return strings.EqualFold(strings.TrimSpace(payload.Code), "permission-denied")
 }
 
 func (m *Manager) lockAuthLifecycle(authID string) func() {
@@ -6475,29 +6490,13 @@ func shouldDeleteAfterCredentialProbe(ctx context.Context, exec ProviderExecutor
 		log.Debugf("credential conversation probe succeeded for %s (%s); keeping auth after refresh failure", auth.Provider, auth.ID)
 		return false, true
 	}
-	if isCredentialProbeRejection(auth, errProbe) {
+	if isUnauthorizedError(errProbe) {
 		log.Debugf("credential conversation probe rejected %s (%s): %v", auth.Provider, auth.ID, errProbe)
 		return true, false
 	}
 
 	log.Warnf("credential conversation probe was inconclusive for %s (%s); keeping auth: %v", auth.Provider, auth.ID, errProbe)
 	return false, false
-}
-
-func isCredentialProbeRejection(auth *Auth, err error) bool {
-	if isUnauthorizedError(err) {
-		return true
-	}
-	if auth == nil || !strings.EqualFold(strings.TrimSpace(auth.Provider), "xai") || err == nil {
-		return false
-	}
-	var payload struct {
-		Code string `json:"code"`
-	}
-	if errUnmarshal := json.Unmarshal([]byte(strings.TrimSpace(err.Error())), &payload); errUnmarshal != nil {
-		return false
-	}
-	return strings.EqualFold(strings.TrimSpace(payload.Code), "permission-denied")
 }
 
 func (m *Manager) executorFor(provider string) ProviderExecutor {
