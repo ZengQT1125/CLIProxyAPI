@@ -33,9 +33,11 @@ auths/*
 /docs/**/*.txt
 /docs/performance/
 /docs/superpowers/
+/superpowers/
 GEMINI.md
 
 # Tooling metadata
+/.superpowers/
 .vscode/*
 .worktrees/
 .codex/*
