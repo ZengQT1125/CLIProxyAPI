@@ -118,6 +118,100 @@ func TestSQLiteUsageStoreQueryMonitorChannelStats(t *testing.T) {
 	assertStringSliceEqual(t, result.Filters.Sources, []string{"source-a", "source-b"})
 }
 
+func TestSQLiteUsageStoreQueryMonitorChannelStatsSummary(t *testing.T) {
+	ctx := context.Background()
+	store := newTestSQLiteUsageStore(t)
+	defer store.Close()
+
+	base := time.Date(2026, 2, 7, 12, 0, 0, 0, time.UTC)
+	insertUsageRecords(t, store,
+		UsageRecord{APIKey: "api-1", Model: "model-a", Source: "source-a", RequestedAt: base.Add(-3 * time.Hour), InputTokens: 100, OutputTokens: 20},
+		UsageRecord{APIKey: "api-1", Model: "model-b", Source: "source-a", RequestedAt: base.Add(-2 * time.Hour), InputTokens: 25, OutputTokens: 7},
+		UsageRecord{APIKey: "api-2", Model: "model-c", Source: "source-b", RequestedAt: base.Add(-1 * time.Hour), InputTokens: 11, OutputTokens: 13},
+	)
+
+	result, err := store.QueryMonitorChannelStats(ctx, MonitorQueryFilter{SummaryOnly: true}, 1, 12)
+	if err != nil {
+		t.Fatalf("QueryMonitorChannelStats summary failed: %v", err)
+	}
+
+	if len(result.Items) != 1 || result.Items[0].Source != "source-a" {
+		t.Fatalf("unexpected summary items: %+v", result.Items)
+	}
+	if len(result.Items[0].Models) != 2 {
+		t.Fatalf("summary model count = %d, want 2", len(result.Items[0].Models))
+	}
+	if len(result.Items[0].Recent) != 0 || len(result.Items[0].Models[0].Recent) != 0 {
+		t.Fatalf("summary unexpectedly included recent requests: %+v", result.Items[0])
+	}
+	if len(result.Filters.APIs) != 0 || len(result.Filters.Models) != 0 || len(result.Filters.Sources) != 0 {
+		t.Fatalf("summary unexpectedly included filters: %+v", result.Filters)
+	}
+}
+
+func TestSQLiteUsageStoreQueryMonitorChannelStatsSummaryCombinesUnknownSources(t *testing.T) {
+	ctx := context.Background()
+	store := newTestSQLiteUsageStore(t)
+	defer store.Close()
+
+	base := time.Date(2026, 2, 7, 12, 0, 0, 0, time.UTC)
+	insertUsageRecords(t, store,
+		UsageRecord{APIKey: "api-1", Model: "model-empty", Source: "", RequestedAt: base.Add(-2 * time.Hour)},
+		UsageRecord{APIKey: "api-1", Model: "model-literal", Source: "unknown", RequestedAt: base.Add(-time.Hour)},
+	)
+
+	result, err := store.QueryMonitorChannelStats(ctx, MonitorQueryFilter{SummaryOnly: true}, 1, 12)
+	if err != nil {
+		t.Fatalf("QueryMonitorChannelStats summary failed: %v", err)
+	}
+	if len(result.Items) != 1 || result.Items[0].Source != "unknown" {
+		t.Fatalf("unexpected summary items: %+v", result.Items)
+	}
+	if len(result.Items[0].Models) != 2 {
+		t.Fatalf("unknown source model count = %d, want 2", len(result.Items[0].Models))
+	}
+}
+
+func TestSQLiteUsageStoreQueryMonitorDailyTrendUsesLocalDayRanges(t *testing.T) {
+	ctx := context.Background()
+	store := newTestSQLiteUsageStore(t)
+	defer store.Close()
+
+	day1 := time.Date(2026, 2, 6, 0, 0, 0, 0, time.Local)
+	day2 := day1.AddDate(0, 0, 1)
+	day3 := day2.AddDate(0, 0, 1)
+	insertUsageRecords(t, store,
+		UsageRecord{APIKey: "api-1", Model: "model-a", Source: "source-a", RequestedAt: day1.Add(5 * time.Hour), InputTokens: 99},
+		UsageRecord{APIKey: "api-1", Model: "model-a", Source: "source-a", RequestedAt: day1.Add(7 * time.Hour), InputTokens: 10, OutputTokens: 2, ReasoningTokens: 1, CachedTokens: 3, CacheWriteTokens: 4},
+		UsageRecord{APIKey: "api-1", Model: "model-a", Source: "source-a", RequestedAt: day1.Add(8 * time.Hour), Failed: true, InputTokens: 999},
+		UsageRecord{APIKey: "api-1", Model: "model-a", Source: "source-a", RequestedAt: day2.Add(9 * time.Hour), InputTokens: 20, OutputTokens: 4, ReasoningTokens: 2, CachedTokens: 6, CacheWriteTokens: 8},
+		UsageRecord{APIKey: "api-2", Model: "model-b", Source: "source-b", RequestedAt: day2.Add(10 * time.Hour), InputTokens: 500},
+		UsageRecord{APIKey: "api-1", Model: "model-a", Source: "source-a", RequestedAt: day3.Add(5 * time.Hour), InputTokens: 30, OutputTokens: 6, ReasoningTokens: 3, CachedTokens: 9, CacheWriteTokens: 12},
+		UsageRecord{APIKey: "api-1", Model: "model-a", Source: "source-a", RequestedAt: day3.Add(7 * time.Hour), InputTokens: 77},
+	)
+
+	start := day1.Add(6 * time.Hour)
+	end := day3.Add(6 * time.Hour)
+	result, err := store.QueryMonitorDailyTrend(ctx, MonitorQueryFilter{APIKey: "api-1", Start: &start, End: &end})
+	if err != nil {
+		t.Fatalf("QueryMonitorDailyTrend failed: %v", err)
+	}
+
+	want := []MonitorDailyTrendItem{
+		{Date: day1.Format("2006-01-02"), Requests: 2, SuccessRequests: 1, FailedRequests: 1, InputTokens: 10, OutputTokens: 2, ReasoningTokens: 1, CachedTokens: 3, CacheWriteTokens: 4},
+		{Date: day2.Format("2006-01-02"), Requests: 1, SuccessRequests: 1, InputTokens: 20, OutputTokens: 4, ReasoningTokens: 2, CachedTokens: 6, CacheWriteTokens: 8},
+		{Date: day3.Format("2006-01-02"), Requests: 1, SuccessRequests: 1, InputTokens: 30, OutputTokens: 6, ReasoningTokens: 3, CachedTokens: 9, CacheWriteTokens: 12},
+	}
+	if len(result) != len(want) {
+		t.Fatalf("daily trend length = %d, want %d: %+v", len(result), len(want), result)
+	}
+	for i := range want {
+		if result[i] != want[i] {
+			t.Fatalf("daily trend[%d] = %+v, want %+v", i, result[i], want[i])
+		}
+	}
+}
+
 func TestSQLiteUsageStoreQueryMonitorFailureStats(t *testing.T) {
 	ctx := context.Background()
 	store := newTestSQLiteUsageStore(t)

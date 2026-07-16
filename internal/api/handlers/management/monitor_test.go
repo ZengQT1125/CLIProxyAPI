@@ -179,6 +179,47 @@ func TestGetMonitorChannelStats_StatusFilterAndAggregate(t *testing.T) {
 	}
 }
 
+func TestGetMonitorChannelStats_SummaryOmitsFiltersAndRecent(t *testing.T) {
+	gin.SetMode(gin.TestMode)
+
+	base := time.Date(2026, 2, 6, 12, 0, 0, 0, time.Local)
+	h := newMonitorTestHandler(
+		testUsageRecord(base.Add(-2*time.Hour), "api-1", "model-a", "source-a", false),
+		testUsageRecord(base.Add(-time.Hour), "api-1", "model-b", "source-a", false),
+	)
+
+	rr := executeMonitorRequest(h.GetMonitorChannelStats, "/monitor/channel-stats?summary=true")
+	if rr.Code != http.StatusOK {
+		t.Fatalf("unexpected status: %d, body=%s", rr.Code, rr.Body.String())
+	}
+
+	var resp struct {
+		Items []struct {
+			RecentRequests []any `json:"recent_requests"`
+			Models         []struct {
+				RecentRequests []any `json:"recent_requests"`
+			} `json:"models"`
+		} `json:"items"`
+		Filters struct {
+			Models  []string `json:"models"`
+			Sources []string `json:"sources"`
+		} `json:"filters"`
+	}
+	if err := json.Unmarshal(rr.Body.Bytes(), &resp); err != nil {
+		t.Fatalf("decode response failed: %v", err)
+	}
+
+	if len(resp.Filters.Models) != 0 || len(resp.Filters.Sources) != 0 {
+		t.Fatalf("summary unexpectedly included filters: %+v", resp.Filters)
+	}
+	if len(resp.Items) != 1 || len(resp.Items[0].Models) != 2 {
+		t.Fatalf("unexpected summary items: %+v", resp.Items)
+	}
+	if len(resp.Items[0].RecentRequests) != 0 || len(resp.Items[0].Models[0].RecentRequests) != 0 {
+		t.Fatalf("summary unexpectedly included recent requests: %+v", resp.Items[0])
+	}
+}
+
 func TestGetMonitorFailureAnalysis_OnlyFailedSources(t *testing.T) {
 	gin.SetMode(gin.TestMode)
 

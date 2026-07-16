@@ -334,6 +334,7 @@ func (h *Handler) GetMonitorChannelStats(c *gin.Context) {
 		c.JSON(http.StatusBadRequest, gin.H{"error": err.Error()})
 		return
 	}
+	summaryOnly := strings.EqualFold(strings.TrimSpace(firstQuery(c, "summary")), "true")
 
 	dbPlugin := usage.GetDatabasePlugin()
 	if dbPlugin != nil && !isExplicitAllTimeRange(c) {
@@ -353,6 +354,7 @@ func (h *Handler) GetMonitorChannelStats(c *gin.Context) {
 		usageFilter := toUsageMonitorFilter(filter)
 		usageFilter.Model = strings.TrimSpace(modelFilter)
 		usageFilter.Status = strings.TrimSpace(status)
+		usageFilter.SummaryOnly = summaryOnly
 
 		queryResult, queryErr := dbPlugin.QueryMonitorChannelStats(c.Request.Context(), usageFilter, limit, monitorRecentLimit)
 		if queryErr == nil {
@@ -439,7 +441,9 @@ func (h *Handler) GetMonitorChannelStats(c *gin.Context) {
 		if record.Timestamp.After(agg.LastRequestAt) {
 			agg.LastRequestAt = record.Timestamp
 		}
-		agg.Recent = append(agg.Recent, monitorRecentRequest{Failed: record.Failed, Timestamp: record.Timestamp})
+		if !summaryOnly {
+			agg.Recent = append(agg.Recent, monitorRecentRequest{Failed: record.Failed, Timestamp: record.Timestamp})
+		}
 
 		modelAgg, ok := agg.Models[record.Model]
 		if !ok {
@@ -459,11 +463,15 @@ func (h *Handler) GetMonitorChannelStats(c *gin.Context) {
 		if record.Timestamp.After(modelAgg.LastRequestAt) {
 			modelAgg.LastRequestAt = record.Timestamp
 		}
-		modelAgg.Recent = append(modelAgg.Recent, monitorRecentRequest{Failed: record.Failed, Timestamp: record.Timestamp})
+		if !summaryOnly {
+			modelAgg.Recent = append(modelAgg.Recent, monitorRecentRequest{Failed: record.Failed, Timestamp: record.Timestamp})
+		}
 
-		sourceSet[source] = struct{}{}
-		if record.Model != "" {
-			modelSet[record.Model] = struct{}{}
+		if !summaryOnly {
+			sourceSet[source] = struct{}{}
+			if record.Model != "" {
+				modelSet[record.Model] = struct{}{}
+			}
 		}
 	})
 
@@ -483,6 +491,10 @@ func (h *Handler) GetMonitorChannelStats(c *gin.Context) {
 
 		models := make([]monitorModelStats, 0, len(agg.Models))
 		for _, modelAgg := range agg.Models {
+			recent := []monitorRecentRequest(nil)
+			if !summaryOnly {
+				recent = normalizeRecentRequests(modelAgg.Recent)
+			}
 			models = append(models, monitorModelStats{
 				Model:            modelAgg.Model,
 				Requests:         modelAgg.Requests,
@@ -494,7 +506,7 @@ func (h *Handler) GetMonitorChannelStats(c *gin.Context) {
 				CacheWriteTokens: modelAgg.CacheWriteTokens,
 				SuccessRate:      calcRate(modelAgg.Success, modelAgg.Requests),
 				LastRequestAt:    timePointer(modelAgg.LastRequestAt),
-				Recent:           normalizeRecentRequests(modelAgg.Recent),
+				Recent:           recent,
 			})
 		}
 		sort.Slice(models, func(i, j int) bool {
@@ -504,6 +516,10 @@ func (h *Handler) GetMonitorChannelStats(c *gin.Context) {
 			return models[i].Requests > models[j].Requests
 		})
 
+		recent := []monitorRecentRequest(nil)
+		if !summaryOnly {
+			recent = normalizeRecentRequests(agg.Recent)
+		}
 		items = append(items, monitorChannelStatsItem{
 			Source:           agg.Source,
 			TotalRequests:    agg.TotalRequests,
@@ -515,7 +531,7 @@ func (h *Handler) GetMonitorChannelStats(c *gin.Context) {
 			CacheWriteTokens: agg.CacheWriteTokens,
 			SuccessRate:      calcRate(agg.SuccessRequests, agg.TotalRequests),
 			LastRequestAt:    timePointer(agg.LastRequestAt),
-			Recent:           normalizeRecentRequests(agg.Recent),
+			Recent:           recent,
 			Models:           models,
 		})
 	}
@@ -530,11 +546,15 @@ func (h *Handler) GetMonitorChannelStats(c *gin.Context) {
 		items = items[:limit]
 	}
 
+	filters := monitorFilterOptions{}
+	if !summaryOnly {
+		filters = monitorFilterOptions{Models: setToSortedSlice(modelSet), Sources: setToSortedSlice(sourceSet)}
+	}
 	c.JSON(http.StatusOK, gin.H{
 		"items":      items,
 		"total":      len(items),
 		"limit":      limit,
-		"filters":    monitorFilterOptions{Models: setToSortedSlice(modelSet), Sources: setToSortedSlice(sourceSet)},
+		"filters":    filters,
 		"time_range": monitorTimeRange{Start: start, End: end},
 	})
 }

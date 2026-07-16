@@ -28,6 +28,8 @@ type MonitorQueryFilter struct {
 	Status      string
 	Start       *time.Time
 	End         *time.Time
+	// SummaryOnly skips high-cardinality filter candidates and recent request series.
+	SummaryOnly bool
 }
 
 // MonitorRecentRequest stores the request status and time for trend bars.
@@ -633,6 +635,9 @@ func (s *sqliteUsageStore) QueryMonitorChannelStats(ctx context.Context, filter 
 	baseFilter.Status = ""
 
 	whereClause, args := buildSQLiteMonitorWhere(baseFilter, false)
+	if filter.SummaryOnly {
+		return s.queryMonitorChannelSummary(ctx, whereClause, args, limit)
+	}
 
 	filters, err := s.queryMonitorFilterOptions(ctx, baseFilter, false, false)
 	if err != nil {
@@ -968,7 +973,7 @@ func buildSourceWhereClause(sources []string) (string, []any) {
 	args := make([]any, 0, len(sourceSet))
 	for source := range sourceSet {
 		if source == "unknown" {
-			clauses = append(clauses, "(source IS NULL OR source = '')")
+			clauses = append(clauses, "(source IS NULL OR source = '' OR source = 'unknown')")
 			continue
 		}
 		clauses = append(clauses, "source = ?")
@@ -1032,6 +1037,96 @@ func (s *sqliteUsageStore) queryChannelAggregates(ctx context.Context, whereClau
 		return nil, fmt.Errorf("usage store: iterate monitor channel aggregates: %w", err)
 	}
 	return result, nil
+}
+
+func (s *sqliteUsageStore) queryMonitorChannelSummary(ctx context.Context, whereClause string, args []any, limit int) (MonitorChannelStatsResult, error) {
+	query := fmt.Sprintf(`
+		SELECT COALESCE(NULLIF(source, ''), 'unknown') AS source_key,
+			COUNT(*) AS total_requests,
+			COALESCE(SUM(CASE WHEN failed=0 THEN 1 ELSE 0 END), 0),
+			COALESCE(SUM(CASE WHEN failed=1 THEN 1 ELSE 0 END), 0),
+			COALESCE(SUM(CASE WHEN failed=0 THEN input_tokens ELSE 0 END), 0),
+			COALESCE(SUM(CASE WHEN failed=0 THEN output_tokens ELSE 0 END), 0),
+			COALESCE(SUM(CASE WHEN failed=0 THEN cached_tokens ELSE 0 END), 0),
+			COALESCE(SUM(CASE WHEN failed=0 THEN cache_write_tokens ELSE 0 END), 0),
+			MAX(requested_at)
+		FROM usage_records
+		WHERE %s
+		GROUP BY source_key
+		ORDER BY total_requests DESC, source_key ASC
+		LIMIT ?
+	`, whereClause)
+	queryArgs := append(copyArgs(args), limit)
+	rows, err := s.db.QueryContext(ctx, query, queryArgs...)
+	if err != nil {
+		return MonitorChannelStatsResult{}, fmt.Errorf("usage store: query monitor channel summary: %w", err)
+	}
+	defer rows.Close()
+
+	channelMap := make(map[string]*MonitorChannelStats, limit)
+	orderedSources := make([]string, 0, limit)
+	for rows.Next() {
+		var (
+			source   string
+			item     MonitorChannelStats
+			lastUnix sql.NullInt64
+		)
+		if err = rows.Scan(
+			&source,
+			&item.TotalRequests,
+			&item.SuccessRequests,
+			&item.FailedRequests,
+			&item.InputTokens,
+			&item.OutputTokens,
+			&item.CachedTokens,
+			&item.CacheWriteTokens,
+			&lastUnix,
+		); err != nil {
+			return MonitorChannelStatsResult{}, fmt.Errorf("usage store: scan monitor channel summary: %w", err)
+		}
+		item.Source = normalizeMonitorSource(source)
+		item.LastRequestAt = nullUnixPointer(lastUnix)
+		item.Models = []MonitorModelStats{}
+		item.Recent = []MonitorRecentRequest{}
+		channelMap[item.Source] = &item
+		orderedSources = append(orderedSources, item.Source)
+	}
+	if err = rows.Err(); err != nil {
+		return MonitorChannelStatsResult{}, fmt.Errorf("usage store: iterate monitor channel summary: %w", err)
+	}
+	if len(orderedSources) == 0 {
+		return MonitorChannelStatsResult{
+			Items:   []MonitorChannelStats{},
+			Filters: MonitorFilterOptions{APIs: []string{}, Models: []string{}, Sources: []string{}},
+		}, nil
+	}
+
+	sourceWhereClause, sourceWhereArgs := buildSourceWhereClause(orderedSources)
+	if sourceWhereClause == "" {
+		return MonitorChannelStatsResult{}, fmt.Errorf("usage store: build channel summary source where clause: empty")
+	}
+	modelWhereClause := fmt.Sprintf("(%s) AND (%s)", whereClause, sourceWhereClause)
+	modelArgs := append(copyArgs(args), sourceWhereArgs...)
+	if err = s.attachChannelModels(ctx, modelWhereClause, modelArgs, channelMap); err != nil {
+		return MonitorChannelStatsResult{}, err
+	}
+
+	items := make([]MonitorChannelStats, 0, len(orderedSources))
+	for _, source := range orderedSources {
+		item := channelMap[source]
+		sort.Slice(item.Models, func(i, j int) bool {
+			if item.Models[i].Requests == item.Models[j].Requests {
+				return item.Models[i].Model < item.Models[j].Model
+			}
+			return item.Models[i].Requests > item.Models[j].Requests
+		})
+		items = append(items, *item)
+	}
+
+	return MonitorChannelStatsResult{
+		Items:   items,
+		Filters: MonitorFilterOptions{APIs: []string{}, Models: []string{}, Sources: []string{}},
+	}, nil
 }
 
 func (s *sqliteUsageStore) attachChannelModels(ctx context.Context, whereClause string, args []any, channelMap map[string]*MonitorChannelStats) error {
@@ -1605,6 +1700,10 @@ func (s *sqliteUsageStore) QueryMonitorDailyTrend(ctx context.Context, filter Mo
 	if s == nil || s.db == nil {
 		return nil, fmt.Errorf("usage store: sqlite store not initialized")
 	}
+	// Bounded ranges avoid DATE(..., 'localtime') on every row and the temporary GROUP BY tree.
+	if ranges, ok := buildMonitorDailyRanges(filter.Start, filter.End); ok {
+		return s.queryMonitorDailyTrendRanges(ctx, filter, ranges)
+	}
 
 	whereClause, args := buildSQLiteMonitorWhere(filter, false)
 	query := fmt.Sprintf(`
@@ -1622,7 +1721,84 @@ func (s *sqliteUsageStore) QueryMonitorDailyTrend(ctx context.Context, filter Mo
 		GROUP BY date_key
 		ORDER BY date_key ASC
 	`, whereClause)
+	return s.queryMonitorDailyTrendRows(ctx, query, args)
+}
 
+const maxMonitorDailyRanges = 366
+
+type monitorDailyRange struct {
+	Date  string
+	Start int64
+	End   int64
+}
+
+func buildMonitorDailyRanges(start, end *time.Time) ([]monitorDailyRange, bool) {
+	if start == nil || end == nil || end.Before(*start) {
+		return nil, false
+	}
+
+	startLocal := start.In(time.Local)
+	cursor := time.Date(startLocal.Year(), startLocal.Month(), startLocal.Day(), 0, 0, 0, 0, time.Local)
+	ranges := make([]monitorDailyRange, 0, 32)
+	for cursor.Before(*end) || cursor.Equal(*end) {
+		if len(ranges) >= maxMonitorDailyRanges {
+			return nil, false
+		}
+		next := cursor.AddDate(0, 0, 1)
+		windowStart := cursor.Unix()
+		if start.Unix() > windowStart {
+			windowStart = start.Unix()
+		}
+		windowEnd := next.Unix() - 1
+		if end.Unix() < windowEnd {
+			windowEnd = end.Unix()
+		}
+		if windowStart <= windowEnd {
+			ranges = append(ranges, monitorDailyRange{
+				Date:  cursor.Format("2006-01-02"),
+				Start: windowStart,
+				End:   windowEnd,
+			})
+		}
+		cursor = next
+	}
+	return ranges, len(ranges) > 0
+}
+
+func (s *sqliteUsageStore) queryMonitorDailyTrendRanges(ctx context.Context, filter MonitorQueryFilter, ranges []monitorDailyRange) ([]MonitorDailyTrendItem, error) {
+	valueRows := make([]string, 0, len(ranges))
+	args := make([]any, 0, len(ranges)*3+8)
+	for _, dayRange := range ranges {
+		valueRows = append(valueRows, "(?, ?, ?)")
+		args = append(args, dayRange.Date, dayRange.Start, dayRange.End)
+	}
+
+	baseFilter := filter
+	baseFilter.Start = nil
+	baseFilter.End = nil
+	whereClause, whereArgs := buildSQLiteMonitorWhere(baseFilter, false)
+	args = append(args, whereArgs...)
+	query := fmt.Sprintf(`
+		WITH day_ranges(date_key, start_ts, end_ts) AS (VALUES %s)
+		SELECT d.date_key,
+			COUNT(*),
+			COALESCE(SUM(CASE WHEN failed=0 THEN 1 ELSE 0 END), 0),
+			COALESCE(SUM(CASE WHEN failed=1 THEN 1 ELSE 0 END), 0),
+			COALESCE(SUM(CASE WHEN failed=0 THEN input_tokens ELSE 0 END), 0),
+			COALESCE(SUM(CASE WHEN failed=0 THEN output_tokens ELSE 0 END), 0),
+			COALESCE(SUM(CASE WHEN failed=0 THEN reasoning_tokens ELSE 0 END), 0),
+			COALESCE(SUM(CASE WHEN failed=0 THEN cached_tokens ELSE 0 END), 0),
+			COALESCE(SUM(CASE WHEN failed=0 THEN cache_write_tokens ELSE 0 END), 0)
+		FROM day_ranges d
+		JOIN usage_records u ON u.requested_at >= d.start_ts AND u.requested_at <= d.end_ts
+		WHERE %s
+		GROUP BY d.date_key
+		ORDER BY d.date_key ASC
+	`, strings.Join(valueRows, ","), whereClause)
+	return s.queryMonitorDailyTrendRows(ctx, query, args)
+}
+
+func (s *sqliteUsageStore) queryMonitorDailyTrendRows(ctx context.Context, query string, args []any) ([]MonitorDailyTrendItem, error) {
 	rows, err := s.db.QueryContext(ctx, query, args...)
 	if err != nil {
 		return nil, fmt.Errorf("usage store: query monitor daily trend: %w", err)
