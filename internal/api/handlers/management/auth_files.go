@@ -10,7 +10,6 @@ import (
 	"errors"
 	"fmt"
 	"io"
-	"mime/multipart"
 	"net"
 	"net/http"
 	"os"
@@ -48,6 +47,7 @@ var lastRefreshKeys = []string{"last_refresh", "lastRefresh", "last_refreshed_at
 const (
 	anthropicCallbackPort = 54545
 	codexCallbackPort     = 1455
+	maxAuthUploadFiles    = 10000
 )
 
 type callbackForwarder struct {
@@ -861,56 +861,8 @@ func (h *Handler) UploadAuthFile(c *gin.Context) {
 	}
 	ctx := c.Request.Context()
 
-	fileHeaders, errMultipart := h.multipartAuthFileHeaders(c)
-	if errMultipart != nil {
-		c.JSON(http.StatusBadRequest, gin.H{"error": fmt.Sprintf("invalid multipart form: %v", errMultipart)})
-		return
-	}
-	if len(fileHeaders) == 1 {
-		if _, errUpload := h.storeUploadedAuthFile(ctx, fileHeaders[0]); errUpload != nil {
-			if errors.Is(errUpload, errAuthFileMustBeJSON) {
-				c.JSON(http.StatusBadRequest, gin.H{"error": "file must be .json"})
-				return
-			}
-			c.JSON(http.StatusInternalServerError, gin.H{"error": errUpload.Error()})
-			return
-		}
-		c.JSON(http.StatusOK, gin.H{"status": "ok"})
-		return
-	}
-	if len(fileHeaders) > 1 {
-		uploaded := make([]string, 0, len(fileHeaders))
-		failed := make([]gin.H, 0)
-		for _, file := range fileHeaders {
-			name, errUpload := h.storeUploadedAuthFile(ctx, file)
-			if errUpload != nil {
-				failureName := ""
-				if file != nil {
-					failureName = filepath.Base(file.Filename)
-				}
-				msg := errUpload.Error()
-				if errors.Is(errUpload, errAuthFileMustBeJSON) {
-					msg = "file must be .json"
-				}
-				failed = append(failed, gin.H{"name": failureName, "error": msg})
-				continue
-			}
-			uploaded = append(uploaded, name)
-		}
-		if len(failed) > 0 {
-			c.JSON(http.StatusMultiStatus, gin.H{
-				"status":   "partial",
-				"uploaded": len(uploaded),
-				"files":    uploaded,
-				"failed":   failed,
-			})
-			return
-		}
-		c.JSON(http.StatusOK, gin.H{"status": "ok", "uploaded": len(uploaded), "files": uploaded})
-		return
-	}
 	if c.ContentType() == "multipart/form-data" {
-		c.JSON(http.StatusBadRequest, gin.H{"error": "no files uploaded"})
+		h.uploadMultipartAuthFiles(c, ctx)
 		return
 	}
 	name := strings.TrimSpace(c.Query("name"))
@@ -1206,45 +1158,93 @@ func (h *Handler) deleteFilteredAuthFile(ctx context.Context, candidate filtered
 	return name, http.StatusOK, nil
 }
 
-func (h *Handler) multipartAuthFileHeaders(c *gin.Context) ([]*multipart.FileHeader, error) {
-	if h == nil || c == nil || c.ContentType() != "multipart/form-data" {
-		return nil, nil
-	}
-	form, err := c.MultipartForm()
-	if err != nil {
-		return nil, err
-	}
-	if form == nil || len(form.File) == 0 {
-		return nil, nil
+func (h *Handler) uploadMultipartAuthFiles(c *gin.Context, ctx context.Context) {
+	reader, errReader := c.Request.MultipartReader()
+	if errReader != nil {
+		c.JSON(http.StatusBadRequest, gin.H{"error": fmt.Sprintf("invalid multipart form: %v", errReader)})
+		return
 	}
 
-	keys := make([]string, 0, len(form.File))
-	for key := range form.File {
-		keys = append(keys, key)
+	type uploadFailure struct {
+		name string
+		err  error
 	}
-	sort.Strings(keys)
+	uploaded := make([]string, 0)
+	failed := make([]uploadFailure, 0)
+	fileCount := 0
+	for {
+		part, errNext := reader.NextPart()
+		if errors.Is(errNext, io.EOF) {
+			break
+		}
+		if errNext != nil {
+			c.JSON(http.StatusBadRequest, gin.H{"error": fmt.Sprintf("invalid multipart form: %v", errNext)})
+			return
+		}
+		filename := strings.TrimSpace(part.FileName())
+		if filename == "" {
+			if errClose := part.Close(); errClose != nil {
+				c.JSON(http.StatusBadRequest, gin.H{"error": fmt.Sprintf("invalid multipart form: %v", errClose)})
+				return
+			}
+			continue
+		}
 
-	headers := make([]*multipart.FileHeader, 0)
-	for _, key := range keys {
-		headers = append(headers, form.File[key]...)
+		fileCount++
+		if fileCount > maxAuthUploadFiles {
+			_ = part.Close()
+			c.JSON(http.StatusRequestEntityTooLarge, gin.H{"error": fmt.Sprintf("too many files: maximum is %d", maxAuthUploadFiles)})
+			return
+		}
+
+		name, errUpload := h.storeUploadedAuthFile(ctx, filename, part)
+		if errClose := part.Close(); errClose != nil {
+			log.WithError(errClose).Warn("failed to close uploaded auth file part")
+		}
+		if errUpload != nil {
+			failed = append(failed, uploadFailure{name: filepath.Base(filename), err: errUpload})
+			continue
+		}
+		uploaded = append(uploaded, name)
 	}
-	return headers, nil
+
+	switch {
+	case fileCount == 0:
+		c.JSON(http.StatusBadRequest, gin.H{"error": "no files uploaded"})
+	case fileCount == 1 && len(failed) == 1:
+		failure := failed[0]
+		if errors.Is(failure.err, errAuthFileMustBeJSON) {
+			c.JSON(http.StatusBadRequest, gin.H{"error": "file must be .json"})
+			return
+		}
+		c.JSON(http.StatusInternalServerError, gin.H{"error": failure.err.Error()})
+	case fileCount == 1:
+		c.JSON(http.StatusOK, gin.H{"status": "ok"})
+	case len(failed) > 0:
+		failedPayload := make([]gin.H, 0, len(failed))
+		for _, failure := range failed {
+			msg := failure.err.Error()
+			if errors.Is(failure.err, errAuthFileMustBeJSON) {
+				msg = "file must be .json"
+			}
+			failedPayload = append(failedPayload, gin.H{"name": failure.name, "error": msg})
+		}
+		c.JSON(http.StatusMultiStatus, gin.H{
+			"status":   "partial",
+			"uploaded": len(uploaded),
+			"files":    uploaded,
+			"failed":   failedPayload,
+		})
+	default:
+		c.JSON(http.StatusOK, gin.H{"status": "ok", "uploaded": len(uploaded), "files": uploaded})
+	}
 }
 
-func (h *Handler) storeUploadedAuthFile(ctx context.Context, file *multipart.FileHeader) (string, error) {
-	if file == nil {
-		return "", fmt.Errorf("no file uploaded")
-	}
-	name := filepath.Base(strings.TrimSpace(file.Filename))
+func (h *Handler) storeUploadedAuthFile(ctx context.Context, filename string, src io.Reader) (string, error) {
+	name := filepath.Base(strings.TrimSpace(filename))
 	if !strings.HasSuffix(strings.ToLower(name), ".json") {
 		return "", errAuthFileMustBeJSON
 	}
-	src, err := file.Open()
-	if err != nil {
-		return "", fmt.Errorf("failed to open uploaded file: %w", err)
-	}
-	defer src.Close()
-
 	data, err := io.ReadAll(src)
 	if err != nil {
 		return "", fmt.Errorf("failed to read uploaded file: %w", err)

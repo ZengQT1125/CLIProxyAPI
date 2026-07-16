@@ -3,6 +3,7 @@ package management
 import (
 	"bytes"
 	"encoding/json"
+	"fmt"
 	"mime/multipart"
 	"net/http"
 	"net/http/httptest"
@@ -13,8 +14,51 @@ import (
 
 	"github.com/gin-gonic/gin"
 	"github.com/router-for-me/CLIProxyAPI/v7/internal/config"
+	sdkAuth "github.com/router-for-me/CLIProxyAPI/v7/sdk/auth"
 	coreauth "github.com/router-for-me/CLIProxyAPI/v7/sdk/cliproxy/auth"
 )
+
+func TestUploadAuthFile_BatchMultipartExceedsDefaultPartLimit(t *testing.T) {
+	t.Setenv("MANAGEMENT_PASSWORD", "")
+	gin.SetMode(gin.TestMode)
+
+	authDir := t.TempDir()
+	store := sdkAuth.NewFileTokenStore()
+	store.SetBaseDir(authDir)
+	manager := coreauth.NewManager(store, nil, nil)
+	h := NewHandlerWithoutConfigFilePath(&config.Config{AuthDir: authDir}, manager)
+
+	const fileCount = 2465
+	var body bytes.Buffer
+	writer := multipart.NewWriter(&body)
+	for fileIndex := 0; fileIndex < fileCount; fileIndex++ {
+		part, errCreate := writer.CreateFormFile("file", fmt.Sprintf("xai-%04d.json", fileIndex))
+		if errCreate != nil {
+			t.Fatalf("create multipart file: %v", errCreate)
+		}
+		if _, errWrite := part.Write([]byte(`{"type":"xai","access_token":"token"}`)); errWrite != nil {
+			t.Fatalf("write multipart file: %v", errWrite)
+		}
+	}
+	if errClose := writer.Close(); errClose != nil {
+		t.Fatalf("close multipart writer: %v", errClose)
+	}
+
+	rec := httptest.NewRecorder()
+	ctx, _ := gin.CreateTestContext(rec)
+	req := httptest.NewRequest(http.MethodPost, "/v0/management/auth-files", &body)
+	req.Header.Set("Content-Type", writer.FormDataContentType())
+	ctx.Request = req
+
+	h.UploadAuthFile(ctx)
+
+	if rec.Code != http.StatusOK {
+		t.Fatalf("upload status = %d, want %d; body = %s", rec.Code, http.StatusOK, rec.Body.String())
+	}
+	if got := len(manager.List()); got != fileCount {
+		t.Fatalf("registered auth count = %d, want %d", got, fileCount)
+	}
+}
 
 func TestUploadAuthFile_BatchMultipart(t *testing.T) {
 	t.Setenv("MANAGEMENT_PASSWORD", "")
