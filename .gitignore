@@ -29,7 +29,10 @@ auths/*
 !auths/.gitkeep
 
 # Documentation
-docs/*
+/docs/*.txt
+/docs/**/*.txt
+/docs/performance/
+/docs/superpowers/
 GEMINI.md
 
 # Tooling metadata
