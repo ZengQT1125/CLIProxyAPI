@@ -90,6 +90,15 @@ func (e *refreshOAuthError) StatusCode() int { return e.status }
 
 func (e *refreshOAuthError) OAuthErrorCode() string { return e.code }
 
+type credentialProbeHTTPError struct {
+	status int
+	body   string
+}
+
+func (e *credentialProbeHTTPError) Error() string { return e.body }
+
+func (e *credentialProbeHTTPError) StatusCode() int { return e.status }
+
 type oauthRefreshFailureExecutor struct {
 	schedulerProviderTestExecutor
 	err   error
@@ -267,6 +276,75 @@ func TestManagerAutoRefreshDeletesInvalidGrantWhenConversationProbeIsUnauthorize
 	}
 	if got := executor.probeCalls.Load(); got != 1 {
 		t.Fatalf("conversation probe calls = %d, want 1", got)
+	}
+}
+
+func TestManagerAutoRefreshDeletesXAIWhenConversationProbeReturnsPermissionDenied(t *testing.T) {
+	SetDeleteUnauthorizedAuth(true)
+	t.Cleanup(func() { SetDeleteUnauthorizedAuth(false) })
+
+	store := &deleteTrackingStore{}
+	manager := NewManager(store, nil, nil)
+	executor := &probingOAuthRefreshFailureExecutor{
+		oauthRefreshFailureExecutor: &oauthRefreshFailureExecutor{
+			schedulerProviderTestExecutor: schedulerProviderTestExecutor{provider: "xai"},
+			err:                           &refreshOAuthError{status: http.StatusBadRequest, code: "invalid_grant", message: "Refresh token has been revoked"},
+		},
+		probeErr: &credentialProbeHTTPError{
+			status: http.StatusForbidden,
+			body:   `{"code":"permission-denied","error":"Access to the chat endpoint is denied."}`,
+		},
+	}
+	manager.RegisterExecutor(executor)
+	registerExpiredRefreshAuth(t, manager, "xai-permission-denied", "xai")
+
+	manager.StartAutoRefresh(context.Background(), time.Millisecond)
+	t.Cleanup(manager.StopAutoRefresh)
+	waitForAuthCondition(t, func() bool { return len(store.deleted()) == 1 }, "permission-denied auth deletion")
+
+	if _, ok := manager.GetByID("xai-permission-denied"); ok {
+		t.Fatal("expected permission-denied xai auth to be removed from manager")
+	}
+	if got := store.deleted(); len(got) != 1 || got[0] != "xai-permission-denied" {
+		t.Fatalf("deleted auths = %v, want [xai-permission-denied]", got)
+	}
+	if got := executor.probeCalls.Load(); got != 1 {
+		t.Fatalf("conversation probe calls = %d, want 1", got)
+	}
+}
+
+func TestManagerAutoRefreshKeepsNonXAIWhenConversationProbeReturnsPermissionDenied(t *testing.T) {
+	SetDeleteUnauthorizedAuth(true)
+	t.Cleanup(func() { SetDeleteUnauthorizedAuth(false) })
+
+	store := &deleteTrackingStore{}
+	manager := NewManager(store, nil, nil)
+	executor := &probingOAuthRefreshFailureExecutor{
+		oauthRefreshFailureExecutor: &oauthRefreshFailureExecutor{
+			schedulerProviderTestExecutor: schedulerProviderTestExecutor{provider: "codex"},
+			err:                           &refreshOAuthError{status: http.StatusBadRequest, code: "invalid_grant", message: "Refresh token has been revoked"},
+		},
+		probeErr: &credentialProbeHTTPError{
+			status: http.StatusForbidden,
+			body:   `{"code":"permission-denied","error":"Access to the chat endpoint is denied."}`,
+		},
+	}
+	manager.RegisterExecutor(executor)
+	registerExpiredRefreshAuth(t, manager, "codex-permission-denied", "codex")
+
+	manager.StartAutoRefresh(context.Background(), time.Millisecond)
+	t.Cleanup(manager.StopAutoRefresh)
+	waitForAuthCondition(t, func() bool { return executor.probeCalls.Load() == 1 }, "non-xai permission-denied credential probe")
+
+	retained, ok := manager.GetByID("codex-permission-denied")
+	if !ok || retained == nil {
+		t.Fatal("expected non-xai auth to remain after permission-denied probe")
+	}
+	if !retained.Unavailable || retained.Status != StatusError {
+		t.Fatalf("retained auth state = unavailable:%v status:%s, want terminal error", retained.Unavailable, retained.Status)
+	}
+	if got := store.deleted(); len(got) != 0 {
+		t.Fatalf("deleted auths = %v, want none", got)
 	}
 }
 
