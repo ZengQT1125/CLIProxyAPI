@@ -432,7 +432,8 @@ func TestGetMonitorKeyStats_AuthIndexFilter(t *testing.T) {
 			} `json:"blocks"`
 		} `json:"by_auth_index"`
 		BlockConfig struct {
-			Count int `json:"count"`
+			Count      int   `json:"count"`
+			DurationMs int64 `json:"duration_ms"`
 		} `json:"block_config"`
 		Filter struct {
 			AuthIndexes []string `json:"auth_indexes"`
@@ -460,47 +461,29 @@ func TestGetMonitorKeyStats_AuthIndexFilter(t *testing.T) {
 	if got := resp.BySource["source-b"]; got.Success != 1 || got.Failure != 0 {
 		t.Fatalf("unexpected source-b stats: %+v", got)
 	}
-	if resp.BlockConfig.Count != 20 {
-		t.Fatalf("unexpected block count: got %d want 20", resp.BlockConfig.Count)
+	if resp.BlockConfig.Count != 20 || resp.BlockConfig.DurationMs != 600_000 {
+		t.Fatalf("unexpected block_config: %+v", resp.BlockConfig)
 	}
 	if !slices.Equal(resp.Filter.AuthIndexes, []string{"auth-a", "auth-b"}) {
 		t.Fatalf("unexpected filter auth indexes: got %q want %q", resp.Filter.AuthIndexes, []string{"auth-a", "auth-b"})
 	}
 }
 
-func TestGetMonitorKeyStats_UsesLocalCalendarDay(t *testing.T) {
+func TestGetMonitorKeyStats_UsesRollingWindow(t *testing.T) {
 	gin.SetMode(gin.TestMode)
 
 	now := time.Now()
-	dayStart := time.Date(now.Year(), now.Month(), now.Day(), 0, 0, 0, 0, now.Location())
-	if now.Sub(dayStart) < 2*time.Minute {
-		t.Skip("too close to local midnight for stable same-day samples")
-	}
+	// Inside the rolling 200-minute window.
+	recentOK := testUsageRecord(now.Add(-15*time.Minute), "api-win", "model-a", "source-win", false)
+	recentOK.AuthIndex = "auth-win"
+	recentFail := testUsageRecord(now.Add(-5*time.Minute), "api-win", "model-a", "source-win", true)
+	recentFail.AuthIndex = "auth-win"
+	// Outside the rolling window — must NOT count.
+	oldOK := testUsageRecord(now.Add(-4*time.Hour), "api-win", "model-a", "source-win", false)
+	oldOK.AuthIndex = "auth-win"
 
-	// Same local day samples, always clamped into [dayStart, now].
-	earlyOffset := now.Sub(dayStart) / 3
-	if earlyOffset < time.Minute {
-		earlyOffset = time.Minute
-	}
-	midOffset := now.Sub(dayStart) * 2 / 3
-	if midOffset <= earlyOffset {
-		midOffset = earlyOffset + time.Minute
-	}
-
-	sameDayOK := testUsageRecord(dayStart.Add(earlyOffset), "api-day", "model-a", "source-day", false)
-	sameDayOK.AuthIndex = "auth-day"
-	sameDayFail := testUsageRecord(dayStart.Add(midOffset), "api-day", "model-a", "source-day", true)
-	sameDayFail.AuthIndex = "auth-day"
-	recentOK := testUsageRecord(now.Add(-time.Second), "api-day", "model-a", "source-day", false)
-	recentOK.AuthIndex = "auth-day"
-
-	// Yesterday, even if still inside a rolling 24h window — must NOT count.
-	yesterday := dayStart.Add(-1 * time.Hour)
-	yesterdayOK := testUsageRecord(yesterday, "api-day", "model-a", "source-day", false)
-	yesterdayOK.AuthIndex = "auth-day"
-
-	h := newMonitorTestHandler(sameDayOK, sameDayFail, recentOK, yesterdayOK)
-	rr := executeMonitorRequest(h.GetMonitorKeyStats, "/monitor/key-stats?auth_index=auth-day")
+	h := newMonitorTestHandler(recentOK, recentFail, oldOK)
+	rr := executeMonitorRequest(h.GetMonitorKeyStats, "/monitor/key-stats?auth_index=auth-win")
 	if rr.Code != http.StatusOK {
 		t.Fatalf("unexpected status: %d, body=%s", rr.Code, rr.Body.String())
 	}
@@ -524,37 +507,35 @@ func TestGetMonitorKeyStats_UsesLocalCalendarDay(t *testing.T) {
 		t.Fatalf("decode response failed: %v", err)
 	}
 
-	got := resp.ByAuthIndex["auth-day"]
-	if got.Success != 2 || got.Failure != 1 {
-		t.Fatalf("unexpected auth-day totals: success=%d failure=%d (want 2/1 for local calendar day)", got.Success, got.Failure)
+	got := resp.ByAuthIndex["auth-win"]
+	if got.Success != 1 || got.Failure != 1 {
+		t.Fatalf("unexpected auth-win totals: success=%d failure=%d (want 1/1 for rolling 200m window)", got.Success, got.Failure)
 	}
 	if len(got.Blocks) != 20 {
 		t.Fatalf("unexpected block length: got %d want 20", len(got.Blocks))
 	}
-	if resp.BlockConfig.Count != 20 || resp.BlockConfig.DurationMs != 4_320_000 {
+	if resp.BlockConfig.Count != 20 || resp.BlockConfig.DurationMs != 600_000 {
 		t.Fatalf("unexpected block_config: %+v", resp.BlockConfig)
 	}
-	if resp.BlockConfig.WindowStartMs != dayStart.UnixMilli() {
-		t.Fatalf("window_start_ms = %d, want local midnight %d", resp.BlockConfig.WindowStartMs, dayStart.UnixMilli())
+	// window_start should be ~now-200m (allow a few seconds of skew from request handling).
+	wantStart := now.Add(-200 * time.Minute).UnixMilli()
+	if delta := resp.BlockConfig.WindowStartMs - wantStart; delta < -5_000 || delta > 5_000 {
+		t.Fatalf("window_start_ms = %d, want ~%d (±5s)", resp.BlockConfig.WindowStartMs, wantStart)
 	}
 }
-
 
 func TestGetMonitorKeyStats_RemapsDriftedAuthIndexViaSource(t *testing.T) {
 	gin.SetMode(gin.TestMode)
 
 	now := time.Now()
-	dayStart := time.Date(now.Year(), now.Month(), now.Day(), 0, 0, 0, 0, now.Location())
-	if now.Sub(dayStart) < 2*time.Minute {
-		t.Skip("too close to local midnight for stable same-day samples")
-	}
 
 	email := "crappie.blocker@example.com"
 	currentIndex := "current-basename-index"
 	historicalIndex := "old-absolute-path-index"
 
 	// Historical usage rows written under a different auth_index seed.
-	histOK := testUsageRecord(dayStart.Add(now.Sub(dayStart)/2), "api-1", "model-a", email, false)
+	// Keep them inside the rolling 200-minute window.
+	histOK := testUsageRecord(now.Add(-30*time.Minute), "api-1", "model-a", email, false)
 	histOK.AuthIndex = historicalIndex
 	histFail := testUsageRecord(now.Add(-time.Second), "api-1", "model-a", email, true)
 	histFail.AuthIndex = historicalIndex

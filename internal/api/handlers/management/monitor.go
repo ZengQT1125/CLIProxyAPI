@@ -2672,11 +2672,10 @@ func (h *Handler) GetMonitorServiceHealth(c *gin.Context) {
 }
 
 // GetMonitorKeyStats returns per-source and per-auth-index success/failure stats
-// for the local calendar day (00:00 → now), with 20 fixed blocks covering 00:00–24:00
-// (72 minutes each). Future blocks in the day stay empty.
-//
-// Auth-file cards surface success/failure totals from this endpoint; a short
-// ~3h window under-counts real daily traffic and disagrees with channel stats "今天".
+// over a rolling window of the last 200 minutes (20 × 10-minute blocks ending at
+// now). The status bar on auth-file cards is driven by this grid; a fixed local
+// calendar day with 72-minute slots left future empty blocks and a single
+// morning bucket, which is unusable as a recent-health strip.
 //
 // Historical usage rows may carry drifted auth_index values when file-based OAuth
 // seeds previously embedded absolute paths. When filtering by auth_index, also
@@ -2685,13 +2684,13 @@ func (h *Handler) GetMonitorServiceHealth(c *gin.Context) {
 func (h *Handler) GetMonitorKeyStats(c *gin.Context) {
 	const (
 		blockCount      = 20
-		blockDurationMs = 4_320_000 // 72 minutes = 24h / 20
-		blockDuration   = 72 * time.Minute
+		blockDurationMs = 600_000 // 10 minutes
+		blockDuration   = 10 * time.Minute
+		windowDuration  = blockCount * blockDuration // 200 minutes
 	)
 
 	now := time.Now()
-	// Local calendar day — matches monitor channel stats "今天".
-	dayStart := time.Date(now.Year(), now.Month(), now.Day(), 0, 0, 0, 0, now.Location())
+	windowStart := now.Add(-windowDuration)
 	authIndexes := normalizeAuthIndexes(c.QueryArray("auth_index"))
 	authIndexSet := make(map[string]struct{}, len(authIndexes))
 	for _, authIndex := range authIndexes {
@@ -2768,13 +2767,12 @@ func (h *Handler) GetMonitorKeyStats(c *gin.Context) {
 		return s
 	}
 
-	// Block grid is aligned to the full local day [00:00, 24:00).
 	clampBlockIndex := func(idx int) (int, bool) {
 		if idx < 0 {
 			return 0, false
 		}
 		if idx >= blockCount {
-			// Exactly 24:00 lands on blockCount; keep in last slot.
+			// Exactly window end lands on blockCount; keep in last slot.
 			if idx == blockCount {
 				return blockCount - 1, true
 			}
@@ -2784,11 +2782,10 @@ func (h *Handler) GetMonitorKeyStats(c *gin.Context) {
 	}
 
 	if dbPlugin := usage.GetDatabasePlugin(); dbPlugin != nil {
-		// Query only records from local midnight through now.
 		// Include source aliases so path-drifted historical auth_index rows still match.
 		rows, queryErr := dbPlugin.QueryMonitorKeyStatsBlocks(
 			c.Request.Context(),
-			dayStart.Unix(),
+			windowStart.Unix(),
 			now.Unix(),
 			int(blockDuration.Seconds()),
 			authIndexes,
@@ -2821,10 +2818,10 @@ func (h *Handler) GetMonitorKeyStats(c *gin.Context) {
 	}
 
 	visitSnapshotRecords(h.usageSnapshot(), func(record monitorRecord) {
-		if record.Timestamp.Before(dayStart) || record.Timestamp.After(now) {
+		if record.Timestamp.Before(windowStart) || record.Timestamp.After(now) {
 			return
 		}
-		idx, ok := clampBlockIndex(int(record.Timestamp.Sub(dayStart) / blockDuration))
+		idx, ok := clampBlockIndex(int(record.Timestamp.Sub(windowStart) / blockDuration))
 		if !ok {
 			return
 		}
@@ -2870,7 +2867,7 @@ buildKeyStatsResponse:
 		"block_config": gin.H{
 			"count":           blockCount,
 			"duration_ms":     blockDurationMs,
-			"window_start_ms": dayStart.UnixMilli(),
+			"window_start_ms": windowStart.UnixMilli(),
 		},
 	}
 	if len(authIndexes) > 0 {
