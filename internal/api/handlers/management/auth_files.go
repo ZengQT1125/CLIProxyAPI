@@ -1,8 +1,10 @@
 package management
 
 import (
+	"archive/tar"
 	"archive/zip"
 	"bytes"
+	"compress/gzip"
 	"context"
 	"crypto/sha256"
 	"encoding/hex"
@@ -47,7 +49,10 @@ var lastRefreshKeys = []string{"last_refresh", "lastRefresh", "last_refreshed_at
 const (
 	anthropicCallbackPort = 54545
 	codexCallbackPort     = 1455
-	maxAuthUploadFiles    = 10000
+	maxAuthUploadFiles = 10000
+	// Hard caps against archive bombs when bulk-importing auth archives.
+	maxAuthArchiveUncompressedFile  = 8 << 20   // 8 MiB per entry
+	maxAuthArchiveUncompressedTotal = 512 << 20 // 512 MiB across the archive
 )
 
 type callbackForwarder struct {
@@ -853,7 +858,9 @@ func (h *Handler) DownloadAuthFile(c *gin.Context) {
 	c.Data(200, "application/json", data)
 }
 
-// Upload auth file: multipart or raw JSON with ?name=
+// Upload auth file: multipart (json and/or archives), raw JSON with ?name=.json,
+// or a raw archive body with ?name=.zip|.tar|.tar.gz|.tgz / matching Content-Type.
+// Supported archives: zip, tar, tar.gz/tgz.
 func (h *Handler) UploadAuthFile(c *gin.Context) {
 	if h.authManager == nil {
 		c.JSON(http.StatusServiceUnavailable, gin.H{"error": "core auth manager unavailable"})
@@ -865,13 +872,30 @@ func (h *Handler) UploadAuthFile(c *gin.Context) {
 		h.uploadMultipartAuthFiles(c, ctx)
 		return
 	}
+
 	name := strings.TrimSpace(c.Query("name"))
+	contentType := strings.ToLower(strings.TrimSpace(c.ContentType()))
+	format := detectAuthArchiveFormat(name, contentType)
+	if format != authArchiveUnknown {
+		data, err := io.ReadAll(c.Request.Body)
+		if err != nil {
+			c.JSON(http.StatusBadRequest, gin.H{"error": "failed to read body"})
+			return
+		}
+		if len(data) == 0 {
+			c.JSON(http.StatusBadRequest, gin.H{"error": "empty archive body"})
+			return
+		}
+		h.respondAuthArchiveUpload(c, h.importAuthFilesFromArchiveBytes(ctx, format, data))
+		return
+	}
+
 	if isUnsafeAuthFileName(name) {
 		c.JSON(400, gin.H{"error": "invalid name"})
 		return
 	}
 	if !strings.HasSuffix(strings.ToLower(name), ".json") {
-		c.JSON(400, gin.H{"error": "name must end with .json"})
+		c.JSON(400, gin.H{"error": "name must end with .json, .zip, .tar, .tar.gz, or .tgz"})
 		return
 	}
 	data, err := io.ReadAll(c.Request.Body)
@@ -1158,6 +1182,58 @@ func (h *Handler) deleteFilteredAuthFile(ctx context.Context, candidate filtered
 	return name, http.StatusOK, nil
 }
 
+type authUploadFailure struct {
+	name string
+	err  error
+}
+
+type authArchiveImportResult struct {
+	uploaded int
+	failed   []authUploadFailure
+	// fatal is set when the archive itself is unusable (not per-entry failures).
+	fatal error
+}
+
+type authArchiveFormat int
+
+const (
+	authArchiveUnknown authArchiveFormat = iota
+	authArchiveZip
+	authArchiveTar
+	authArchiveTarGz
+)
+
+func detectAuthArchiveFormat(filename, contentType string) authArchiveFormat {
+	lowerName := strings.ToLower(strings.TrimSpace(filename))
+	// Check compound suffixes first.
+	switch {
+	case strings.HasSuffix(lowerName, ".tar.gz"), strings.HasSuffix(lowerName, ".tgz"):
+		return authArchiveTarGz
+	case strings.HasSuffix(lowerName, ".tar"):
+		return authArchiveTar
+	case strings.HasSuffix(lowerName, ".zip"):
+		return authArchiveZip
+	}
+
+	ct := strings.ToLower(strings.TrimSpace(contentType))
+	switch {
+	case strings.Contains(ct, "application/zip"),
+		strings.Contains(ct, "application/x-zip-compressed"),
+		strings.Contains(ct, "multipart/x-zip"):
+		return authArchiveZip
+	case strings.Contains(ct, "application/gzip"),
+		strings.Contains(ct, "application/x-gzip"),
+		strings.Contains(ct, "application/x-gtar"),
+		strings.Contains(ct, "application/x-tar+gzip"):
+		return authArchiveTarGz
+	case strings.Contains(ct, "application/x-tar"),
+		strings.Contains(ct, "application/tar"):
+		return authArchiveTar
+	default:
+		return authArchiveUnknown
+	}
+}
+
 func (h *Handler) uploadMultipartAuthFiles(c *gin.Context, ctx context.Context) {
 	reader, errReader := c.Request.MultipartReader()
 	if errReader != nil {
@@ -1165,13 +1241,12 @@ func (h *Handler) uploadMultipartAuthFiles(c *gin.Context, ctx context.Context) 
 		return
 	}
 
-	type uploadFailure struct {
-		name string
-		err  error
-	}
 	uploadedCount := 0
-	failed := make([]uploadFailure, 0)
+	failed := make([]authUploadFailure, 0)
+	// Counts logical auth JSON files (archive entries expand into multiple).
 	fileCount := 0
+	// Counts multipart parts that carried a filename (including archive parts).
+	partCount := 0
 	for {
 		part, errNext := reader.NextPart()
 		if errors.Is(errNext, io.EOF) {
@@ -1190,6 +1265,32 @@ func (h *Handler) uploadMultipartAuthFiles(c *gin.Context, ctx context.Context) 
 			continue
 		}
 
+		partCount++
+		baseName := filepath.Base(filename)
+		if format := detectAuthArchiveFormat(baseName, ""); format != authArchiveUnknown {
+			data, errRead := io.ReadAll(part)
+			if errClose := part.Close(); errClose != nil {
+				log.WithError(errClose).Warn("failed to close uploaded auth archive part")
+			}
+			if errRead != nil {
+				failed = append(failed, authUploadFailure{name: baseName, err: fmt.Errorf("failed to read uploaded archive: %w", errRead)})
+				continue
+			}
+			result := h.importAuthFilesFromArchiveBytes(ctx, format, data)
+			if result.fatal != nil {
+				failed = append(failed, authUploadFailure{name: baseName, err: result.fatal})
+				continue
+			}
+			if fileCount+result.uploaded+len(result.failed) > maxAuthUploadFiles {
+				c.JSON(http.StatusRequestEntityTooLarge, gin.H{"error": fmt.Sprintf("too many files: maximum is %d", maxAuthUploadFiles)})
+				return
+			}
+			fileCount += result.uploaded + len(result.failed)
+			uploadedCount += result.uploaded
+			failed = append(failed, result.failed...)
+			continue
+		}
+
 		fileCount++
 		if fileCount > maxAuthUploadFiles {
 			_ = part.Close()
@@ -1202,23 +1303,31 @@ func (h *Handler) uploadMultipartAuthFiles(c *gin.Context, ctx context.Context) 
 			log.WithError(errClose).Warn("failed to close uploaded auth file part")
 		}
 		if errUpload != nil {
-			failed = append(failed, uploadFailure{name: filepath.Base(filename), err: errUpload})
+			failed = append(failed, authUploadFailure{name: baseName, err: errUpload})
 			continue
 		}
 		uploadedCount++
 	}
 
 	switch {
-	case fileCount == 0:
+	case partCount == 0 || (fileCount == 0 && len(failed) == 0):
 		c.JSON(http.StatusBadRequest, gin.H{"error": "no files uploaded"})
-	case fileCount == 1 && len(failed) == 1:
+	case fileCount == 0 && len(failed) == 1:
+		// Single archive/part that produced only a fatal/entry failure with zero successes.
 		failure := failed[0]
 		if errors.Is(failure.err, errAuthFileMustBeJSON) {
-			c.JSON(http.StatusBadRequest, gin.H{"error": "file must be .json"})
+			c.JSON(http.StatusBadRequest, gin.H{"error": "file must be .json, .zip, .tar, .tar.gz, or .tgz"})
+			return
+		}
+		c.JSON(http.StatusBadRequest, gin.H{"error": failure.err.Error()})
+	case fileCount == 1 && len(failed) == 1 && uploadedCount == 0:
+		failure := failed[0]
+		if errors.Is(failure.err, errAuthFileMustBeJSON) {
+			c.JSON(http.StatusBadRequest, gin.H{"error": "file must be .json, .zip, .tar, .tar.gz, or .tgz"})
 			return
 		}
 		c.JSON(http.StatusInternalServerError, gin.H{"error": failure.err.Error()})
-	case fileCount == 1:
+	case fileCount == 1 && uploadedCount == 1 && len(failed) == 0:
 		c.JSON(http.StatusOK, gin.H{"status": "ok"})
 	case len(failed) > 0:
 		failedPayload := make([]gin.H, 0, len(failed))
@@ -1239,8 +1348,264 @@ func (h *Handler) uploadMultipartAuthFiles(c *gin.Context, ctx context.Context) 
 	}
 }
 
+func (h *Handler) respondAuthArchiveUpload(c *gin.Context, result authArchiveImportResult) {
+	if result.fatal != nil {
+		c.JSON(http.StatusBadRequest, gin.H{"error": result.fatal.Error()})
+		return
+	}
+	total := result.uploaded + len(result.failed)
+	switch {
+	case total == 0:
+		c.JSON(http.StatusBadRequest, gin.H{"error": "archive contains no .json auth files"})
+	case result.uploaded == 0 && len(result.failed) == 1:
+		c.JSON(http.StatusBadRequest, gin.H{"error": result.failed[0].err.Error()})
+	case len(result.failed) > 0:
+		failedPayload := make([]gin.H, 0, len(result.failed))
+		for _, failure := range result.failed {
+			failedPayload = append(failedPayload, gin.H{"name": failure.name, "error": failure.err.Error()})
+		}
+		c.JSON(http.StatusMultiStatus, gin.H{
+			"status":   "partial",
+			"uploaded": result.uploaded,
+			"failed":   failedPayload,
+		})
+	case result.uploaded == 1:
+		c.JSON(http.StatusOK, gin.H{"status": "ok"})
+	default:
+		c.JSON(http.StatusOK, gin.H{"status": "ok", "uploaded": result.uploaded})
+	}
+}
+
+func (h *Handler) importAuthFilesFromArchiveBytes(ctx context.Context, format authArchiveFormat, data []byte) authArchiveImportResult {
+	if len(data) == 0 {
+		return authArchiveImportResult{fatal: fmt.Errorf("empty archive body")}
+	}
+	switch format {
+	case authArchiveZip:
+		return h.importAuthFilesFromZipBytes(ctx, data)
+	case authArchiveTar:
+		return h.importAuthFilesFromTarReader(ctx, tar.NewReader(bytes.NewReader(data)))
+	case authArchiveTarGz:
+		gz, err := gzip.NewReader(bytes.NewReader(data))
+		if err != nil {
+			return authArchiveImportResult{fatal: fmt.Errorf("invalid gzip archive: %w", err)}
+		}
+		defer gz.Close()
+		return h.importAuthFilesFromTarReader(ctx, tar.NewReader(gz))
+	default:
+		return authArchiveImportResult{fatal: fmt.Errorf("unsupported archive format")}
+	}
+}
+
+func (h *Handler) importAuthFilesFromZipBytes(ctx context.Context, data []byte) authArchiveImportResult {
+	reader, err := zip.NewReader(bytes.NewReader(data), int64(len(data)))
+	if err != nil {
+		return authArchiveImportResult{fatal: fmt.Errorf("invalid zip archive: %w", err)}
+	}
+	return h.importAuthFilesFromZipReader(ctx, reader)
+}
+
+func (h *Handler) importAuthFilesFromZipReader(ctx context.Context, reader *zip.Reader) authArchiveImportResult {
+	result := authArchiveImportResult{failed: make([]authUploadFailure, 0)}
+	if reader == nil {
+		result.fatal = fmt.Errorf("invalid zip archive")
+		return result
+	}
+
+	var uncompressedTotal int64
+	seen := 0
+	for _, entry := range reader.File {
+		if entry == nil {
+			continue
+		}
+		base, skip, skipErr := authArchiveEntryBaseName(entry.Name, entry.FileInfo().IsDir())
+		if skip {
+			if skipErr != nil {
+				result.failed = append(result.failed, authUploadFailure{name: base, err: skipErr})
+			}
+			continue
+		}
+
+		seen++
+		if seen > maxAuthUploadFiles {
+			result.fatal = fmt.Errorf("too many files: maximum is %d", maxAuthUploadFiles)
+			return result
+		}
+		if entry.UncompressedSize64 > maxAuthArchiveUncompressedFile {
+			result.failed = append(result.failed, authUploadFailure{
+				name: base,
+				err:  fmt.Errorf("file too large: maximum is %d bytes", maxAuthArchiveUncompressedFile),
+			})
+			continue
+		}
+		if uncompressedTotal+int64(entry.UncompressedSize64) > maxAuthArchiveUncompressedTotal {
+			result.fatal = fmt.Errorf("archive uncompressed size exceeds limit of %d bytes", maxAuthArchiveUncompressedTotal)
+			return result
+		}
+
+		rc, errOpen := entry.Open()
+		if errOpen != nil {
+			result.failed = append(result.failed, authUploadFailure{name: base, err: fmt.Errorf("failed to open archive entry: %w", errOpen)})
+			continue
+		}
+		// Cap read to declared size + 1 to detect lying headers.
+		payload, errRead := readAuthArchiveEntry(rc, int64(entry.UncompressedSize64))
+		_ = rc.Close()
+		if errRead != nil {
+			result.failed = append(result.failed, authUploadFailure{name: base, err: errRead})
+			continue
+		}
+		uncompressedTotal += int64(len(payload))
+
+		if errWrite := h.writeAuthFile(ctx, base, payload); errWrite != nil {
+			result.failed = append(result.failed, authUploadFailure{name: base, err: errWrite})
+			continue
+		}
+		result.uploaded++
+	}
+
+	if result.uploaded == 0 && len(result.failed) == 0 {
+		result.fatal = fmt.Errorf("archive contains no .json auth files")
+	}
+	return result
+}
+
+func (h *Handler) importAuthFilesFromTarReader(ctx context.Context, reader *tar.Reader) authArchiveImportResult {
+	result := authArchiveImportResult{failed: make([]authUploadFailure, 0)}
+	if reader == nil {
+		result.fatal = fmt.Errorf("invalid tar archive")
+		return result
+	}
+
+	var uncompressedTotal int64
+	seen := 0
+	for {
+		header, errNext := reader.Next()
+		if errors.Is(errNext, io.EOF) {
+			break
+		}
+		if errNext != nil {
+			result.fatal = fmt.Errorf("invalid tar archive: %w", errNext)
+			return result
+		}
+		if header == nil {
+			continue
+		}
+		isDir := header.Typeflag == tar.TypeDir
+		base, skip, skipErr := authArchiveEntryBaseName(header.Name, isDir)
+		if skip {
+			if skipErr != nil {
+				result.failed = append(result.failed, authUploadFailure{name: base, err: skipErr})
+			}
+			continue
+		}
+		// Only regular files / contiguous files are imported.
+		switch header.Typeflag {
+		case tar.TypeReg, tar.TypeRegA:
+			// ok
+		default:
+			continue
+		}
+
+		seen++
+		if seen > maxAuthUploadFiles {
+			result.fatal = fmt.Errorf("too many files: maximum is %d", maxAuthUploadFiles)
+			return result
+		}
+		if header.Size > maxAuthArchiveUncompressedFile {
+			result.failed = append(result.failed, authUploadFailure{
+				name: base,
+				err:  fmt.Errorf("file too large: maximum is %d bytes", maxAuthArchiveUncompressedFile),
+			})
+			// Drain remaining bytes for this entry so Next() stays aligned.
+			_, _ = io.Copy(io.Discard, io.LimitReader(reader, header.Size))
+			continue
+		}
+		if uncompressedTotal+header.Size > maxAuthArchiveUncompressedTotal {
+			result.fatal = fmt.Errorf("archive uncompressed size exceeds limit of %d bytes", maxAuthArchiveUncompressedTotal)
+			return result
+		}
+
+		payload, errRead := readAuthArchiveEntry(reader, header.Size)
+		if errRead != nil {
+			result.failed = append(result.failed, authUploadFailure{name: base, err: errRead})
+			continue
+		}
+		uncompressedTotal += int64(len(payload))
+
+		if errWrite := h.writeAuthFile(ctx, base, payload); errWrite != nil {
+			result.failed = append(result.failed, authUploadFailure{name: base, err: errWrite})
+			continue
+		}
+		result.uploaded++
+	}
+
+	if result.uploaded == 0 && len(result.failed) == 0 {
+		result.fatal = fmt.Errorf("archive contains no .json auth files")
+	}
+	return result
+}
+
+// authArchiveEntryBaseName normalizes an archive entry path into a safe basename.
+// skip=true means the entry should be ignored (directories, junk, non-json).
+// skipErr is set when the basename is present but unsafe (path traversal / invalid).
+func authArchiveEntryBaseName(name string, isDir bool) (base string, skip bool, skipErr error) {
+	name = strings.TrimSpace(name)
+	if name == "" || isDir || strings.HasSuffix(name, "/") {
+		return "", true, nil
+	}
+	base = filepath.Base(name)
+	if base == "" || base == "." || base == ".." {
+		return "", true, nil
+	}
+	if strings.HasPrefix(base, "._") || strings.EqualFold(base, ".DS_Store") {
+		return base, true, nil
+	}
+	// Only accept the basename; reject absolute/unsafe names (zip/tar slip).
+	if isUnsafeAuthFileName(base) {
+		return base, true, fmt.Errorf("invalid name")
+	}
+	if !strings.HasSuffix(strings.ToLower(base), ".json") {
+		// Non-auth payloads inside the archive are ignored, not fatal.
+		return base, true, nil
+	}
+	return base, false, nil
+}
+
+func readAuthArchiveEntry(r io.Reader, declaredSize int64) ([]byte, error) {
+	limit := int64(maxAuthArchiveUncompressedFile) + 1
+	if declaredSize > 0 && declaredSize+1 < limit {
+		limit = declaredSize + 1
+	}
+	payload, err := io.ReadAll(io.LimitReader(r, limit))
+	if err != nil {
+		return nil, fmt.Errorf("failed to read archive entry: %w", err)
+	}
+	if len(payload) > maxAuthArchiveUncompressedFile {
+		return nil, fmt.Errorf("file too large: maximum is %d bytes", maxAuthArchiveUncompressedFile)
+	}
+	return payload, nil
+}
+
 func (h *Handler) storeUploadedAuthFile(ctx context.Context, filename string, src io.Reader) (string, error) {
 	name := filepath.Base(strings.TrimSpace(filename))
+	if format := detectAuthArchiveFormat(name, ""); format != authArchiveUnknown {
+		data, err := io.ReadAll(src)
+		if err != nil {
+			return "", fmt.Errorf("failed to read uploaded archive: %w", err)
+		}
+		result := h.importAuthFilesFromArchiveBytes(ctx, format, data)
+		if result.fatal != nil {
+			return "", result.fatal
+		}
+		if result.uploaded == 0 && len(result.failed) > 0 {
+			return "", result.failed[0].err
+		}
+		if result.uploaded == 0 {
+			return "", fmt.Errorf("archive contains no .json auth files")
+		}
+		return name, nil
+	}
 	if !strings.HasSuffix(strings.ToLower(name), ".json") {
 		return "", errAuthFileMustBeJSON
 	}

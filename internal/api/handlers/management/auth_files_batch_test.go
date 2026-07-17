@@ -1,7 +1,10 @@
 package management
 
 import (
+	"archive/tar"
+	"archive/zip"
 	"bytes"
+	"compress/gzip"
 	"encoding/json"
 	"fmt"
 	"mime/multipart"
@@ -10,6 +13,7 @@ import (
 	"net/url"
 	"os"
 	"path/filepath"
+	"strings"
 	"testing"
 
 	"github.com/gin-gonic/gin"
@@ -18,6 +22,359 @@ import (
 	sdkAuth "github.com/router-for-me/CLIProxyAPI/v7/sdk/auth"
 	coreauth "github.com/router-for-me/CLIProxyAPI/v7/sdk/cliproxy/auth"
 )
+
+func buildAuthZipArchive(t *testing.T, files map[string]string) []byte {
+	t.Helper()
+	var buf bytes.Buffer
+	archive := zip.NewWriter(&buf)
+	for name, content := range files {
+		writer, errCreate := archive.Create(name)
+		if errCreate != nil {
+			t.Fatalf("create zip entry %s: %v", name, errCreate)
+		}
+		if _, errWrite := writer.Write([]byte(content)); errWrite != nil {
+			t.Fatalf("write zip entry %s: %v", name, errWrite)
+		}
+	}
+	if errClose := archive.Close(); errClose != nil {
+		t.Fatalf("close zip archive: %v", errClose)
+	}
+	return buf.Bytes()
+}
+
+func buildAuthTarArchive(t *testing.T, files map[string]string) []byte {
+	t.Helper()
+	var buf bytes.Buffer
+	archive := tar.NewWriter(&buf)
+	for name, content := range files {
+		payload := []byte(content)
+		header := &tar.Header{
+			Name: name,
+			Mode: 0o600,
+			Size: int64(len(payload)),
+		}
+		if errWrite := archive.WriteHeader(header); errWrite != nil {
+			t.Fatalf("write tar header %s: %v", name, errWrite)
+		}
+		if _, errWrite := archive.Write(payload); errWrite != nil {
+			t.Fatalf("write tar entry %s: %v", name, errWrite)
+		}
+	}
+	if errClose := archive.Close(); errClose != nil {
+		t.Fatalf("close tar archive: %v", errClose)
+	}
+	return buf.Bytes()
+}
+
+func buildAuthTarGzArchive(t *testing.T, files map[string]string) []byte {
+	t.Helper()
+	tarBytes := buildAuthTarArchive(t, files)
+	var buf bytes.Buffer
+	gz := gzip.NewWriter(&buf)
+	if _, errWrite := gz.Write(tarBytes); errWrite != nil {
+		t.Fatalf("write gzip payload: %v", errWrite)
+	}
+	if errClose := gz.Close(); errClose != nil {
+		t.Fatalf("close gzip writer: %v", errClose)
+	}
+	return buf.Bytes()
+}
+
+func TestDetectAuthArchiveFormat(t *testing.T) {
+	t.Parallel()
+	cases := []struct {
+		name        string
+		filename    string
+		contentType string
+		want        authArchiveFormat
+	}{
+		{name: "zip-ext", filename: "bundle.zip", want: authArchiveZip},
+		{name: "tar-ext", filename: "bundle.tar", want: authArchiveTar},
+		{name: "tar-gz-ext", filename: "bundle.tar.gz", want: authArchiveTarGz},
+		{name: "tgz-ext", filename: "bundle.tgz", want: authArchiveTarGz},
+		{name: "json-ext", filename: "auth.json", want: authArchiveUnknown},
+		{name: "zip-ct", contentType: "application/zip", want: authArchiveZip},
+		{name: "tar-ct", contentType: "application/x-tar", want: authArchiveTar},
+		{name: "gzip-ct", contentType: "application/gzip", want: authArchiveTarGz},
+	}
+	for _, tc := range cases {
+		tc := tc
+		t.Run(tc.name, func(t *testing.T) {
+			t.Parallel()
+			if got := detectAuthArchiveFormat(tc.filename, tc.contentType); got != tc.want {
+				t.Fatalf("detectAuthArchiveFormat(%q, %q) = %v, want %v", tc.filename, tc.contentType, got, tc.want)
+			}
+		})
+	}
+}
+
+func TestUploadAuthFile_ZipMultipart(t *testing.T) {
+	t.Setenv("MANAGEMENT_PASSWORD", "")
+	gin.SetMode(gin.TestMode)
+
+	authDir := t.TempDir()
+	manager := coreauth.NewManager(nil, nil, nil)
+	h := NewHandlerWithoutConfigFilePath(&config.Config{AuthDir: authDir}, manager)
+
+	zipBytes := buildAuthZipArchive(t, map[string]string{
+		"nested/xai-alpha@example.com.json": `{"type":"xai","email":"alpha@example.com","access_token":"a"}`,
+		"xai-beta@example.com.json":         `{"type":"xai","email":"beta@example.com","access_token":"b"}`,
+		"readme.txt":                        "ignore me",
+		"__MACOSX/._xai-skip.json":          `{"type":"xai"}`,
+	})
+
+	var body bytes.Buffer
+	writer := multipart.NewWriter(&body)
+	part, errCreate := writer.CreateFormFile("file", "auths.zip")
+	if errCreate != nil {
+		t.Fatalf("create multipart file: %v", errCreate)
+	}
+	if _, errWrite := part.Write(zipBytes); errWrite != nil {
+		t.Fatalf("write multipart zip: %v", errWrite)
+	}
+	if errClose := writer.Close(); errClose != nil {
+		t.Fatalf("close multipart writer: %v", errClose)
+	}
+
+	rec := httptest.NewRecorder()
+	ctx, _ := gin.CreateTestContext(rec)
+	req := httptest.NewRequest(http.MethodPost, "/v0/management/auth-files", &body)
+	req.Header.Set("Content-Type", writer.FormDataContentType())
+	ctx.Request = req
+
+	h.UploadAuthFile(ctx)
+
+	if rec.Code != http.StatusOK {
+		t.Fatalf("upload status = %d, want %d; body = %s", rec.Code, http.StatusOK, rec.Body.String())
+	}
+	var payload map[string]any
+	if errDecode := json.Unmarshal(rec.Body.Bytes(), &payload); errDecode != nil {
+		t.Fatalf("decode response: %v", errDecode)
+	}
+	if got := int(payload["uploaded"].(float64)); got != 2 {
+		t.Fatalf("uploaded = %d, want 2; body = %s", got, rec.Body.String())
+	}
+
+	for _, name := range []string{"xai-alpha@example.com.json", "xai-beta@example.com.json"} {
+		if _, errStat := os.Stat(filepath.Join(authDir, name)); errStat != nil {
+			t.Fatalf("expected extracted auth file %s: %v", name, errStat)
+		}
+	}
+	if got := len(manager.List()); got != 2 {
+		t.Fatalf("registered auth count = %d, want 2", got)
+	}
+}
+
+func TestUploadAuthFile_ZipRawBody(t *testing.T) {
+	t.Setenv("MANAGEMENT_PASSWORD", "")
+	gin.SetMode(gin.TestMode)
+
+	authDir := t.TempDir()
+	manager := coreauth.NewManager(nil, nil, nil)
+	h := NewHandlerWithoutConfigFilePath(&config.Config{AuthDir: authDir}, manager)
+
+	zipBytes := buildAuthZipArchive(t, map[string]string{
+		"xai-one@example.com.json": `{"type":"xai","email":"one@example.com","access_token":"1"}`,
+		"xai-two@example.com.json": `{"type":"xai","email":"two@example.com","access_token":"2"}`,
+	})
+
+	rec := httptest.NewRecorder()
+	ctx, _ := gin.CreateTestContext(rec)
+	req := httptest.NewRequest(
+		http.MethodPost,
+		"/v0/management/auth-files?name="+url.QueryEscape("bundle.zip"),
+		bytes.NewReader(zipBytes),
+	)
+	req.Header.Set("Content-Type", "application/zip")
+	ctx.Request = req
+
+	h.UploadAuthFile(ctx)
+
+	if rec.Code != http.StatusOK {
+		t.Fatalf("upload status = %d, want %d; body = %s", rec.Code, http.StatusOK, rec.Body.String())
+	}
+	var payload map[string]any
+	if errDecode := json.Unmarshal(rec.Body.Bytes(), &payload); errDecode != nil {
+		t.Fatalf("decode response: %v", errDecode)
+	}
+	if got := int(payload["uploaded"].(float64)); got != 2 {
+		t.Fatalf("uploaded = %d, want 2; body = %s", got, rec.Body.String())
+	}
+	if got := len(manager.List()); got != 2 {
+		t.Fatalf("registered auth count = %d, want 2", got)
+	}
+}
+
+func TestUploadAuthFile_ZipRejectsTraversal(t *testing.T) {
+	t.Setenv("MANAGEMENT_PASSWORD", "")
+	gin.SetMode(gin.TestMode)
+
+	authDir := t.TempDir()
+	manager := coreauth.NewManager(nil, nil, nil)
+	h := NewHandlerWithoutConfigFilePath(&config.Config{AuthDir: authDir}, manager)
+
+	// Entry path looks nested/absolute-ish; we only persist basename and reject unsafe basenames.
+	zipBytes := buildAuthZipArchive(t, map[string]string{
+		"../escape.json":               `{"type":"xai","access_token":"bad"}`,
+		"ok/xai-safe@example.com.json": `{"type":"xai","email":"safe@example.com","access_token":"ok"}`,
+	})
+
+	rec := httptest.NewRecorder()
+	ctx, _ := gin.CreateTestContext(rec)
+	req := httptest.NewRequest(http.MethodPost, "/v0/management/auth-files?name=bundle.zip", bytes.NewReader(zipBytes))
+	req.Header.Set("Content-Type", "application/zip")
+	ctx.Request = req
+
+	h.UploadAuthFile(ctx)
+
+	// escape.json basename is safe after filepath.Base, so both may import — ensure no file lands outside authDir.
+	entries, errRead := os.ReadDir(authDir)
+	if errRead != nil {
+		t.Fatalf("read auth dir: %v", errRead)
+	}
+	for _, entry := range entries {
+		if strings.Contains(entry.Name(), "..") || strings.ContainsAny(entry.Name(), `/\`) {
+			t.Fatalf("unsafe file name written: %q", entry.Name())
+		}
+	}
+	// Parent of authDir must not gain escape.json
+	if _, errStat := os.Stat(filepath.Join(filepath.Dir(authDir), "escape.json")); errStat == nil {
+		t.Fatalf("zip slip wrote outside auth dir")
+	}
+	_ = rec
+}
+
+func TestUploadAuthFile_TarMultipart(t *testing.T) {
+	t.Setenv("MANAGEMENT_PASSWORD", "")
+	gin.SetMode(gin.TestMode)
+
+	authDir := t.TempDir()
+	manager := coreauth.NewManager(nil, nil, nil)
+	h := NewHandlerWithoutConfigFilePath(&config.Config{AuthDir: authDir}, manager)
+
+	tarBytes := buildAuthTarArchive(t, map[string]string{
+		"nested/xai-alpha@example.com.json": `{"type":"xai","email":"alpha@example.com","access_token":"a"}`,
+		"xai-beta@example.com.json":         `{"type":"xai","email":"beta@example.com","access_token":"b"}`,
+		"readme.txt":                        "ignore me",
+	})
+
+	var body bytes.Buffer
+	writer := multipart.NewWriter(&body)
+	part, errCreate := writer.CreateFormFile("file", "auths.tar")
+	if errCreate != nil {
+		t.Fatalf("create multipart file: %v", errCreate)
+	}
+	if _, errWrite := part.Write(tarBytes); errWrite != nil {
+		t.Fatalf("write multipart tar: %v", errWrite)
+	}
+	if errClose := writer.Close(); errClose != nil {
+		t.Fatalf("close multipart writer: %v", errClose)
+	}
+
+	rec := httptest.NewRecorder()
+	ctx, _ := gin.CreateTestContext(rec)
+	req := httptest.NewRequest(http.MethodPost, "/v0/management/auth-files", &body)
+	req.Header.Set("Content-Type", writer.FormDataContentType())
+	ctx.Request = req
+
+	h.UploadAuthFile(ctx)
+
+	if rec.Code != http.StatusOK {
+		t.Fatalf("upload status = %d, want %d; body = %s", rec.Code, http.StatusOK, rec.Body.String())
+	}
+	var payload map[string]any
+	if errDecode := json.Unmarshal(rec.Body.Bytes(), &payload); errDecode != nil {
+		t.Fatalf("decode response: %v", errDecode)
+	}
+	if got := int(payload["uploaded"].(float64)); got != 2 {
+		t.Fatalf("uploaded = %d, want 2; body = %s", got, rec.Body.String())
+	}
+	for _, name := range []string{"xai-alpha@example.com.json", "xai-beta@example.com.json"} {
+		if _, errStat := os.Stat(filepath.Join(authDir, name)); errStat != nil {
+			t.Fatalf("expected extracted auth file %s: %v", name, errStat)
+		}
+	}
+	if got := len(manager.List()); got != 2 {
+		t.Fatalf("registered auth count = %d, want 2", got)
+	}
+}
+
+func TestUploadAuthFile_TarGzRawBody(t *testing.T) {
+	t.Setenv("MANAGEMENT_PASSWORD", "")
+	gin.SetMode(gin.TestMode)
+
+	authDir := t.TempDir()
+	manager := coreauth.NewManager(nil, nil, nil)
+	h := NewHandlerWithoutConfigFilePath(&config.Config{AuthDir: authDir}, manager)
+
+	archiveBytes := buildAuthTarGzArchive(t, map[string]string{
+		"nested/xai-one@example.com.json": `{"type":"xai","email":"one@example.com","access_token":"1"}`,
+		"xai-two@example.com.json":        `{"type":"xai","email":"two@example.com","access_token":"2"}`,
+		"notes.md":                        "skip",
+	})
+
+	rec := httptest.NewRecorder()
+	ctx, _ := gin.CreateTestContext(rec)
+	req := httptest.NewRequest(
+		http.MethodPost,
+		"/v0/management/auth-files?name="+url.QueryEscape("bundle.tgz"),
+		bytes.NewReader(archiveBytes),
+	)
+	req.Header.Set("Content-Type", "application/gzip")
+	ctx.Request = req
+
+	h.UploadAuthFile(ctx)
+
+	if rec.Code != http.StatusOK {
+		t.Fatalf("upload status = %d, want %d; body = %s", rec.Code, http.StatusOK, rec.Body.String())
+	}
+	var payload map[string]any
+	if errDecode := json.Unmarshal(rec.Body.Bytes(), &payload); errDecode != nil {
+		t.Fatalf("decode response: %v", errDecode)
+	}
+	if got := int(payload["uploaded"].(float64)); got != 2 {
+		t.Fatalf("uploaded = %d, want 2; body = %s", got, rec.Body.String())
+	}
+	if got := len(manager.List()); got != 2 {
+		t.Fatalf("registered auth count = %d, want 2", got)
+	}
+}
+
+func TestUploadAuthFile_TarRejectsTraversal(t *testing.T) {
+	t.Setenv("MANAGEMENT_PASSWORD", "")
+	gin.SetMode(gin.TestMode)
+
+	authDir := t.TempDir()
+	manager := coreauth.NewManager(nil, nil, nil)
+	h := NewHandlerWithoutConfigFilePath(&config.Config{AuthDir: authDir}, manager)
+
+	tarBytes := buildAuthTarArchive(t, map[string]string{
+		"../escape.json":               `{"type":"xai","access_token":"bad"}`,
+		"ok/xai-safe@example.com.json": `{"type":"xai","email":"safe@example.com","access_token":"ok"}`,
+	})
+
+	rec := httptest.NewRecorder()
+	ctx, _ := gin.CreateTestContext(rec)
+	req := httptest.NewRequest(http.MethodPost, "/v0/management/auth-files?name=bundle.tar", bytes.NewReader(tarBytes))
+	req.Header.Set("Content-Type", "application/x-tar")
+	ctx.Request = req
+
+	h.UploadAuthFile(ctx)
+
+	entries, errRead := os.ReadDir(authDir)
+	if errRead != nil {
+		t.Fatalf("read auth dir: %v", errRead)
+	}
+	for _, entry := range entries {
+		if strings.Contains(entry.Name(), "..") || strings.ContainsAny(entry.Name(), `/\`) {
+			t.Fatalf("unsafe file name written: %q", entry.Name())
+		}
+	}
+	if _, errStat := os.Stat(filepath.Join(filepath.Dir(authDir), "escape.json")); errStat == nil {
+		t.Fatalf("tar slip wrote outside auth dir")
+	}
+	_ = rec
+}
 
 func TestUploadAuthFile_BatchMultipartExceedsDefaultPartLimit(t *testing.T) {
 	t.Setenv("MANAGEMENT_PASSWORD", "")
