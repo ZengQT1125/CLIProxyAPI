@@ -1755,8 +1755,8 @@ func TestXAIExecutorCompactOAuthUsesOfficialAPIHeadersNotCLIProxy(t *testing.T) 
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		gotPath = r.URL.Path
 		gotHost = r.Host
-		gotTokenAuth = r.Header.Get(xaiTokenAuthHeader)
-		gotClientVersion = r.Header.Get(xaiClientVersionHeader)
+		gotTokenAuth = r.Header.Get(xaiauth.CLITokenAuthHeader)
+		gotClientVersion = r.Header.Get(xaiauth.CLIClientVersionHeader)
 		gotUserAgent = r.Header.Get("User-Agent")
 		w.Header().Set("Content-Type", "application/json")
 		_, _ = w.Write([]byte(`{"id":"resp_1","object":"response.compaction","output":[{"type":"compaction","encrypted_content":"opaque-out"}],"usage":{"input_tokens":1,"output_tokens":2,"total_tokens":3}}`))
@@ -1797,10 +1797,10 @@ func TestXAIExecutorCompactOAuthUsesOfficialAPIHeadersNotCLIProxy(t *testing.T) 
 		t.Fatalf("host = %q, want %q", gotHost, wantHost)
 	}
 	if gotTokenAuth != "" {
-		t.Fatalf("%s = %q, want empty on compact (not CLI proxy)", xaiTokenAuthHeader, gotTokenAuth)
+		t.Fatalf("%s = %q, want empty on compact (not CLI proxy)", xaiauth.CLITokenAuthHeader, gotTokenAuth)
 	}
 	if gotClientVersion != "" {
-		t.Fatalf("%s = %q, want empty on compact", xaiClientVersionHeader, gotClientVersion)
+		t.Fatalf("%s = %q, want empty on compact", xaiauth.CLIClientVersionHeader, gotClientVersion)
 	}
 	if strings.Contains(gotUserAgent, "xai-grok-workspace/") {
 		t.Fatalf("User-Agent = %q, want no CLI workspace UA on compact", gotUserAgent)
