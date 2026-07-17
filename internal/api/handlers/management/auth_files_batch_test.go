@@ -14,6 +14,7 @@ import (
 
 	"github.com/gin-gonic/gin"
 	"github.com/router-for-me/CLIProxyAPI/v7/internal/config"
+	"github.com/router-for-me/CLIProxyAPI/v7/internal/watcher"
 	sdkAuth "github.com/router-for-me/CLIProxyAPI/v7/sdk/auth"
 	coreauth "github.com/router-for-me/CLIProxyAPI/v7/sdk/cliproxy/auth"
 )
@@ -124,6 +125,63 @@ func TestUploadAuthFile_BatchMultipart(t *testing.T) {
 	auths := manager.List()
 	if len(auths) != len(files) {
 		t.Fatalf("expected %d auth entries, got %d", len(files), len(auths))
+	}
+}
+
+func TestUploadAuthFile_WatcherBackedBatchDefersRuntimeLoading(t *testing.T) {
+	t.Setenv("MANAGEMENT_PASSWORD", "")
+	gin.SetMode(gin.TestMode)
+
+	authDir := t.TempDir()
+	manager := coreauth.NewManager(nil, nil, nil)
+	h := NewHandlerWithoutConfigFilePath(&config.Config{AuthDir: authDir}, manager)
+	h.SetAuthLoadStatusProvider(func() watcher.AuthLoadStatus {
+		return watcher.AuthLoadStatus{State: watcher.AuthLoadStateReady}
+	})
+
+	var body bytes.Buffer
+	writer := multipart.NewWriter(&body)
+	for _, name := range []string{"alpha.json", "beta.json"} {
+		part, errCreate := writer.CreateFormFile("file", name)
+		if errCreate != nil {
+			t.Fatalf("create multipart file: %v", errCreate)
+		}
+		if _, errWrite := part.Write([]byte(`{"type":"codex","access_token":"token"}`)); errWrite != nil {
+			t.Fatalf("write multipart file: %v", errWrite)
+		}
+	}
+	if errClose := writer.Close(); errClose != nil {
+		t.Fatalf("close multipart writer: %v", errClose)
+	}
+
+	rec := httptest.NewRecorder()
+	ctx, _ := gin.CreateTestContext(rec)
+	req := httptest.NewRequest(http.MethodPost, "/v0/management/auth-files", &body)
+	req.Header.Set("Content-Type", writer.FormDataContentType())
+	ctx.Request = req
+
+	h.UploadAuthFile(ctx)
+
+	if rec.Code != http.StatusOK {
+		t.Fatalf("upload status = %d, want %d; body = %s", rec.Code, http.StatusOK, rec.Body.String())
+	}
+	if got := len(manager.List()); got != 0 {
+		t.Fatalf("synchronously registered auth count = %d, want 0", got)
+	}
+	for _, name := range []string{"alpha.json", "beta.json"} {
+		if _, errStat := os.Stat(filepath.Join(authDir, name)); errStat != nil {
+			t.Fatalf("uploaded file %s was not persisted: %v", name, errStat)
+		}
+	}
+	var payload map[string]any
+	if errDecode := json.Unmarshal(rec.Body.Bytes(), &payload); errDecode != nil {
+		t.Fatalf("decode response: %v", errDecode)
+	}
+	if got := int(payload["uploaded"].(float64)); got != 2 {
+		t.Fatalf("uploaded count = %d, want 2", got)
+	}
+	if _, returnedFiles := payload["files"]; returnedFiles {
+		t.Fatalf("response returned uploaded file details: %s", rec.Body.String())
 	}
 }
 

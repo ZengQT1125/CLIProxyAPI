@@ -2348,8 +2348,8 @@ func TestXAIExecutorExecuteImagesUsesImagesEndpointAndPublishesUsage(t *testing.
 		gotPath = r.URL.Path
 		gotAuth = r.Header.Get("Authorization")
 		gotAccept = r.Header.Get("Accept")
-		gotTokenAuth = r.Header.Get(xaiTokenAuthHeader)
-		gotClientVersion = r.Header.Get(xaiClientVersionHeader)
+		gotTokenAuth = r.Header.Get(xaiauth.CLITokenAuthHeader)
+		gotClientVersion = r.Header.Get(xaiauth.CLIClientVersionHeader)
 		var errRead error
 		gotBody, errRead = io.ReadAll(r.Body)
 		if errRead != nil {
@@ -2398,10 +2398,10 @@ func TestXAIExecutorExecuteImagesUsesImagesEndpointAndPublishesUsage(t *testing.
 		t.Fatalf("Accept = %q, want application/json", gotAccept)
 	}
 	if gotTokenAuth != "" {
-		t.Fatalf("%s = %q, want empty on media path", xaiTokenAuthHeader, gotTokenAuth)
+		t.Fatalf("%s = %q, want empty on media path", xaiauth.CLITokenAuthHeader, gotTokenAuth)
 	}
 	if gotClientVersion != "" {
-		t.Fatalf("%s = %q, want empty on media path", xaiClientVersionHeader, gotClientVersion)
+		t.Fatalf("%s = %q, want empty on media path", xaiauth.CLIClientVersionHeader, gotClientVersion)
 	}
 	if string(gotBody) != `{"model":"grok-imagine-image-quality","prompt":"draw"}` {
 		t.Fatalf("body = %s", string(gotBody))
@@ -4224,11 +4224,11 @@ func TestApplyXAIChatHeaders(t *testing.T) {
 		if got := req.Header.Get("x-grok-conv-id"); got != "conv-1" {
 			t.Fatalf("x-grok-conv-id = %q, want conv-1", got)
 		}
-		if got := req.Header.Get(xaiTokenAuthHeader); got != "" {
-			t.Fatalf("%s = %q, want empty for official API", xaiTokenAuthHeader, got)
+		if got := req.Header.Get(xaiauth.CLITokenAuthHeader); got != "" {
+			t.Fatalf("%s = %q, want empty for official API", xaiauth.CLITokenAuthHeader, got)
 		}
-		if got := req.Header.Get(xaiClientVersionHeader); got != "" {
-			t.Fatalf("%s = %q, want empty for official API", xaiClientVersionHeader, got)
+		if got := req.Header.Get(xaiauth.CLIClientVersionHeader); got != "" {
+			t.Fatalf("%s = %q, want empty for official API", xaiauth.CLIClientVersionHeader, got)
 		}
 		if got := req.Header.Get("User-Agent"); got != "" {
 			t.Fatalf("User-Agent = %q, want empty for official API", got)
@@ -4251,14 +4251,14 @@ func TestApplyXAIChatHeaders(t *testing.T) {
 		if got := req.Header.Get("x-grok-conv-id"); got != "conv-1" {
 			t.Fatalf("x-grok-conv-id = %q, want conv-1", got)
 		}
-		if got := req.Header.Get(xaiTokenAuthHeader); got != xaiTokenAuthValue {
-			t.Fatalf("%s = %q, want %q", xaiTokenAuthHeader, got, xaiTokenAuthValue)
+		if got := req.Header.Get(xaiauth.CLITokenAuthHeader); got != xaiauth.CLITokenAuthValue {
+			t.Fatalf("%s = %q, want %q", xaiauth.CLITokenAuthHeader, got, xaiauth.CLITokenAuthValue)
 		}
-		if got := req.Header.Get(xaiClientVersionHeader); got != xaiClientVersionValue {
-			t.Fatalf("%s = %q, want %q", xaiClientVersionHeader, got, xaiClientVersionValue)
+		if got := req.Header.Get(xaiauth.CLIClientVersionHeader); got != xaiauth.CLIClientVersion {
+			t.Fatalf("%s = %q, want %q", xaiauth.CLIClientVersionHeader, got, xaiauth.CLIClientVersion)
 		}
-		if got := req.Header.Get("User-Agent"); got != "xai-grok-workspace/"+xaiClientVersionValue {
-			t.Fatalf("User-Agent = %q, want xai-grok-workspace/%s", got, xaiClientVersionValue)
+		if got := req.Header.Get("User-Agent"); got != "xai-grok-workspace/"+xaiauth.CLIClientVersion {
+			t.Fatalf("User-Agent = %q, want xai-grok-workspace/%s", got, xaiauth.CLIClientVersion)
 		}
 	})
 
@@ -4272,11 +4272,11 @@ func TestApplyXAIChatHeaders(t *testing.T) {
 		}
 		applyXAIChatHeaders(req, auth, "xai-token", false, "")
 
-		if got := req.Header.Get(xaiTokenAuthHeader); got != "" {
-			t.Fatalf("%s = %q, want empty for custom gateway", xaiTokenAuthHeader, got)
+		if got := req.Header.Get(xaiauth.CLITokenAuthHeader); got != "" {
+			t.Fatalf("%s = %q, want empty for custom gateway", xaiauth.CLITokenAuthHeader, got)
 		}
-		if got := req.Header.Get(xaiClientVersionHeader); got != "" {
-			t.Fatalf("%s = %q, want empty for custom gateway", xaiClientVersionHeader, got)
+		if got := req.Header.Get(xaiauth.CLIClientVersionHeader); got != "" {
+			t.Fatalf("%s = %q, want empty for custom gateway", xaiauth.CLIClientVersionHeader, got)
 		}
 		if got := req.Header.Get("User-Agent"); got != "" {
 			t.Fatalf("User-Agent = %q, want empty for custom gateway", got)
@@ -4287,19 +4287,19 @@ func TestApplyXAIChatHeaders(t *testing.T) {
 		req := httptest.NewRequest(http.MethodPost, xaiauth.CLIChatProxyBaseURL+"/responses", nil)
 		auth := &cliproxyauth.Auth{
 			Attributes: map[string]string{
-				"base_url":                         xaiauth.CLIChatProxyBaseURL,
-				xaiUsingAPIAttr:                    "false",
-				"header:" + xaiTokenAuthHeader:     "custom-token-auth",
-				"header:" + xaiClientVersionHeader: "custom-client-version",
+				"base_url":                                 xaiauth.CLIChatProxyBaseURL,
+				xaiUsingAPIAttr:                            "false",
+				"header:" + xaiauth.CLITokenAuthHeader:     "custom-token-auth",
+				"header:" + xaiauth.CLIClientVersionHeader: "custom-client-version",
 			},
 		}
 		applyXAIChatHeaders(req, auth, "xai-token", true, "")
 
-		if got := req.Header.Get(xaiTokenAuthHeader); got != "custom-token-auth" {
-			t.Fatalf("%s = %q, want custom-token-auth", xaiTokenAuthHeader, got)
+		if got := req.Header.Get(xaiauth.CLITokenAuthHeader); got != "custom-token-auth" {
+			t.Fatalf("%s = %q, want custom-token-auth", xaiauth.CLITokenAuthHeader, got)
 		}
-		if got := req.Header.Get(xaiClientVersionHeader); got != "custom-client-version" {
-			t.Fatalf("%s = %q, want custom-client-version", xaiClientVersionHeader, got)
+		if got := req.Header.Get(xaiauth.CLIClientVersionHeader); got != "custom-client-version" {
+			t.Fatalf("%s = %q, want custom-client-version", xaiauth.CLIClientVersionHeader, got)
 		}
 	})
 
@@ -4313,11 +4313,11 @@ func TestApplyXAIChatHeaders(t *testing.T) {
 		}
 		applyXAIChatHeaders(req, auth, "xai-token", true, "")
 
-		if got := req.Header.Get(xaiTokenAuthHeader); got != xaiTokenAuthValue {
-			t.Fatalf("%s = %q, want %q", xaiTokenAuthHeader, got, xaiTokenAuthValue)
+		if got := req.Header.Get(xaiauth.CLITokenAuthHeader); got != xaiauth.CLITokenAuthValue {
+			t.Fatalf("%s = %q, want %q", xaiauth.CLITokenAuthHeader, got, xaiauth.CLITokenAuthValue)
 		}
-		if got := req.Header.Get(xaiClientVersionHeader); got != xaiClientVersionValue {
-			t.Fatalf("%s = %q, want %q", xaiClientVersionHeader, got, xaiClientVersionValue)
+		if got := req.Header.Get(xaiauth.CLIClientVersionHeader); got != xaiauth.CLIClientVersion {
+			t.Fatalf("%s = %q, want %q", xaiauth.CLIClientVersionHeader, got, xaiauth.CLIClientVersion)
 		}
 	})
 }
@@ -4326,8 +4326,8 @@ func TestXAIExecutorExecuteChatUsesProxyHeadersOnlyForChatProxy(t *testing.T) {
 	var gotTokenAuth string
 	var gotClientVersion string
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		gotTokenAuth = r.Header.Get(xaiTokenAuthHeader)
-		gotClientVersion = r.Header.Get(xaiClientVersionHeader)
+		gotTokenAuth = r.Header.Get(xaiauth.CLITokenAuthHeader)
+		gotClientVersion = r.Header.Get(xaiauth.CLIClientVersionHeader)
 		w.Header().Set("Content-Type", "text/event-stream")
 		_, _ = w.Write([]byte("data: {\"type\":\"response.completed\",\"response\":{\"id\":\"resp_1\",\"object\":\"response\",\"created_at\":0,\"status\":\"completed\",\"model\":\"grok-4.3\",\"output\":[{\"type\":\"message\",\"role\":\"assistant\",\"content\":[{\"type\":\"output_text\",\"text\":\"ok\"}]}],\"usage\":{\"input_tokens\":1,\"output_tokens\":1,\"total_tokens\":2}}}\n\n"))
 	}))
@@ -4353,10 +4353,10 @@ func TestXAIExecutorExecuteChatUsesProxyHeadersOnlyForChatProxy(t *testing.T) {
 		t.Fatalf("Execute() error = %v", err)
 	}
 	if gotTokenAuth != "" {
-		t.Fatalf("%s = %q, want empty for custom chat gateway", xaiTokenAuthHeader, gotTokenAuth)
+		t.Fatalf("%s = %q, want empty for custom chat gateway", xaiauth.CLITokenAuthHeader, gotTokenAuth)
 	}
 	if gotClientVersion != "" {
-		t.Fatalf("%s = %q, want empty for custom chat gateway", xaiClientVersionHeader, gotClientVersion)
+		t.Fatalf("%s = %q, want empty for custom chat gateway", xaiauth.CLIClientVersionHeader, gotClientVersion)
 	}
 }
 

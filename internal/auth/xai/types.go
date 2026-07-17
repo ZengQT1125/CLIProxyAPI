@@ -11,6 +11,18 @@ const (
 	// CLIChatProxyBaseURL is the Grok CLI chat-proxy base URL for non-image/video
 	// HTTP chat when auth using_api is false, including the OAuth default.
 	CLIChatProxyBaseURL = "https://cli-chat-proxy.grok.com/v1"
+	// CLIBillingPath is the Grok CLI billing endpoint used for quota checks.
+	CLIBillingPath = "/billing"
+	// CLITokenAuthHeader identifies the Grok CLI token-auth scheme.
+	CLITokenAuthHeader = "X-XAI-Token-Auth"
+	// CLITokenAuthValue is the required Grok CLI token-auth value.
+	CLITokenAuthValue = "xai-grok-cli"
+	// CLIClientVersionHeader carries the Grok CLI protocol version.
+	CLIClientVersionHeader = "x-grok-client-version"
+	// CLIClientVersion must stay aligned with the Grok CLI version expected by chat-proxy.
+	CLIClientVersion = "0.2.93"
+	// CLIUserAgent identifies CLIProxyAPI requests to Grok chat-proxy endpoints.
+	CLIUserAgent = "xai-grok-workspace/" + CLIClientVersion
 	// Issuer is xAI's OAuth issuer.
 	Issuer = "https://auth.x.ai"
 	// DiscoveryURL is the OIDC discovery endpoint used to resolve OAuth endpoints.

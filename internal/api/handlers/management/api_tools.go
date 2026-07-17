@@ -2,6 +2,7 @@ package management
 
 import (
 	"context"
+	"crypto/sha256"
 	"encoding/json"
 	"fmt"
 	"io"
@@ -15,7 +16,9 @@ import (
 
 	"github.com/gin-gonic/gin"
 	"github.com/router-for-me/CLIProxyAPI/v7/internal/auth/codex"
+	xaiauth "github.com/router-for-me/CLIProxyAPI/v7/internal/auth/xai"
 	"github.com/router-for-me/CLIProxyAPI/v7/internal/config"
+	"github.com/router-for-me/CLIProxyAPI/v7/internal/util"
 	coreauth "github.com/router-for-me/CLIProxyAPI/v7/sdk/cliproxy/auth"
 	"github.com/router-for-me/CLIProxyAPI/v7/sdk/proxyutil"
 	log "github.com/sirupsen/logrus"
@@ -657,18 +660,18 @@ type authCleanupRequest struct {
 // isAuthCleanupProviderSupported reports whether the management API can probe
 // credentials of this provider for invalid-token cleanup.
 func isAuthCleanupProviderSupported(provider string) bool {
-	return normalizeAuthCleanupProvider(provider) == "codex"
+	switch normalizeAuthCleanupProvider(provider) {
+	case "codex", "xai":
+		return true
+	default:
+		return false
+	}
 }
 
 // authCleanupUnsupportedMessage returns a stable user-facing error for providers
 // that are intentionally not cleaned up by this endpoint.
 func authCleanupUnsupportedMessage(provider string) string {
-	switch normalizeAuthCleanupProvider(provider) {
-	case "xai":
-		return "xai credential cleanup is not supported yet"
-	default:
-		return fmt.Sprintf("unsupported cleanup provider: %s", provider)
-	}
+	return fmt.Sprintf("unsupported cleanup provider: %s", provider)
 }
 
 func normalizeAuthCleanupProvider(provider string) string {
@@ -694,7 +697,7 @@ func parseAuthCleanupProvider(c *gin.Context) string {
 	return provider
 }
 
-// CleanupCodexAuth verifies Codex credentials and removes invalid ones.
+// CleanupCodexAuth verifies provider credentials and removes invalid ones.
 //
 // Endpoint:
 //
@@ -708,12 +711,11 @@ func parseAuthCleanupProvider(c *gin.Context) string {
 //
 //	?provider=codex
 //
-// Provider defaults to "codex" when omitted. xAI and other providers return
-// "not supported yet" / unsupported without probing or deleting credentials.
+// Provider defaults to "codex" when omitted. Supported providers are codex and xai.
 //
-// For each enabled Codex credential, sends a verification request. 4xx client
-// errors delete the credential. 5xx responses and request errors are treated as
-// transient upstream failures and keep the credential.
+// Codex credentials are deleted on 4xx verification responses. xAI credentials
+// are checked through the CLI billing endpoint and deleted only on HTTP 401.
+// Other responses and request errors keep the credential.
 //
 // Response: NDJSON stream (application/x-ndjson), one JSON object per line:
 //
@@ -749,6 +751,9 @@ func (h *Handler) CleanupCodexAuth(c *gin.Context) {
 		if auth.Disabled {
 			continue
 		}
+		if !isAuthCleanupCandidate(provider, auth) {
+			continue
+		}
 		auth.EnsureIndex()
 		targetAuths = append(targetAuths, auth)
 	}
@@ -780,10 +785,15 @@ func (h *Handler) CleanupCodexAuth(c *gin.Context) {
 
 		if result.shouldDelete {
 			log.Infof("[auth-cleanup] provider=%s %s: token invalid (status %d), removing", provider, result.name, result.statusCode)
-			if delErr := h.removeCodexAuth(ctx, result.auth); delErr != nil {
+			removed, delErr := h.removeVerifiedCleanupAuth(ctx, result)
+			if delErr != nil {
 				log.Errorf("[auth-cleanup] provider=%s %s: delete failed: %v", provider, result.name, delErr)
 				ev["deleted"] = false
 				ev["error"] = delErr.Error()
+			} else if !removed {
+				log.Infof("[auth-cleanup] provider=%s %s: credential changed during verification, keeping it", provider, result.name)
+				ev["deleted"] = false
+				ev["skipped"] = "credential_changed"
 			} else {
 				log.Infof("[auth-cleanup] provider=%s %s: deleted successfully", provider, result.name)
 				ev["deleted"] = true
@@ -791,7 +801,7 @@ func (h *Handler) CleanupCodexAuth(c *gin.Context) {
 			}
 		} else {
 			ev["deleted"] = false
-			if result.statusCode >= http.StatusInternalServerError {
+			if result.statusCode >= http.StatusBadRequest {
 				log.Warnf("[auth-cleanup] provider=%s %s: verify returned status %d, keeping credential", provider, result.name, result.statusCode)
 			} else {
 				log.Debugf("[auth-cleanup] provider=%s %s: valid (status %d)", provider, result.name, result.statusCode)
@@ -817,6 +827,7 @@ type authCleanupVerifyResult struct {
 	name         string
 	statusCode   int
 	shouldDelete bool
+	tokenHash    [sha256.Size]byte
 	verifyErr    error
 	event        gin.H
 }
@@ -874,6 +885,20 @@ func authCleanupWorkerCount(total int) int {
 	return authCleanupMaxConcurrency
 }
 
+func isAuthCleanupCandidate(provider string, auth *coreauth.Auth) bool {
+	if auth == nil {
+		return false
+	}
+	fileBacked := strings.TrimSpace(authAttribute(auth, "path")) != "" || strings.TrimSpace(auth.FileName) != ""
+	if !fileBacked {
+		return false
+	}
+	if normalizeAuthCleanupProvider(provider) == "xai" {
+		return auth.AuthKind() == coreauth.AuthKindOAuth
+	}
+	return true
+}
+
 func (h *Handler) verifyAuthForCleanup(ctx context.Context, job authCleanupJob) authCleanupVerifyResult {
 	ev := gin.H{
 		"type":       "progress",
@@ -900,6 +925,7 @@ func (h *Handler) verifyAuthForCleanup(ctx context.Context, job authCleanupJob) 
 		result.verifyErr = fmt.Errorf("%s", errMsg)
 		return result
 	}
+	result.tokenHash = sha256.Sum256([]byte(token))
 
 	statusCode, verifyErr := h.verifyProviderToken(ctx, job.provider, job.auth, token)
 	ev["status_code"] = statusCode
@@ -911,14 +937,27 @@ func (h *Handler) verifyAuthForCleanup(ctx context.Context, job authCleanupJob) 
 		return result
 	}
 
-	result.shouldDelete = statusCode >= http.StatusBadRequest && statusCode < http.StatusInternalServerError
+	result.shouldDelete = shouldDeleteCleanupAuth(job.provider, statusCode)
 	return result
+}
+
+func shouldDeleteCleanupAuth(provider string, statusCode int) bool {
+	switch normalizeAuthCleanupProvider(provider) {
+	case "codex":
+		return statusCode >= http.StatusBadRequest && statusCode < http.StatusInternalServerError
+	case "xai":
+		return statusCode == http.StatusUnauthorized
+	default:
+		return false
+	}
 }
 
 func (h *Handler) verifyProviderToken(ctx context.Context, provider string, auth *coreauth.Auth, token string) (int, error) {
 	switch normalizeAuthCleanupProvider(provider) {
 	case "codex":
 		return h.verifyCodexToken(ctx, auth, token, extractCodexAccountID(auth))
+	case "xai":
+		return h.verifyXAIToken(ctx, auth, token)
 	default:
 		return 0, fmt.Errorf("unsupported cleanup provider: %s", provider)
 	}
@@ -944,24 +983,121 @@ func (h *Handler) verifyCodexToken(ctx context.Context, auth *coreauth.Auth, tok
 	if err != nil {
 		return 0, fmt.Errorf("request failed: %w", err)
 	}
-	defer func() { _ = resp.Body.Close() }()
+	defer func() {
+		if errClose := resp.Body.Close(); errClose != nil {
+			log.Warnf("[auth-cleanup] codex verify response close failed: %v", errClose)
+		}
+	}()
 
 	_, _ = io.Copy(io.Discard, resp.Body)
 
 	return resp.StatusCode, nil
 }
 
+func (h *Handler) verifyXAIToken(ctx context.Context, auth *coreauth.Auth, token string) (int, error) {
+	baseURL := xaiCleanupBaseURL(auth)
+	verifyURL := strings.TrimRight(baseURL, "/") + xaiauth.CLIBillingPath
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, verifyURL, nil)
+	if err != nil {
+		return 0, fmt.Errorf("failed to build request: %w", err)
+	}
+	req.Header.Set("Authorization", "Bearer "+token)
+	req.Header.Set("Accept", "application/json")
+	req.Header.Set("Content-Type", "application/json")
+	req.Header.Set(xaiauth.CLITokenAuthHeader, xaiauth.CLITokenAuthValue)
+	req.Header.Set(xaiauth.CLIClientVersionHeader, xaiauth.CLIClientVersion)
+	req.Header.Set("User-Agent", xaiauth.CLIUserAgent)
+	if auth != nil {
+		util.ApplyCustomHeadersFromAttrs(req, auth.Attributes)
+	}
+
+	client := &http.Client{
+		Timeout:   defaultAPICallTimeout,
+		Transport: h.apiCallTransport(auth),
+	}
+	resp, err := client.Do(req)
+	if err != nil {
+		return 0, fmt.Errorf("request failed: %w", err)
+	}
+	defer func() {
+		if errClose := resp.Body.Close(); errClose != nil {
+			log.Warnf("[auth-cleanup] xai verify response close failed: %v", errClose)
+		}
+	}()
+
+	_, _ = io.Copy(io.Discard, resp.Body)
+	return resp.StatusCode, nil
+}
+
+func xaiCleanupBaseURL(auth *coreauth.Auth) string {
+	baseURL := strings.TrimSpace(authAttribute(auth, "base_url"))
+	if baseURL == "" && auth != nil && auth.Metadata != nil {
+		if raw, ok := auth.Metadata["base_url"].(string); ok {
+			baseURL = strings.TrimSpace(raw)
+		}
+	}
+	normalized := strings.TrimRight(baseURL, "/")
+	if normalized == "" || strings.EqualFold(normalized, strings.TrimRight(xaiauth.DefaultAPIBaseURL, "/")) {
+		return xaiauth.CLIChatProxyBaseURL
+	}
+	return normalized
+}
+
+func (h *Handler) removeVerifiedCleanupAuth(ctx context.Context, result authCleanupVerifyResult) (bool, error) {
+	if h == nil || h.authManager == nil || result.auth == nil {
+		return false, nil
+	}
+	authID := strings.TrimSpace(result.auth.ID)
+	if authID == "" {
+		return false, nil
+	}
+	expectedPath := h.cleanupAuthPath(result.auth)
+	var matchErr error
+	removed, errRemove := h.authManager.RemoveIf(ctx, authID, func(current *coreauth.Auth) bool {
+		if current == nil || !strings.EqualFold(strings.TrimSpace(current.Provider), strings.TrimSpace(result.auth.Provider)) {
+			return false
+		}
+		if !sameAuthFilePath(h.cleanupAuthPath(current), expectedPath) {
+			return false
+		}
+		currentToken, errToken := h.resolveTokenForAuth(ctx, current)
+		if errToken != nil || currentToken == "" {
+			if errToken != nil {
+				matchErr = fmt.Errorf("failed to re-resolve current token: %w", errToken)
+			}
+			return false
+		}
+		return sha256.Sum256([]byte(currentToken)) == result.tokenHash
+	}, func(current *coreauth.Auth) error {
+		return h.deleteAuthBacking(ctx, current)
+	})
+	if errRemove != nil {
+		return false, errRemove
+	}
+	if matchErr != nil {
+		return false, matchErr
+	}
+	return removed, nil
+}
+
 // removeCodexAuth deletes a credential file and its runtime auth record.
 // Name kept for historical call sites; works for any provider auth file.
 func (h *Handler) removeCodexAuth(ctx context.Context, auth *coreauth.Auth) error {
-	path := strings.TrimSpace(authAttribute(auth, "path"))
-	if path == "" {
-		path = filepath.Join(h.cfg.AuthDir, auth.FileName)
+	if errDelete := h.deleteAuthBacking(ctx, auth); errDelete != nil {
+		return errDelete
 	}
-	if !filepath.IsAbs(path) {
-		if abs, err := filepath.Abs(path); err == nil {
-			path = abs
-		}
+	id := strings.TrimSpace(auth.ID)
+	if id == "" {
+		id = h.cleanupAuthPath(auth)
+	}
+	h.removeAuth(ctx, id)
+	return nil
+}
+
+func (h *Handler) deleteAuthBacking(ctx context.Context, auth *coreauth.Auth) error {
+	path := h.cleanupAuthPath(auth)
+	if path == "" {
+		return fmt.Errorf("auth path is empty")
 	}
 	if err := os.Remove(path); err != nil && !os.IsNotExist(err) {
 		return fmt.Errorf("failed to remove file: %w", err)
@@ -970,12 +1106,23 @@ func (h *Handler) removeCodexAuth(ctx context.Context, auth *coreauth.Auth) erro
 	if err := h.deleteTokenRecord(ctx, path); err != nil {
 		return fmt.Errorf("failed to delete token record: %w", err)
 	}
-	id := strings.TrimSpace(auth.ID)
-	if id == "" {
-		id = path
-	}
-	h.removeAuth(ctx, id)
 	return nil
+}
+
+func (h *Handler) cleanupAuthPath(auth *coreauth.Auth) string {
+	if auth == nil {
+		return ""
+	}
+	path := strings.TrimSpace(authAttribute(auth, "path"))
+	if path == "" && h != nil && h.cfg != nil && strings.TrimSpace(auth.FileName) != "" {
+		path = filepath.Join(h.cfg.AuthDir, auth.FileName)
+	}
+	if path != "" && !filepath.IsAbs(path) {
+		if abs, errAbs := filepath.Abs(path); errAbs == nil {
+			path = abs
+		}
+	}
+	return path
 }
 
 func extractCodexAccountID(auth *coreauth.Auth) string {

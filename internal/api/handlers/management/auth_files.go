@@ -1169,7 +1169,7 @@ func (h *Handler) uploadMultipartAuthFiles(c *gin.Context, ctx context.Context) 
 		name string
 		err  error
 	}
-	uploaded := make([]string, 0)
+	uploadedCount := 0
 	failed := make([]uploadFailure, 0)
 	fileCount := 0
 	for {
@@ -1197,7 +1197,7 @@ func (h *Handler) uploadMultipartAuthFiles(c *gin.Context, ctx context.Context) 
 			return
 		}
 
-		name, errUpload := h.storeUploadedAuthFile(ctx, filename, part)
+		_, errUpload := h.storeUploadedAuthFile(ctx, filename, part)
 		if errClose := part.Close(); errClose != nil {
 			log.WithError(errClose).Warn("failed to close uploaded auth file part")
 		}
@@ -1205,7 +1205,7 @@ func (h *Handler) uploadMultipartAuthFiles(c *gin.Context, ctx context.Context) 
 			failed = append(failed, uploadFailure{name: filepath.Base(filename), err: errUpload})
 			continue
 		}
-		uploaded = append(uploaded, name)
+		uploadedCount++
 	}
 
 	switch {
@@ -1231,12 +1231,11 @@ func (h *Handler) uploadMultipartAuthFiles(c *gin.Context, ctx context.Context) 
 		}
 		c.JSON(http.StatusMultiStatus, gin.H{
 			"status":   "partial",
-			"uploaded": len(uploaded),
-			"files":    uploaded,
+			"uploaded": uploadedCount,
 			"failed":   failedPayload,
 		})
 	default:
-		c.JSON(http.StatusOK, gin.H{"status": "ok", "uploaded": len(uploaded), "files": uploaded})
+		c.JSON(http.StatusOK, gin.H{"status": "ok", "uploaded": uploadedCount})
 	}
 }
 
@@ -1263,18 +1262,39 @@ func (h *Handler) writeAuthFile(ctx context.Context, name string, data []byte) e
 		}
 	}
 	data = fillMissingAuthEmailFromFileName(name, data)
-	auth, err := h.buildAuthFromFileData(dst, data)
-	if err != nil {
-		return err
+	watcherManaged := h.authFileLoadingManagedByWatcher()
+	var auth *coreauth.Auth
+	if watcherManaged {
+		if _, errDecode := decodeAuthFileMetadata(data); errDecode != nil {
+			return errDecode
+		}
+	} else {
+		var errBuild error
+		auth, errBuild = h.buildAuthFromFileData(dst, data)
+		if errBuild != nil {
+			return errBuild
+		}
 	}
 	if errWrite := os.WriteFile(dst, data, 0o600); errWrite != nil {
 		return fmt.Errorf("failed to write file: %w", errWrite)
 	}
 	h.notifyAuthFileMutation(dst)
+	if watcherManaged {
+		return nil
+	}
 	if err := h.upsertAuthRecord(coreauth.WithAuthMaterialReplacement(ctx), auth); err != nil {
 		return err
 	}
 	return nil
+}
+
+func (h *Handler) authFileLoadingManagedByWatcher() bool {
+	if h == nil {
+		return false
+	}
+	h.mu.Lock()
+	defer h.mu.Unlock()
+	return h.authLoadStatusProvider != nil
 }
 
 func fillMissingAuthEmailFromFileName(name string, data []byte) []byte {
@@ -1512,9 +1532,9 @@ func (h *Handler) buildAuthFromFileData(path string, data []byte) (*coreauth.Aut
 			return nil, fmt.Errorf("failed to read auth file: %w", err)
 		}
 	}
-	metadata := make(map[string]any)
-	if err := json.Unmarshal(data, &metadata); err != nil {
-		return nil, fmt.Errorf("invalid auth file: %w", err)
+	metadata, errDecode := decodeAuthFileMetadata(data)
+	if errDecode != nil {
+		return nil, errDecode
 	}
 	provider, _ := metadata["type"].(string)
 	if provider == "" {
@@ -1574,6 +1594,14 @@ func (h *Handler) buildAuthFromFileData(path string, data []byte) (*coreauth.Aut
 	}
 	coreauth.ApplyCustomHeadersFromMetadata(auth)
 	return auth, nil
+}
+
+func decodeAuthFileMetadata(data []byte) (map[string]any, error) {
+	metadata := make(map[string]any)
+	if errUnmarshal := json.Unmarshal(data, &metadata); errUnmarshal != nil {
+		return nil, fmt.Errorf("invalid auth file: %w", errUnmarshal)
+	}
+	return metadata, nil
 }
 
 func (h *Handler) upsertAuthRecord(ctx context.Context, auth *coreauth.Auth) error {

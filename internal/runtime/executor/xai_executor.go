@@ -62,11 +62,6 @@ const (
 	xaiVideosPath               = "/videos"
 	xaiIdempotencyKeyMetaKey    = "idempotency_key"
 	xaiComposerModelPrefix      = "grok-composer-"
-	xaiTokenAuthHeader          = "X-XAI-Token-Auth"
-	xaiTokenAuthValue           = "xai-grok-cli"
-	xaiClientVersionHeader      = "x-grok-client-version"
-	// Keep in sync with the current Grok CLI client version that chat-proxy expects.
-	xaiClientVersionValue = "0.2.93"
 	// xaiUsingAPIAttr enables the official API path for non-media HTTP chat.
 	xaiUsingAPIAttr = "using_api"
 )
@@ -1178,9 +1173,9 @@ func applyXAIChatHeaders(r *http.Request, auth *cliproxyauth.Auth, token string,
 	}
 	applyXAIDefaultHeaders(r, token, stream, sessionID)
 	if xaiIsCLIChatProxyBaseURL(xaiChatBaseURL(auth)) {
-		r.Header.Set(xaiTokenAuthHeader, xaiTokenAuthValue)
-		r.Header.Set(xaiClientVersionHeader, xaiClientVersionValue)
-		r.Header.Set("User-Agent", "xai-grok-workspace/"+xaiClientVersionValue)
+		r.Header.Set(xaiauth.CLITokenAuthHeader, xaiauth.CLITokenAuthValue)
+		r.Header.Set(xaiauth.CLIClientVersionHeader, xaiauth.CLIClientVersion)
+		r.Header.Set("User-Agent", xaiauth.CLIUserAgent)
 	}
 	applyXAICustomHeaders(r, auth)
 }

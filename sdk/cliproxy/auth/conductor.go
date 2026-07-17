@@ -2481,6 +2481,44 @@ func (m *Manager) Remove(ctx context.Context, id string) {
 	if id == "" {
 		return
 	}
+	unlockLifecycle := m.lockAuthLifecycle(id)
+	defer unlockLifecycle()
+	m.removeRuntime(ctx, id)
+}
+
+// RemoveIf deletes the current auth only when matches accepts the lifecycle-locked snapshot.
+// beforeRemove runs under the same lifecycle lock and must complete any external deletion first.
+func (m *Manager) RemoveIf(ctx context.Context, id string, matches func(*Auth) bool, beforeRemove func(*Auth) error) (bool, error) {
+	if m == nil {
+		return false, nil
+	}
+	id = strings.TrimSpace(id)
+	if id == "" {
+		return false, nil
+	}
+
+	unlockLifecycle := m.lockAuthLifecycle(id)
+	defer unlockLifecycle()
+
+	m.mu.RLock()
+	current := m.auths[id]
+	if current != nil {
+		current = current.Clone()
+	}
+	m.mu.RUnlock()
+	if current == nil || (matches != nil && !matches(current)) {
+		return false, nil
+	}
+	if beforeRemove != nil {
+		if errRemove := beforeRemove(current.Clone()); errRemove != nil {
+			return false, errRemove
+		}
+	}
+	m.removeRuntime(ctx, id)
+	return true, nil
+}
+
+func (m *Manager) removeRuntime(ctx context.Context, id string) {
 	_ = ctx
 
 	m.mu.Lock()
