@@ -140,7 +140,7 @@ type monitorQueryableStore interface {
 	QueryMonitorHourlySlots(ctx context.Context, filter MonitorQueryFilter, cutoffUnix, nowUnix int64, slotSeconds int) ([]MonitorHourlySlot, error)
 	QueryMonitorHourlyTokenSlots(ctx context.Context, filter MonitorQueryFilter, cutoffUnix, nowUnix int64, slotSeconds int) ([]MonitorHourlyTokenSlot, error)
 	QueryMonitorHealthBlocks(ctx context.Context, windowStartUnix, windowEndUnix int64, blockSeconds int) ([]MonitorHealthBlock, error)
-	QueryMonitorKeyStatsBlocks(ctx context.Context, windowStartUnix, windowEndUnix int64, blockSeconds int, authIndexes []string) ([]MonitorKeyStatsRow, error)
+	QueryMonitorKeyStatsBlocks(ctx context.Context, windowStartUnix, windowEndUnix int64, blockSeconds int, authIndexes []string, sources []string) ([]MonitorKeyStatsRow, error)
 }
 
 // MonitorRequestDetail represents a single request detail row for the request-details endpoint.
@@ -361,7 +361,7 @@ func (p *DatabasePlugin) QueryMonitorHealthBlocks(ctx context.Context, windowSta
 }
 
 // QueryMonitorKeyStatsBlocks queries per-source/auth time-block aggregates directly from persistence layer.
-func (p *DatabasePlugin) QueryMonitorKeyStatsBlocks(ctx context.Context, windowStartUnix, windowEndUnix int64, blockSeconds int, authIndexes []string) ([]MonitorKeyStatsRow, error) {
+func (p *DatabasePlugin) QueryMonitorKeyStatsBlocks(ctx context.Context, windowStartUnix, windowEndUnix int64, blockSeconds int, authIndexes []string, sources []string) ([]MonitorKeyStatsRow, error) {
 	queryable, err := p.monitorQueryableStore()
 	if err != nil {
 		return nil, err
@@ -369,7 +369,7 @@ func (p *DatabasePlugin) QueryMonitorKeyStatsBlocks(ctx context.Context, windowS
 	if ctx == nil {
 		ctx = context.Background()
 	}
-	return queryable.QueryMonitorKeyStatsBlocks(ctx, windowStartUnix, windowEndUnix, blockSeconds, normalizeMonitorAuthIndexes(authIndexes))
+	return queryable.QueryMonitorKeyStatsBlocks(ctx, windowStartUnix, windowEndUnix, blockSeconds, normalizeMonitorAuthIndexes(authIndexes), normalizeMonitorAuthIndexes(sources))
 }
 
 func (s *mirrorUsageStore) QueryMonitorRequestLogs(ctx context.Context, filter MonitorQueryFilter, page, pageSize, recentLimit int) (MonitorRequestLogsResult, error) {
@@ -442,11 +442,11 @@ func (s *mirrorUsageStore) QueryMonitorHealthBlocks(ctx context.Context, windowS
 	return s.local.QueryMonitorHealthBlocks(ctx, windowStartUnix, windowEndUnix, blockSeconds)
 }
 
-func (s *mirrorUsageStore) QueryMonitorKeyStatsBlocks(ctx context.Context, windowStartUnix, windowEndUnix int64, blockSeconds int, authIndexes []string) ([]MonitorKeyStatsRow, error) {
+func (s *mirrorUsageStore) QueryMonitorKeyStatsBlocks(ctx context.Context, windowStartUnix, windowEndUnix int64, blockSeconds int, authIndexes []string, sources []string) ([]MonitorKeyStatsRow, error) {
 	if s == nil || s.local == nil {
 		return nil, fmt.Errorf("usage store: mirror store not initialized")
 	}
-	return s.local.QueryMonitorKeyStatsBlocks(ctx, windowStartUnix, windowEndUnix, blockSeconds, authIndexes)
+	return s.local.QueryMonitorKeyStatsBlocks(ctx, windowStartUnix, windowEndUnix, blockSeconds, authIndexes, sources)
 }
 
 func (s *sqliteUsageStore) QueryMonitorRequestLogs(ctx context.Context, filter MonitorQueryFilter, page, pageSize, recentLimit int) (MonitorRequestLogsResult, error) {
@@ -1957,7 +1957,7 @@ func (s *sqliteUsageStore) QueryMonitorHealthBlocks(ctx context.Context, windowS
 	return items, nil
 }
 
-func (s *sqliteUsageStore) QueryMonitorKeyStatsBlocks(ctx context.Context, windowStartUnix, windowEndUnix int64, blockSeconds int, authIndexes []string) ([]MonitorKeyStatsRow, error) {
+func (s *sqliteUsageStore) QueryMonitorKeyStatsBlocks(ctx context.Context, windowStartUnix, windowEndUnix int64, blockSeconds int, authIndexes []string, sources []string) ([]MonitorKeyStatsRow, error) {
 	if s == nil || s.db == nil {
 		return nil, fmt.Errorf("usage store: sqlite store not initialized")
 	}
@@ -1965,13 +1965,23 @@ func (s *sqliteUsageStore) QueryMonitorKeyStatsBlocks(ctx context.Context, windo
 		blockSeconds = 600
 	}
 	authIndexes = normalizeMonitorAuthIndexes(authIndexes)
+	sources = normalizeMonitorAuthIndexes(sources)
 
 	whereClause := "requested_at >= ? AND requested_at <= ?"
 	args := []any{windowStartUnix, blockSeconds, windowStartUnix, windowEndUnix}
-	if len(authIndexes) > 0 {
-		inClause, inArgs := toInClause(authIndexes)
-		whereClause += " AND COALESCE(NULLIF(auth_index, ''), 'unknown') IN (" + inClause + ")"
-		args = append(args, inArgs...)
+	if len(authIndexes) > 0 || len(sources) > 0 {
+		parts := make([]string, 0, 2)
+		if len(authIndexes) > 0 {
+			inClause, inArgs := toInClause(authIndexes)
+			parts = append(parts, "COALESCE(NULLIF(auth_index, ''), 'unknown') IN ("+inClause+")")
+			args = append(args, inArgs...)
+		}
+		if len(sources) > 0 {
+			inClause, inArgs := toInClause(sources)
+			parts = append(parts, "COALESCE(NULLIF(source, ''), 'unknown') IN ("+inClause+")")
+			args = append(args, inArgs...)
+		}
+		whereClause += " AND (" + strings.Join(parts, " OR ") + ")"
 	}
 
 	query := fmt.Sprintf(`

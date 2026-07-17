@@ -1,8 +1,6 @@
 package auth
 
 import (
-	"os"
-	"path/filepath"
 	"strings"
 	"testing"
 	"time"
@@ -103,35 +101,34 @@ func TestEnsureIndexUsesCredentialIdentity(t *testing.T) {
 	}
 }
 
-func TestEnsureIndexUsesOAuthTypeAndAbsolutePath(t *testing.T) {
+func TestEnsureIndexUsesOAuthTypeAndFileBaseName(t *testing.T) {
 	t.Parallel()
 
-	wd, errWd := os.Getwd()
-	if errWd != nil {
-		t.Fatalf("os.Getwd returned error: %v", errWd)
-	}
-
-	relPath := "test-oauth.json"
-	absPath := filepath.Join(wd, relPath)
-	expectedSeed := "antigravity:" + filepath.Clean(absPath)
+	expectedSeed := "antigravity:test-oauth.json"
 	expectedIndex := stableAuthIndex(expectedSeed)
 
-	a := &Auth{
-		Provider: "antigravity",
-		Attributes: map[string]string{
-			"path": relPath,
-		},
-		Metadata: map[string]any{
-			"type": "antigravity",
-		},
-	}
-
-	got := a.EnsureIndex()
-	if got == "" {
-		t.Fatal("auth index should not be empty")
-	}
-	if got != expectedIndex {
-		t.Fatalf("auth index = %q, want %q", got, expectedIndex)
+	// Different absolute directories must yield the same index.
+	for _, path := range []string{
+		"test-oauth.json",
+		"/data/auths/test-oauth.json",
+		"/Users/example/Source/go/CLIProxyAPI/auths/test-oauth.json",
+	} {
+		a := &Auth{
+			Provider: "antigravity",
+			Attributes: map[string]string{
+				"path": path,
+			},
+			Metadata: map[string]any{
+				"type": "antigravity",
+			},
+		}
+		got := a.EnsureIndex()
+		if got == "" {
+			t.Fatal("auth index should not be empty")
+		}
+		if got != expectedIndex {
+			t.Fatalf("path %q: auth index = %q, want %q", path, got, expectedIndex)
+		}
 	}
 }
 

@@ -3,6 +3,7 @@ package management
 import (
 	"math"
 	"net/http"
+	"path/filepath"
 	"sort"
 	"strconv"
 	"strings"
@@ -10,6 +11,7 @@ import (
 
 	"github.com/gin-gonic/gin"
 	"github.com/router-for-me/CLIProxyAPI/v7/internal/usage"
+	coreauth "github.com/router-for-me/CLIProxyAPI/v7/sdk/cliproxy/auth"
 )
 
 const (
@@ -2670,21 +2672,77 @@ func (h *Handler) GetMonitorServiceHealth(c *gin.Context) {
 }
 
 // GetMonitorKeyStats returns per-source and per-auth-index success/failure stats
-// with 10-minute time blocks over a 200-minute sliding window.
+// for the local calendar day (00:00 → now), with 20 fixed blocks covering 00:00–24:00
+// (72 minutes each). Future blocks in the day stay empty.
+//
+// Auth-file cards surface success/failure totals from this endpoint; a short
+// ~3h window under-counts real daily traffic and disagrees with channel stats "今天".
+//
+// Historical usage rows may carry drifted auth_index values when file-based OAuth
+// seeds previously embedded absolute paths. When filtering by auth_index, also
+// match via source aliases (email/filename) from the live auth manager and remap
+// aggregates onto the requested indexes.
 func (h *Handler) GetMonitorKeyStats(c *gin.Context) {
 	const (
 		blockCount      = 20
-		blockDurationMs = 600000 // 10 minutes
-		blockDuration   = 10 * time.Minute
-		windowDuration  = blockCount * blockDuration // 200 minutes
+		blockDurationMs = 4_320_000 // 72 minutes = 24h / 20
+		blockDuration   = 72 * time.Minute
 	)
 
 	now := time.Now()
-	windowStart := now.Add(-windowDuration)
+	// Local calendar day — matches monitor channel stats "今天".
+	dayStart := time.Date(now.Year(), now.Month(), now.Day(), 0, 0, 0, 0, now.Location())
 	authIndexes := normalizeAuthIndexes(c.QueryArray("auth_index"))
 	authIndexSet := make(map[string]struct{}, len(authIndexes))
 	for _, authIndex := range authIndexes {
 		authIndexSet[authIndex] = struct{}{}
+	}
+
+	// source -> requested auth_index for remapping drifted historical rows.
+	requestedBySource := make(map[string]string)
+	querySources := []string{}
+	if len(authIndexes) > 0 && h != nil && h.authManager != nil {
+		for _, auth := range h.authManager.List() {
+			if auth == nil {
+				continue
+			}
+			idx := auth.EnsureIndex()
+			if idx == "" {
+				continue
+			}
+			if _, ok := authIndexSet[idx]; !ok {
+				continue
+			}
+			for _, src := range keyStatsSourceCandidates(auth) {
+				if src == "" {
+					continue
+				}
+				if _, exists := requestedBySource[src]; !exists {
+					requestedBySource[src] = idx
+					querySources = append(querySources, src)
+				}
+			}
+		}
+	}
+	querySources = normalizeAuthIndexes(querySources)
+
+	resolveAuthIndex := func(authIdx, source string) (string, bool) {
+		if authIdx == "" {
+			authIdx = "unknown"
+		}
+		if len(authIndexSet) == 0 {
+			return authIdx, true
+		}
+		if _, exists := authIndexSet[authIdx]; exists {
+			return authIdx, true
+		}
+		if source == "" {
+			source = "unknown"
+		}
+		if mapped, ok := requestedBySource[source]; ok {
+			return mapped, true
+		}
+		return "", false
 	}
 
 	type blockStats struct {
@@ -2710,59 +2768,78 @@ func (h *Handler) GetMonitorKeyStats(c *gin.Context) {
 		return s
 	}
 
+	// Block grid is aligned to the full local day [00:00, 24:00).
+	clampBlockIndex := func(idx int) (int, bool) {
+		if idx < 0 {
+			return 0, false
+		}
+		if idx >= blockCount {
+			// Exactly 24:00 lands on blockCount; keep in last slot.
+			if idx == blockCount {
+				return blockCount - 1, true
+			}
+			return 0, false
+		}
+		return idx, true
+	}
+
 	if dbPlugin := usage.GetDatabasePlugin(); dbPlugin != nil {
-		rows, queryErr := dbPlugin.QueryMonitorKeyStatsBlocks(c.Request.Context(), windowStart.Unix(), now.Unix(), int(blockDuration.Seconds()), authIndexes)
+		// Query only records from local midnight through now.
+		// Include source aliases so path-drifted historical auth_index rows still match.
+		rows, queryErr := dbPlugin.QueryMonitorKeyStatsBlocks(
+			c.Request.Context(),
+			dayStart.Unix(),
+			now.Unix(),
+			int(blockDuration.Seconds()),
+			authIndexes,
+			querySources,
+		)
 		if queryErr == nil {
 			for _, row := range rows {
-				if row.BlockIndex < 0 || row.BlockIndex >= blockCount {
+				idx, ok := clampBlockIndex(row.BlockIndex)
+				if !ok {
 					continue
 				}
-				if len(authIndexSet) > 0 {
-					if _, exists := authIndexSet[row.AuthIndex]; !exists {
-						continue
-					}
+				targetIndex, matched := resolveAuthIndex(row.AuthIndex, row.Source)
+				if !matched {
+					continue
 				}
 				srcStats := ensureEntry(bySource, row.Source)
 				srcStats.Success += row.Success
 				srcStats.Failure += row.Failure
-				srcStats.Blocks[row.BlockIndex].Success += row.Success
-				srcStats.Blocks[row.BlockIndex].Failure += row.Failure
+				srcStats.Blocks[idx].Success += row.Success
+				srcStats.Blocks[idx].Failure += row.Failure
 
-				aiStats := ensureEntry(byAuthIndex, row.AuthIndex)
+				aiStats := ensureEntry(byAuthIndex, targetIndex)
 				aiStats.Success += row.Success
 				aiStats.Failure += row.Failure
-				aiStats.Blocks[row.BlockIndex].Success += row.Success
-				aiStats.Blocks[row.BlockIndex].Failure += row.Failure
+				aiStats.Blocks[idx].Success += row.Success
+				aiStats.Blocks[idx].Failure += row.Failure
 			}
 			goto buildKeyStatsResponse
 		}
 	}
 
 	visitSnapshotRecords(h.usageSnapshot(), func(record monitorRecord) {
-		if record.Timestamp.Before(windowStart) || record.Timestamp.After(now) {
+		if record.Timestamp.Before(dayStart) || record.Timestamp.After(now) {
 			return
 		}
-		idx := int(record.Timestamp.Sub(windowStart) / blockDuration)
-		if idx >= blockCount {
-			idx = blockCount - 1
-		}
-
-		authIdx := record.AuthIndex
-		if authIdx == "" {
-			authIdx = "unknown"
-		}
-		if len(authIndexSet) > 0 {
-			if _, exists := authIndexSet[authIdx]; !exists {
-				return
-			}
+		idx, ok := clampBlockIndex(int(record.Timestamp.Sub(dayStart) / blockDuration))
+		if !ok {
+			return
 		}
 
 		source := record.Source
 		if source == "" {
 			source = "unknown"
 		}
+		targetIndex, matched := resolveAuthIndex(record.AuthIndex, source)
+		if !matched {
+			return
+		}
+
 		srcStats := ensureEntry(bySource, source)
-		aiStats := ensureEntry(byAuthIndex, authIdx)
+		aiStats := ensureEntry(byAuthIndex, targetIndex)
 
 		if record.Failed {
 			srcStats.Failure++
@@ -2793,7 +2870,7 @@ buildKeyStatsResponse:
 		"block_config": gin.H{
 			"count":           blockCount,
 			"duration_ms":     blockDurationMs,
-			"window_start_ms": windowStart.UnixMilli(),
+			"window_start_ms": dayStart.UnixMilli(),
 		},
 	}
 	if len(authIndexes) > 0 {
@@ -2801,6 +2878,64 @@ buildKeyStatsResponse:
 	}
 
 	c.JSON(http.StatusOK, response)
+}
+
+// keyStatsSourceCandidates returns usage-record Source values that may identify
+// the same credential as the live auth entry (email, project, api key, filename).
+func keyStatsSourceCandidates(auth *coreauth.Auth) []string {
+	if auth == nil {
+		return nil
+	}
+	seen := make(map[string]struct{}, 8)
+	out := make([]string, 0, 8)
+	add := func(raw string) {
+		value := strings.TrimSpace(raw)
+		if value == "" {
+			return
+		}
+		if _, exists := seen[value]; exists {
+			return
+		}
+		seen[value] = struct{}{}
+		out = append(out, value)
+	}
+
+	if _, value := auth.AccountInfo(); value != "" {
+		add(value)
+	}
+	if auth.Metadata != nil {
+		if email, ok := auth.Metadata["email"].(string); ok {
+			add(email)
+		}
+		if projectID, ok := auth.Metadata["project_id"].(string); ok {
+			add(projectID)
+		}
+		if project, ok := auth.Metadata["project"].(string); ok {
+			add(project)
+		}
+	}
+	if auth.Attributes != nil {
+		add(auth.Attributes["api_key"])
+		path := strings.TrimSpace(auth.Attributes["path"])
+		if path == "" {
+			path = strings.TrimSpace(auth.Attributes["source"])
+		}
+		if path != "" {
+			base := filepath.Base(path)
+			add(base)
+			if ext := filepath.Ext(base); ext != "" {
+				add(strings.TrimSuffix(base, ext))
+			}
+		}
+	}
+	if name := strings.TrimSpace(auth.FileName); name != "" {
+		base := filepath.Base(name)
+		add(base)
+		if ext := filepath.Ext(base); ext != "" {
+			add(strings.TrimSuffix(base, ext))
+		}
+	}
+	return out
 }
 
 // GetMonitorRequestDetails returns request-level details with method/path from the database.

@@ -329,11 +329,9 @@ func (a *Auth) indexSeed() string {
 	}
 
 	if filePath != "" && strings.HasSuffix(strings.ToLower(filePath), ".json") {
-		abs, errAbs := filepath.Abs(filePath)
-		if errAbs == nil && strings.TrimSpace(abs) != "" {
-			filePath = abs
-		}
-		filePath = filepath.Clean(filePath)
+		// Basename only: absolute paths make auth_index drift across deploy
+		// directories and working directories, breaking usage aggregation.
+		filePath = filepath.Base(filepath.Clean(filePath))
 
 		authType := ""
 		if a.Metadata != nil {

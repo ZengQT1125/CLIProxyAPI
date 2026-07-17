@@ -468,6 +468,153 @@ func TestGetMonitorKeyStats_AuthIndexFilter(t *testing.T) {
 	}
 }
 
+func TestGetMonitorKeyStats_UsesLocalCalendarDay(t *testing.T) {
+	gin.SetMode(gin.TestMode)
+
+	now := time.Now()
+	dayStart := time.Date(now.Year(), now.Month(), now.Day(), 0, 0, 0, 0, now.Location())
+	if now.Sub(dayStart) < 2*time.Minute {
+		t.Skip("too close to local midnight for stable same-day samples")
+	}
+
+	// Same local day samples, always clamped into [dayStart, now].
+	earlyOffset := now.Sub(dayStart) / 3
+	if earlyOffset < time.Minute {
+		earlyOffset = time.Minute
+	}
+	midOffset := now.Sub(dayStart) * 2 / 3
+	if midOffset <= earlyOffset {
+		midOffset = earlyOffset + time.Minute
+	}
+
+	sameDayOK := testUsageRecord(dayStart.Add(earlyOffset), "api-day", "model-a", "source-day", false)
+	sameDayOK.AuthIndex = "auth-day"
+	sameDayFail := testUsageRecord(dayStart.Add(midOffset), "api-day", "model-a", "source-day", true)
+	sameDayFail.AuthIndex = "auth-day"
+	recentOK := testUsageRecord(now.Add(-time.Second), "api-day", "model-a", "source-day", false)
+	recentOK.AuthIndex = "auth-day"
+
+	// Yesterday, even if still inside a rolling 24h window — must NOT count.
+	yesterday := dayStart.Add(-1 * time.Hour)
+	yesterdayOK := testUsageRecord(yesterday, "api-day", "model-a", "source-day", false)
+	yesterdayOK.AuthIndex = "auth-day"
+
+	h := newMonitorTestHandler(sameDayOK, sameDayFail, recentOK, yesterdayOK)
+	rr := executeMonitorRequest(h.GetMonitorKeyStats, "/monitor/key-stats?auth_index=auth-day")
+	if rr.Code != http.StatusOK {
+		t.Fatalf("unexpected status: %d, body=%s", rr.Code, rr.Body.String())
+	}
+
+	var resp struct {
+		ByAuthIndex map[string]struct {
+			Success int64 `json:"success"`
+			Failure int64 `json:"failure"`
+			Blocks  []struct {
+				Success int64 `json:"success"`
+				Failure int64 `json:"failure"`
+			} `json:"blocks"`
+		} `json:"by_auth_index"`
+		BlockConfig struct {
+			Count         int   `json:"count"`
+			DurationMs    int64 `json:"duration_ms"`
+			WindowStartMs int64 `json:"window_start_ms"`
+		} `json:"block_config"`
+	}
+	if err := json.Unmarshal(rr.Body.Bytes(), &resp); err != nil {
+		t.Fatalf("decode response failed: %v", err)
+	}
+
+	got := resp.ByAuthIndex["auth-day"]
+	if got.Success != 2 || got.Failure != 1 {
+		t.Fatalf("unexpected auth-day totals: success=%d failure=%d (want 2/1 for local calendar day)", got.Success, got.Failure)
+	}
+	if len(got.Blocks) != 20 {
+		t.Fatalf("unexpected block length: got %d want 20", len(got.Blocks))
+	}
+	if resp.BlockConfig.Count != 20 || resp.BlockConfig.DurationMs != 4_320_000 {
+		t.Fatalf("unexpected block_config: %+v", resp.BlockConfig)
+	}
+	if resp.BlockConfig.WindowStartMs != dayStart.UnixMilli() {
+		t.Fatalf("window_start_ms = %d, want local midnight %d", resp.BlockConfig.WindowStartMs, dayStart.UnixMilli())
+	}
+}
+
+
+func TestGetMonitorKeyStats_RemapsDriftedAuthIndexViaSource(t *testing.T) {
+	gin.SetMode(gin.TestMode)
+
+	now := time.Now()
+	dayStart := time.Date(now.Year(), now.Month(), now.Day(), 0, 0, 0, 0, now.Location())
+	if now.Sub(dayStart) < 2*time.Minute {
+		t.Skip("too close to local midnight for stable same-day samples")
+	}
+
+	email := "crappie.blocker@example.com"
+	currentIndex := "current-basename-index"
+	historicalIndex := "old-absolute-path-index"
+
+	// Historical usage rows written under a different auth_index seed.
+	histOK := testUsageRecord(dayStart.Add(now.Sub(dayStart)/2), "api-1", "model-a", email, false)
+	histOK.AuthIndex = historicalIndex
+	histFail := testUsageRecord(now.Add(-time.Second), "api-1", "model-a", email, true)
+	histFail.AuthIndex = historicalIndex
+	other := testUsageRecord(now.Add(-2*time.Second), "api-2", "model-b", "other@example.com", false)
+	other.AuthIndex = "other-index"
+
+	manager := coreauth.NewManager(nil, nil, nil)
+	auth := &coreauth.Auth{
+		ID:       "codex-file",
+		Provider: "codex",
+		Index:    currentIndex,
+		Metadata: map[string]any{
+			"type":  "codex",
+			"email": email,
+		},
+		Attributes: map[string]string{
+			"path": "/Users/example/auths/codex-" + email + "-plus.json",
+		},
+	}
+	if _, err := manager.Register(context.Background(), auth); err != nil {
+		t.Fatalf("register auth: %v", err)
+	}
+
+	h := newMonitorTestHandler(histOK, histFail, other)
+	h.authManager = manager
+
+	rr := executeMonitorRequest(h.GetMonitorKeyStats, "/monitor/key-stats?auth_index="+currentIndex)
+	if rr.Code != http.StatusOK {
+		t.Fatalf("unexpected status: %d, body=%s", rr.Code, rr.Body.String())
+	}
+
+	var resp struct {
+		ByAuthIndex map[string]struct {
+			Success int64 `json:"success"`
+			Failure int64 `json:"failure"`
+		} `json:"by_auth_index"`
+		BySource map[string]struct {
+			Success int64 `json:"success"`
+			Failure int64 `json:"failure"`
+		} `json:"by_source"`
+	}
+	if err := json.Unmarshal(rr.Body.Bytes(), &resp); err != nil {
+		t.Fatalf("decode response failed: %v", err)
+	}
+
+	got := resp.ByAuthIndex[currentIndex]
+	if got.Success != 1 || got.Failure != 1 {
+		t.Fatalf("unexpected remapped stats for %s: %+v (body=%s)", currentIndex, got, rr.Body.String())
+	}
+	if _, exists := resp.ByAuthIndex[historicalIndex]; exists {
+		t.Fatalf("historical auth_index should be remapped away: %#v", resp.ByAuthIndex)
+	}
+	if got := resp.BySource[email]; got.Success != 1 || got.Failure != 1 {
+		t.Fatalf("unexpected source stats: %+v", got)
+	}
+	if _, exists := resp.ByAuthIndex["other-index"]; exists {
+		t.Fatalf("unrelated auth should be filtered out: %#v", resp.ByAuthIndex)
+	}
+}
+
 func newMonitorTestHandler(records ...coreusage.Record) *Handler {
 	stats := usage.NewRequestStatistics()
 	for _, record := range records {

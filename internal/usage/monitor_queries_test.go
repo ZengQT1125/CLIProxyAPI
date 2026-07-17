@@ -261,7 +261,7 @@ func TestSQLiteUsageStoreQueryMonitorKeyStatsBlocksAuthIndexFilter(t *testing.T)
 		UsageRecord{APIKey: "api-c", Model: "model-c", Source: "source-c", AuthIndex: "auth-c", RequestedAt: base.Add(-7 * time.Minute)},
 	)
 
-	rows, err := store.QueryMonitorKeyStatsBlocks(ctx, base.Add(-20*time.Minute).Unix(), base.Unix(), int((10 * time.Minute).Seconds()), []string{"auth-a", "auth-b"})
+	rows, err := store.QueryMonitorKeyStatsBlocks(ctx, base.Add(-20*time.Minute).Unix(), base.Unix(), int((10 * time.Minute).Seconds()), []string{"auth-a", "auth-b"}, nil)
 	if err != nil {
 		t.Fatalf("QueryMonitorKeyStatsBlocks failed: %v", err)
 	}
@@ -284,6 +284,43 @@ func TestSQLiteUsageStoreQueryMonitorKeyStatsBlocksAuthIndexFilter(t *testing.T)
 		failureCount += row.Failure
 	}
 	if successCount != 2 || failureCount != 1 {
+		t.Fatalf("unexpected filtered totals: success=%d failure=%d", successCount, failureCount)
+	}
+}
+
+
+func TestSQLiteUsageStoreQueryMonitorKeyStatsBlocksSourceFilter(t *testing.T) {
+	ctx := context.Background()
+	store := newTestSQLiteUsageStore(t)
+	defer store.Close()
+
+	base := time.Date(2026, 2, 7, 12, 0, 0, 0, time.UTC)
+	insertUsageRecords(t, store,
+		UsageRecord{APIKey: "api-a", Model: "model-a", Source: "email@example.com", AuthIndex: "old-path-index", RequestedAt: base.Add(-19 * time.Minute)},
+		UsageRecord{APIKey: "api-a", Model: "model-a", Source: "email@example.com", AuthIndex: "old-path-index", RequestedAt: base.Add(-9 * time.Minute), Failed: true},
+		UsageRecord{APIKey: "api-b", Model: "model-b", Source: "other@example.com", AuthIndex: "other-index", RequestedAt: base.Add(-8 * time.Minute)},
+	)
+
+	// Query by current auth_index (no rows) plus source alias — historical rows must match.
+	rows, err := store.QueryMonitorKeyStatsBlocks(ctx, base.Add(-20*time.Minute).Unix(), base.Unix(), int((10 * time.Minute).Seconds()), []string{"current-index"}, []string{"email@example.com"})
+	if err != nil {
+		t.Fatalf("QueryMonitorKeyStatsBlocks failed: %v", err)
+	}
+	if len(rows) != 2 {
+		t.Fatalf("unexpected row count: got %d want 2 rows=%#v", len(rows), rows)
+	}
+	var successCount, failureCount int64
+	for _, row := range rows {
+		if row.Source != "email@example.com" {
+			t.Fatalf("unexpected source: %+v", row)
+		}
+		if row.AuthIndex != "old-path-index" {
+			t.Fatalf("unexpected auth index: %+v", row)
+		}
+		successCount += row.Success
+		failureCount += row.Failure
+	}
+	if successCount != 1 || failureCount != 1 {
 		t.Fatalf("unexpected filtered totals: success=%d failure=%d", successCount, failureCount)
 	}
 }
