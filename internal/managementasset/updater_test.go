@@ -8,7 +8,9 @@ import (
 	"net/http/httptest"
 	"os"
 	"path/filepath"
+	"sync/atomic"
 	"testing"
+	"time"
 
 	"github.com/router-for-me/CLIProxyAPI/v7/internal/config"
 )
@@ -68,17 +70,43 @@ func TestAutoUpdateSkipReason(t *testing.T) {
 	}
 }
 
-func TestGetLatestReleaseUsesConfiguredPanelReleaseURL(t *testing.T) {
+func TestDefaultManagementRepositoryTargetsForkPanel(t *testing.T) {
+	const wantRepositoryURL = "https://github.com/caidaoli/Cli-Proxy-API-Management-Center"
+	const wantReleaseURL = "https://github.com/caidaoli/Cli-Proxy-API-Management-Center/releases"
+	const wantAssetURL = "https://github.com/caidaoli/Cli-Proxy-API-Management-Center/releases/latest/download/management.html"
+	if defaultManagementRepositoryURL != wantRepositoryURL {
+		t.Fatalf("default repository URL = %q, want %q", defaultManagementRepositoryURL, wantRepositoryURL)
+	}
+	if got := managementReleasePageURL(defaultManagementRepositoryURL); got != wantReleaseURL {
+		t.Fatalf("release page URL = %q, want %q", got, wantReleaseURL)
+	}
+	if got := managementAssetDownloadURL(defaultManagementRepositoryURL); got != wantAssetURL {
+		t.Fatalf("asset download URL = %q, want %q", got, wantAssetURL)
+	}
+}
+
+func TestGetLatestRelease(t *testing.T) {
 	releaseServer := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		if r.URL.Path != "/repos/acme/panel/releases/latest" {
-			t.Fatalf("release path = %q, want /repos/acme/panel/releases/latest", r.URL.Path)
+		if r.URL.Path != "/releases" {
+			t.Fatalf("release path = %q, want /releases", r.URL.Path)
 		}
-		w.Header().Set("Content-Type", "application/json")
-		_, _ = w.Write([]byte(`{"tag_name":"v9.8.7","assets":[]}`))
+		if accept := r.Header.Get("Accept"); accept != "text/html" {
+			t.Fatalf("Accept header = %q, want text/html", accept)
+		}
+		if authorization := r.Header.Get("Authorization"); authorization != "" {
+			t.Fatalf("Authorization header must not be sent to the public releases page")
+		}
+		w.Header().Set("Content-Type", "text/html; charset=utf-8")
+		_, _ = w.Write([]byte(`<!doctype html>
+<a href="https://example.com/releases/tag/v99.0.0">other repository</a>
+<a href="/releases/tag/v9.8.7">latest release</a>
+<a href="/releases/tag/v9.8.6">older release</a>`))
 	}))
 	defer releaseServer.Close()
 
-	release, err := GetLatestRelease(context.Background(), "", releaseServer.URL+"/repos/acme/panel/releases/latest")
+	t.Setenv("GITSTORE_GIT_URL", "https://github.com/acme/private.git")
+	t.Setenv("GITSTORE_GIT_TOKEN", "must-not-be-sent")
+	release, err := getLatestRelease(context.Background(), releaseServer.Client(), releaseServer.URL)
 	if err != nil {
 		t.Fatalf("GetLatestRelease() error = %v", err)
 	}
@@ -87,21 +115,125 @@ func TestGetLatestReleaseUsesConfiguredPanelReleaseURL(t *testing.T) {
 	}
 }
 
+func TestEnsureLatestManagementHTMLSkipsAssetDownloadWhenVersionMatches(t *testing.T) {
+	staticDir := t.TempDir()
+	localPath := filepath.Join(staticDir, ManagementFileName)
+	if errWrite := os.WriteFile(localPath, []byte("current panel"), 0o644); errWrite != nil {
+		t.Fatalf("write management asset: %v", errWrite)
+	}
+	if errWrite := os.WriteFile(filepath.Join(staticDir, managementVersionFileName), []byte("v1.2.3\n"), 0o644); errWrite != nil {
+		t.Fatalf("write management version: %v", errWrite)
+	}
+
+	var assetRequests atomic.Int32
+	releaseServer := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch r.URL.Path {
+		case "/releases":
+			_, _ = w.Write([]byte(`<a href="/releases/tag/v1.2.3">v1.2.3</a>`))
+		case "/releases/latest/download/management.html":
+			assetRequests.Add(1)
+			_, _ = w.Write([]byte("new panel"))
+		default:
+			http.NotFound(w, r)
+		}
+	}))
+	defer releaseServer.Close()
+
+	resetManagementSyncThrottle(t)
+	if ok := ensureLatestManagementHTML(context.Background(), staticDir, releaseServer.Client(), releaseServer.URL); !ok {
+		t.Fatal("ensureLatestManagementHTML() = false, want true")
+	}
+	if got := assetRequests.Load(); got != 0 {
+		t.Fatalf("asset requests = %d, want 0 when versions match", got)
+	}
+	data, errRead := os.ReadFile(localPath)
+	if errRead != nil {
+		t.Fatalf("read management asset: %v", errRead)
+	}
+	if string(data) != "current panel" {
+		t.Fatalf("management asset = %q, want existing content", data)
+	}
+}
+
+func TestEnsureLatestManagementHTMLDownloadsWhenVersionChanges(t *testing.T) {
+	staticDir := t.TempDir()
+	localPath := filepath.Join(staticDir, ManagementFileName)
+	if errWrite := os.WriteFile(localPath, []byte("old panel"), 0o644); errWrite != nil {
+		t.Fatalf("write management asset: %v", errWrite)
+	}
+	if errWrite := os.WriteFile(filepath.Join(staticDir, managementVersionFileName), []byte("v1.2.2\n"), 0o644); errWrite != nil {
+		t.Fatalf("write management version: %v", errWrite)
+	}
+
+	var assetRequests atomic.Int32
+	releaseServer := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch r.URL.Path {
+		case "/releases":
+			_, _ = w.Write([]byte(`<a href="/releases/tag/v1.2.3">v1.2.3</a>`))
+		case "/releases/latest/download/management.html":
+			assetRequests.Add(1)
+			_, _ = w.Write([]byte("new panel"))
+		default:
+			http.NotFound(w, r)
+		}
+	}))
+	defer releaseServer.Close()
+
+	resetManagementSyncThrottle(t)
+	if ok := ensureLatestManagementHTML(context.Background(), staticDir, releaseServer.Client(), releaseServer.URL); !ok {
+		t.Fatal("ensureLatestManagementHTML() = false, want true")
+	}
+	if got := assetRequests.Load(); got != 1 {
+		t.Fatalf("asset requests = %d, want 1 when version changes", got)
+	}
+	data, errRead := os.ReadFile(localPath)
+	if errRead != nil {
+		t.Fatalf("read management asset: %v", errRead)
+	}
+	if string(data) != "new panel" {
+		t.Fatalf("management asset = %q, want new content", data)
+	}
+	version, errReadVersion := os.ReadFile(filepath.Join(staticDir, managementVersionFileName))
+	if errReadVersion != nil {
+		t.Fatalf("read management version: %v", errReadVersion)
+	}
+	if string(version) != "v1.2.3\n" {
+		t.Fatalf("management version = %q, want v1.2.3", version)
+	}
+}
+
+func resetManagementSyncThrottle(t *testing.T) {
+	t.Helper()
+	lastUpdateCheckMu.Lock()
+	previous := lastUpdateCheckTime
+	lastUpdateCheckTime = time.Time{}
+	lastUpdateCheckMu.Unlock()
+	t.Cleanup(func() {
+		lastUpdateCheckMu.Lock()
+		lastUpdateCheckTime = previous
+		lastUpdateCheckMu.Unlock()
+	})
+}
+
 func TestUpdateLatestManagementHTMLDownloadsDirectReleaseAsset(t *testing.T) {
 	const assetBody = "<!doctype html><title>new panel</title>"
 	sum := sha256.Sum256([]byte(assetBody))
 	digest := hex.EncodeToString(sum[:])
 
 	assetServer := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		if r.URL.Path != "/acme/panel/releases/latest/download/management.html" {
-			t.Fatalf("asset path = %q, want direct latest release download", r.URL.Path)
+		switch r.URL.Path {
+		case "/acme/panel/releases":
+			_, _ = w.Write([]byte(`<a href="/acme/panel/releases/tag/v9.8.7">v9.8.7</a>`))
+		case "/acme/panel/releases/latest/download/management.html":
+			_, _ = w.Write([]byte(assetBody))
+		default:
+			http.NotFound(w, r)
 		}
-		_, _ = w.Write([]byte(assetBody))
 	}))
 	defer assetServer.Close()
 
 	staticDir := t.TempDir()
-	gotHash, err := UpdateLatestManagementHTML(context.Background(), staticDir, "", assetServer.URL+"/acme/panel")
+	gotHash, err := updateLatestManagementHTML(context.Background(), staticDir, assetServer.Client(), assetServer.URL+"/acme/panel")
 	if err != nil {
 		t.Fatalf("UpdateLatestManagementHTML() error = %v", err)
 	}
@@ -115,5 +247,12 @@ func TestUpdateLatestManagementHTMLDownloadsDirectReleaseAsset(t *testing.T) {
 	}
 	if string(data) != assetBody {
 		t.Fatalf("management asset body = %q, want %q", string(data), assetBody)
+	}
+	version, errReadVersion := os.ReadFile(filepath.Join(staticDir, managementVersionFileName))
+	if errReadVersion != nil {
+		t.Fatalf("failed to read management version: %v", errReadVersion)
+	}
+	if string(version) != "v9.8.7\n" {
+		t.Fatalf("management version = %q, want v9.8.7", version)
 	}
 }

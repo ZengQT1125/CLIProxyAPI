@@ -50,3 +50,48 @@ func TestPutRoutingStrategyAcceptsSequentialFillAlias(t *testing.T) {
 		t.Fatalf("saved config = %q, want it to contain %q", string(data), "sequential-fill")
 	}
 }
+
+func TestConfigYAMLRemovesUnsupportedPanelRepository(t *testing.T) {
+	t.Setenv("MANAGEMENT_PASSWORD", "")
+	gin.SetMode(gin.TestMode)
+
+	const source = `remote-management:
+  allow-remote: true
+  panel-github-repository: https://github.com/acme/incompatible-panel
+  panel-repo: https://github.com/acme/legacy-panel
+`
+	configPath := filepath.Join(t.TempDir(), "config.yaml")
+	if errWrite := os.WriteFile(configPath, []byte(source), 0o600); errWrite != nil {
+		t.Fatalf("failed to write config file: %v", errWrite)
+	}
+	h := NewHandler(&config.Config{}, configPath, coreauth.NewManager(nil, nil, nil))
+
+	getRecorder := httptest.NewRecorder()
+	getContext, _ := gin.CreateTestContext(getRecorder)
+	getContext.Request = httptest.NewRequest(http.MethodGet, "/config.yaml", nil)
+	h.GetConfigYAML(getContext)
+	if getRecorder.Code != http.StatusOK {
+		t.Fatalf("GetConfigYAML status = %d, want %d with body %s", getRecorder.Code, http.StatusOK, getRecorder.Body.String())
+	}
+	if strings.Contains(getRecorder.Body.String(), "panel-github-repository") || strings.Contains(getRecorder.Body.String(), "panel-repo") {
+		t.Fatalf("GetConfigYAML still exposes a panel repository setting:\n%s", getRecorder.Body.String())
+	}
+
+	putRecorder := httptest.NewRecorder()
+	putContext, _ := gin.CreateTestContext(putRecorder)
+	putContext.Request = httptest.NewRequest(http.MethodPut, "/config.yaml", strings.NewReader(source))
+	h.PutConfigYAML(putContext)
+	if putRecorder.Code != http.StatusOK {
+		t.Fatalf("PutConfigYAML status = %d, want %d with body %s", putRecorder.Code, http.StatusOK, putRecorder.Body.String())
+	}
+	persisted, errRead := os.ReadFile(configPath)
+	if errRead != nil {
+		t.Fatalf("failed to read persisted config: %v", errRead)
+	}
+	if strings.Contains(string(persisted), "panel-github-repository") || strings.Contains(string(persisted), "panel-repo") {
+		t.Fatalf("PutConfigYAML persisted a panel repository setting:\n%s", persisted)
+	}
+	if !strings.Contains(string(persisted), "allow-remote: true") {
+		t.Fatalf("PutConfigYAML lost supported remote management settings:\n%s", persisted)
+	}
+}

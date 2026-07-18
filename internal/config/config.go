@@ -21,12 +21,11 @@ import (
 )
 
 const (
-	DefaultPanelGitHubRepository = "https://github.com/caidaoli/Cli-Proxy-API-Management-Center"
-	DefaultPprofAddr             = "127.0.0.1:8316"
-	DefaultAuthDir               = "~/.cli-proxy-api"
-	DefaultAuthLoadWorkers       = 16
-	MinAuthLoadWorkers           = 1
-	MaxAuthLoadWorkers           = 64
+	DefaultPprofAddr       = "127.0.0.1:8316"
+	DefaultAuthDir         = "~/.cli-proxy-api"
+	DefaultAuthLoadWorkers = 16
+	MinAuthLoadWorkers     = 1
+	MaxAuthLoadWorkers     = 64
 )
 
 // Config represents the application's configuration, loaded from a YAML file.
@@ -337,9 +336,6 @@ type RemoteManagement struct {
 	// DisableAutoUpdatePanel disables automatic periodic background updates of the management panel asset from GitHub.
 	// When false (the default), the background updater remains enabled; when true, the panel is only downloaded on first access if missing.
 	DisableAutoUpdatePanel bool `yaml:"disable-auto-update-panel"`
-	// PanelGitHubRepository overrides the GitHub repository used to fetch the management panel asset.
-	// Accepts either a repository URL (https://github.com/org/repo) or an API releases endpoint.
-	PanelGitHubRepository string `yaml:"panel-github-repository"`
 }
 
 // QuotaExceeded defines the behavior when API quota limits are exceeded.
@@ -785,7 +781,6 @@ func LoadConfigOptional(configFile string, optional bool) (*Config, error) {
 	cfg.WebsocketAuth = true
 	cfg.Pprof.Enable = false
 	cfg.Pprof.Addr = DefaultPprofAddr
-	cfg.RemoteManagement.PanelGitHubRepository = DefaultPanelGitHubRepository
 	cfg.AuthLoadWorkers = DefaultAuthLoadWorkers
 	if err = yaml.Unmarshal(data, &cfg); err != nil {
 		if optional {
@@ -810,11 +805,6 @@ func LoadConfigOptional(configFile string, optional bool) (*Config, error) {
 		// Persist the hashed value back to the config file to avoid re-hashing on next startup.
 		// Preserve YAML comments and ordering; update only the nested key.
 		_ = SaveConfigPreserveCommentsUpdateNestedScalar(configFile, []string{"remote-management", "secret-key"}, hashed)
-	}
-
-	cfg.RemoteManagement.PanelGitHubRepository = strings.TrimSpace(cfg.RemoteManagement.PanelGitHubRepository)
-	if cfg.RemoteManagement.PanelGitHubRepository == "" {
-		cfg.RemoteManagement.PanelGitHubRepository = DefaultPanelGitHubRepository
 	}
 
 	cfg.Pprof.Addr = strings.TrimSpace(cfg.Pprof.Addr)
@@ -1336,6 +1326,33 @@ func SaveConfigPreserveComments(configFile string, cfg *Config) error {
 	return err
 }
 
+// RemoveUnsupportedPanelRepository removes panel repository overrides from a YAML payload.
+// This fork only supports its bundled management panel source.
+func RemoveUnsupportedPanelRepository(data []byte) ([]byte, error) {
+	var root yaml.Node
+	if err := yaml.Unmarshal(data, &root); err != nil {
+		return nil, err
+	}
+	if root.Kind != yaml.DocumentNode || len(root.Content) == 0 || root.Content[0] == nil {
+		return data, nil
+	}
+	if !removeUnsupportedPanelRepositoryKeys(root.Content[0]) {
+		return data, nil
+	}
+
+	var buf bytes.Buffer
+	enc := yaml.NewEncoder(&buf)
+	enc.SetIndent(2)
+	if err := enc.Encode(&root); err != nil {
+		_ = enc.Close()
+		return nil, err
+	}
+	if err := enc.Close(); err != nil {
+		return nil, err
+	}
+	return NormalizeCommentIndentation(buf.Bytes()), nil
+}
+
 // SaveConfigPreserveCommentsUpdateNestedScalar updates a nested scalar key path like ["a","b"]
 // while preserving comments and positions.
 func SaveConfigPreserveCommentsUpdateNestedScalar(configFile string, path []string, value string) error {
@@ -1583,8 +1600,6 @@ func isKnownDefaultValue(path []string, node *yaml.Node) bool {
 		switch fullPath {
 		case "pprof.addr":
 			return node.Value == DefaultPprofAddr
-		case "remote-management.panel-github-repository":
-			return node.Value == DefaultPanelGitHubRepository
 		case "plugins.dir":
 			return node.Value == "plugins"
 		case "routing.strategy":
@@ -2053,6 +2068,25 @@ func removeRemovedIntegrationKeys(root *yaml.Node) {
 	removeMapKey(root, "amp-upstream-api-key")
 	removeMapKey(root, "amp-restrict-management-to-localhost")
 	removeMapKey(root, "amp-model-mappings")
+	removeUnsupportedPanelRepositoryKeys(root)
+}
+
+func removeUnsupportedPanelRepositoryKeys(root *yaml.Node) bool {
+	if root == nil || root.Kind != yaml.MappingNode {
+		return false
+	}
+	idx := findMapKeyIndex(root, "remote-management")
+	if idx < 0 || idx+1 >= len(root.Content) {
+		return false
+	}
+	remoteManagement := root.Content[idx+1]
+	if remoteManagement == nil || remoteManagement.Kind != yaml.MappingNode {
+		return false
+	}
+	removed := findMapKeyIndex(remoteManagement, "panel-github-repository") >= 0 || findMapKeyIndex(remoteManagement, "panel-repo") >= 0
+	removeMapKey(remoteManagement, "panel-github-repository")
+	removeMapKey(remoteManagement, "panel-repo")
+	return removed
 }
 
 func removeLegacyGenerativeLanguageKeys(root *yaml.Node) {

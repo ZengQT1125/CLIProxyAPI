@@ -17,6 +17,7 @@ import (
 	"github.com/router-for-me/CLIProxyAPI/v7/internal/home"
 	"github.com/router-for-me/CLIProxyAPI/v7/internal/homeplugins"
 	"github.com/router-for-me/CLIProxyAPI/v7/internal/logging"
+	"github.com/router-for-me/CLIProxyAPI/v7/internal/managementasset"
 	"github.com/router-for-me/CLIProxyAPI/v7/internal/pluginhost"
 	"github.com/router-for-me/CLIProxyAPI/v7/internal/redisqueue"
 	"github.com/router-for-me/CLIProxyAPI/v7/internal/registry"
@@ -1930,6 +1931,9 @@ func (s *Service) Run(ctx context.Context) error {
 		return errServer
 	case <-runCtx.Done():
 		return runCtx.Err()
+	}
+	if !homeEnabled {
+		managementasset.StartAutoUpdater(runCtx, s.configPath)
 	}
 
 	if s.progressiveFileAuth && watcherWrapper != nil {

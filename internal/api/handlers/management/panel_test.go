@@ -1,6 +1,7 @@
 package management
 
 import (
+	"context"
 	"encoding/json"
 	"net/http"
 	"net/http/httptest"
@@ -14,18 +15,14 @@ import (
 )
 
 func TestGetManagementPanelLatestVersion(t *testing.T) {
-	releaseServer := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		w.Header().Set("Content-Type", "application/json")
-		_, _ = w.Write([]byte(`{"tag_name":"v3.2.1","assets":[]}`))
-	}))
-	defer releaseServer.Close()
+	previous := getLatestManagementPanelRelease
+	getLatestManagementPanelRelease = func(context.Context, string) (managementasset.LatestRelease, error) {
+		return managementasset.LatestRelease{Version: "v3.2.1"}, nil
+	}
+	t.Cleanup(func() { getLatestManagementPanelRelease = previous })
 
 	h := &Handler{
-		cfg: &config.Config{
-			RemoteManagement: config.RemoteManagement{
-				PanelGitHubRepository: releaseServer.URL + "/repos/acme/panel/releases/latest",
-			},
-		},
+		cfg:            &config.Config{},
 		configFilePath: writeTestConfigFile(t),
 	}
 
@@ -50,23 +47,22 @@ func TestGetManagementPanelLatestVersion(t *testing.T) {
 func TestUpdateManagementPanelWritesLatestAsset(t *testing.T) {
 	const assetBody = "<!doctype html><title>updated panel</title>"
 
-	assetServer := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		if r.URL.Path != "/acme/panel/releases/latest/download/management.html" {
-			t.Fatalf("asset path = %q, want direct latest release download", r.URL.Path)
-		}
-		_, _ = w.Write([]byte(assetBody))
-	}))
-	defer assetServer.Close()
-
 	staticDir := t.TempDir()
 	t.Setenv("MANAGEMENT_STATIC_PATH", staticDir)
+	previous := updateLatestManagementPanelHTML
+	updateLatestManagementPanelHTML = func(_ context.Context, gotStaticDir string, _ string) (string, error) {
+		if gotStaticDir != staticDir {
+			t.Fatalf("static directory = %q, want %q", gotStaticDir, staticDir)
+		}
+		if err := os.WriteFile(filepath.Join(gotStaticDir, managementasset.ManagementFileName), []byte(assetBody), 0o644); err != nil {
+			return "", err
+		}
+		return "test-hash", nil
+	}
+	t.Cleanup(func() { updateLatestManagementPanelHTML = previous })
 
 	h := &Handler{
-		cfg: &config.Config{
-			RemoteManagement: config.RemoteManagement{
-				PanelGitHubRepository: assetServer.URL + "/acme/panel",
-			},
-		},
+		cfg:            &config.Config{},
 		configFilePath: writeTestConfigFile(t),
 	}
 

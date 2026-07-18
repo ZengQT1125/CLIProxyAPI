@@ -115,6 +115,11 @@ func (h *Handler) PutConfigYAML(c *gin.Context) {
 		c.JSON(http.StatusBadRequest, gin.H{"error": "invalid_yaml", "message": "cannot read request body"})
 		return
 	}
+	body, err = config.RemoveUnsupportedPanelRepository(body)
+	if err != nil {
+		c.JSON(http.StatusBadRequest, gin.H{"error": "invalid_yaml", "message": err.Error()})
+		return
+	}
 	var cfg config.Config
 	if err = yaml.Unmarshal(body, &cfg); err != nil {
 		c.JSON(http.StatusBadRequest, gin.H{"error": "invalid_yaml", "message": err.Error()})
@@ -163,8 +168,8 @@ func (h *Handler) PutConfigYAML(c *gin.Context) {
 	c.JSON(http.StatusOK, gin.H{"ok": true, "changed": []string{"config"}})
 }
 
-// GetConfigYAML returns the raw config.yaml file bytes without re-encoding.
-// It preserves comments and original formatting/styles.
+// GetConfigYAML returns config.yaml without unsupported panel repository overrides.
+// Invalid YAML is returned unchanged so operators can repair it in the source editor.
 func (h *Handler) GetConfigYAML(c *gin.Context) {
 	data, err := os.ReadFile(h.configFilePath)
 	if err != nil {
@@ -175,10 +180,12 @@ func (h *Handler) GetConfigYAML(c *gin.Context) {
 		c.JSON(http.StatusInternalServerError, gin.H{"error": "read_failed", "message": err.Error()})
 		return
 	}
+	if sanitized, errSanitize := config.RemoveUnsupportedPanelRepository(data); errSanitize == nil {
+		data = sanitized
+	}
 	c.Header("Content-Type", "application/yaml; charset=utf-8")
 	c.Header("Cache-Control", "no-store")
 	c.Header("X-Content-Type-Options", "nosniff")
-	// Write raw bytes as-is
 	_, _ = c.Writer.Write(data)
 }
 
