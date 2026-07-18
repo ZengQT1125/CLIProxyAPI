@@ -4,13 +4,13 @@ import (
 	"context"
 	"crypto/sha256"
 	"encoding/hex"
+	"encoding/json"
 	"net/http"
 	"net/http/httptest"
 	"os"
 	"path/filepath"
 	"sync/atomic"
 	"testing"
-	"time"
 
 	"github.com/router-for-me/CLIProxyAPI/v7/internal/config"
 )
@@ -22,42 +22,11 @@ func TestAutoUpdateSkipReason(t *testing.T) {
 		wantReason string
 		wantSkip   bool
 	}{
-		{
-			name:       "nil config",
-			cfg:        nil,
-			wantReason: "config not yet available",
-			wantSkip:   true,
-		},
-		{
-			name: "cluster mode",
-			cfg: &config.Config{
-				Home: config.HomeConfig{Enabled: true},
-			},
-			wantReason: "cluster mode enabled",
-			wantSkip:   true,
-		},
-		{
-			name: "control panel disabled",
-			cfg: &config.Config{
-				RemoteManagement: config.RemoteManagement{DisableControlPanel: true},
-			},
-			wantReason: "control panel disabled",
-			wantSkip:   true,
-		},
-		{
-			name: "auto update disabled",
-			cfg: &config.Config{
-				RemoteManagement: config.RemoteManagement{DisableAutoUpdatePanel: true},
-			},
-			wantReason: "disable-auto-update-panel is enabled",
-			wantSkip:   true,
-		},
-		{
-			name:       "enabled",
-			cfg:        &config.Config{},
-			wantReason: "",
-			wantSkip:   false,
-		},
+		{name: "nil config", wantReason: "config not yet available", wantSkip: true},
+		{name: "cluster mode", cfg: &config.Config{Home: config.HomeConfig{Enabled: true}}, wantReason: "cluster mode enabled", wantSkip: true},
+		{name: "control panel disabled", cfg: &config.Config{RemoteManagement: config.RemoteManagement{DisableControlPanel: true}}, wantReason: "control panel disabled", wantSkip: true},
+		{name: "auto update disabled", cfg: &config.Config{RemoteManagement: config.RemoteManagement{DisableAutoUpdatePanel: true}}, wantReason: "disable-auto-update-panel is enabled", wantSkip: true},
+		{name: "enabled", cfg: &config.Config{}},
 	}
 
 	for _, tt := range tests {
@@ -70,189 +39,332 @@ func TestAutoUpdateSkipReason(t *testing.T) {
 	}
 }
 
-func TestDefaultManagementRepositoryTargetsForkPanel(t *testing.T) {
+func TestDefaultManagementRepositoryTargetsForkManifest(t *testing.T) {
 	const wantRepositoryURL = "https://github.com/caidaoli/Cli-Proxy-API-Management-Center"
-	const wantReleaseURL = "https://github.com/caidaoli/Cli-Proxy-API-Management-Center/releases"
-	const wantAssetURL = "https://github.com/caidaoli/Cli-Proxy-API-Management-Center/releases/latest/download/management.html"
+	const wantManifestURL = "https://github.com/caidaoli/Cli-Proxy-API-Management-Center/releases/latest/download/panel-manifest.json"
+	const wantAssetURL = "https://github.com/caidaoli/Cli-Proxy-API-Management-Center/releases/download/v1.58.0/management.html"
+
 	if defaultManagementRepositoryURL != wantRepositoryURL {
 		t.Fatalf("default repository URL = %q, want %q", defaultManagementRepositoryURL, wantRepositoryURL)
 	}
-	if got := managementReleasePageURL(defaultManagementRepositoryURL); got != wantReleaseURL {
-		t.Fatalf("release page URL = %q, want %q", got, wantReleaseURL)
+	if got := managementLatestManifestURL(defaultManagementRepositoryURL); got != wantManifestURL {
+		t.Fatalf("manifest URL = %q, want %q", got, wantManifestURL)
 	}
-	if got := managementAssetDownloadURL(defaultManagementRepositoryURL); got != wantAssetURL {
-		t.Fatalf("asset download URL = %q, want %q", got, wantAssetURL)
+	if got := managementReleaseAssetURL(defaultManagementRepositoryURL, "v1.58.0", ManagementFileName); got != wantAssetURL {
+		t.Fatalf("asset URL = %q, want %q", got, wantAssetURL)
 	}
 }
 
-func TestGetLatestRelease(t *testing.T) {
+func TestLoadManagementPanelUsesEmbeddedBaselineWithoutDisk(t *testing.T) {
+	t.Setenv("MANAGEMENT_STATIC_PATH", t.TempDir())
+
+	panel, err := LoadManagementPanel(filepath.Join(t.TempDir(), "config.yaml"))
+	if err != nil {
+		t.Fatalf("LoadManagementPanel() error = %v", err)
+	}
+	if panel.Source != PanelSourceEmbedded {
+		t.Fatalf("panel source = %q, want %q", panel.Source, PanelSourceEmbedded)
+	}
+	if len(panel.HTML) == 0 {
+		t.Fatal("embedded panel is empty")
+	}
+	assertPanelHash(t, panel.HTML, panel.Manifest.SHA256)
+}
+
+func TestLoadManagementPanelUsesVerifiedNewerDiskPanel(t *testing.T) {
+	staticDir := t.TempDir()
+	t.Setenv("MANAGEMENT_STATIC_PATH", staticDir)
+	manifest := writeTestDiskPanel(t, staticDir, "v99.0.0", []byte("<!doctype html><title>disk panel</title>"), "")
+
+	panel, err := LoadManagementPanel(filepath.Join(t.TempDir(), "config.yaml"))
+	if err != nil {
+		t.Fatalf("LoadManagementPanel() error = %v", err)
+	}
+	if panel.Source != PanelSourceDisk {
+		t.Fatalf("panel source = %q, want %q", panel.Source, PanelSourceDisk)
+	}
+	if panel.Manifest.Version != manifest.Version {
+		t.Fatalf("panel version = %q, want %q", panel.Manifest.Version, manifest.Version)
+	}
+	if string(panel.HTML) != "<!doctype html><title>disk panel</title>" {
+		t.Fatalf("panel HTML = %q", panel.HTML)
+	}
+}
+
+func TestLoadManagementPanelRejectsDiskPanelWithBadHash(t *testing.T) {
+	staticDir := t.TempDir()
+	t.Setenv("MANAGEMENT_STATIC_PATH", staticDir)
+	manifest := writeTestDiskPanel(t, staticDir, "v99.0.0", []byte("valid panel"), "")
+	assetPath := filepath.Join(staticDir, "management."+manifest.SHA256+".html")
+	if err := os.WriteFile(assetPath, []byte("tampered panel"), 0o644); err != nil {
+		t.Fatalf("tamper disk panel: %v", err)
+	}
+
+	panel, err := LoadManagementPanel(filepath.Join(t.TempDir(), "config.yaml"))
+	if err != nil {
+		t.Fatalf("LoadManagementPanel() error = %v", err)
+	}
+	if panel.Source != PanelSourceEmbedded {
+		t.Fatalf("panel source = %q, want %q", panel.Source, PanelSourceEmbedded)
+	}
+}
+
+func TestLoadManagementPanelKeepsEmbeddedBaselineForOlderDiskPanel(t *testing.T) {
+	staticDir := t.TempDir()
+	t.Setenv("MANAGEMENT_STATIC_PATH", staticDir)
+	writeTestDiskPanel(t, staticDir, "v1.0.0", []byte("older panel"), "")
+
+	panel, err := LoadManagementPanel(filepath.Join(t.TempDir(), "config.yaml"))
+	if err != nil {
+		t.Fatalf("LoadManagementPanel() error = %v", err)
+	}
+	if panel.Source != PanelSourceEmbedded {
+		t.Fatalf("panel source = %q, want %q", panel.Source, PanelSourceEmbedded)
+	}
+}
+
+func TestManifestContractRejectsUnsupportedMetadata(t *testing.T) {
+	tests := []struct {
+		name string
+		data string
+	}{
+		{name: "unknown field", data: `{"version":"v1.2.3","sha256":"` + testSHA256("panel") + `","asset":"management.html","url":"https://example.com"}`},
+		{name: "unsupported asset", data: `{"version":"v1.2.3","sha256":"` + testSHA256("panel") + `","asset":"other.html"}`},
+		{name: "prerelease version", data: `{"version":"v1.2.3-beta.1","sha256":"` + testSHA256("panel") + `","asset":"management.html"}`},
+		{name: "trailing JSON", data: `{"version":"v1.2.3","sha256":"` + testSHA256("panel") + `","asset":"management.html"}{}`},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			if _, err := parseManifest([]byte(tt.data)); err == nil {
+				t.Fatal("parseManifest() error = nil")
+			}
+		})
+	}
+}
+
+func TestGetLatestReleaseReadsManifestOnly(t *testing.T) {
 	releaseServer := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		if r.URL.Path != "/releases" {
-			t.Fatalf("release path = %q, want /releases", r.URL.Path)
+		if r.URL.Path != "/releases/latest/download/panel-manifest.json" {
+			t.Fatalf("request path = %q", r.URL.Path)
 		}
-		if accept := r.Header.Get("Accept"); accept != "text/html" {
-			t.Fatalf("Accept header = %q, want text/html", accept)
+		if accept := r.Header.Get("Accept"); accept != "application/json" {
+			t.Fatalf("Accept header = %q, want application/json", accept)
 		}
-		if authorization := r.Header.Get("Authorization"); authorization != "" {
-			t.Fatalf("Authorization header must not be sent to the public releases page")
-		}
-		w.Header().Set("Content-Type", "text/html; charset=utf-8")
-		_, _ = w.Write([]byte(`<!doctype html>
-<a href="https://example.com/releases/tag/v99.0.0">other repository</a>
-<a href="/releases/tag/v9.8.7">latest release</a>
-<a href="/releases/tag/v9.8.6">older release</a>`))
+		writeTestManifestResponse(t, w, Manifest{Version: "v9.8.7", SHA256: testSHA256("panel"), Asset: ManagementFileName})
 	}))
 	defer releaseServer.Close()
 
-	t.Setenv("GITSTORE_GIT_URL", "https://github.com/acme/private.git")
-	t.Setenv("GITSTORE_GIT_TOKEN", "must-not-be-sent")
 	release, err := getLatestRelease(context.Background(), releaseServer.Client(), releaseServer.URL)
 	if err != nil {
-		t.Fatalf("GetLatestRelease() error = %v", err)
+		t.Fatalf("getLatestRelease() error = %v", err)
 	}
 	if release.Version != "v9.8.7" {
 		t.Fatalf("release version = %q, want v9.8.7", release.Version)
 	}
 }
 
-func TestEnsureLatestManagementHTMLSkipsAssetDownloadWhenVersionMatches(t *testing.T) {
+func TestUpdateLatestManagementHTMLSkipsAssetDownloadWhenVersionMatches(t *testing.T) {
 	staticDir := t.TempDir()
-	localPath := filepath.Join(staticDir, ManagementFileName)
-	if errWrite := os.WriteFile(localPath, []byte("current panel"), 0o644); errWrite != nil {
-		t.Fatalf("write management asset: %v", errWrite)
-	}
-	if errWrite := os.WriteFile(filepath.Join(staticDir, managementVersionFileName), []byte("v1.2.3\n"), 0o644); errWrite != nil {
-		t.Fatalf("write management version: %v", errWrite)
+	t.Setenv("MANAGEMENT_STATIC_PATH", staticDir)
+	baseline, err := LoadManagementPanel(filepath.Join(t.TempDir(), "config.yaml"))
+	if err != nil {
+		t.Fatalf("load embedded baseline: %v", err)
 	}
 
 	var assetRequests atomic.Int32
 	releaseServer := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		switch r.URL.Path {
-		case "/releases":
-			_, _ = w.Write([]byte(`<a href="/releases/tag/v1.2.3">v1.2.3</a>`))
-		case "/releases/latest/download/management.html":
+		case "/releases/latest/download/panel-manifest.json":
+			writeTestManifestResponse(t, w, baseline.Manifest)
+		case "/releases/download/" + baseline.Manifest.Version + "/management.html":
 			assetRequests.Add(1)
-			_, _ = w.Write([]byte("new panel"))
+			_, _ = w.Write([]byte("unexpected download"))
 		default:
 			http.NotFound(w, r)
 		}
 	}))
 	defer releaseServer.Close()
 
-	resetManagementSyncThrottle(t)
-	if ok := ensureLatestManagementHTML(context.Background(), staticDir, releaseServer.Client(), releaseServer.URL); !ok {
-		t.Fatal("ensureLatestManagementHTML() = false, want true")
+	result, err := updateLatestManagementHTML(context.Background(), staticDir, releaseServer.Client(), releaseServer.URL, "dev")
+	if err != nil {
+		t.Fatalf("updateLatestManagementHTML() error = %v", err)
+	}
+	if result.Updated {
+		t.Fatal("Updated = true, want false for the embedded version")
 	}
 	if got := assetRequests.Load(); got != 0 {
-		t.Fatalf("asset requests = %d, want 0 when versions match", got)
-	}
-	data, errRead := os.ReadFile(localPath)
-	if errRead != nil {
-		t.Fatalf("read management asset: %v", errRead)
-	}
-	if string(data) != "current panel" {
-		t.Fatalf("management asset = %q, want existing content", data)
+		t.Fatalf("asset requests = %d, want 0", got)
 	}
 }
 
-func TestEnsureLatestManagementHTMLDownloadsWhenVersionChanges(t *testing.T) {
-	staticDir := t.TempDir()
-	localPath := filepath.Join(staticDir, ManagementFileName)
-	if errWrite := os.WriteFile(localPath, []byte("old panel"), 0o644); errWrite != nil {
-		t.Fatalf("write management asset: %v", errWrite)
-	}
-	if errWrite := os.WriteFile(filepath.Join(staticDir, managementVersionFileName), []byte("v1.2.2\n"), 0o644); errWrite != nil {
-		t.Fatalf("write management version: %v", errWrite)
-	}
+func TestUpdateLatestManagementHTMLDownloadsExactManifestRelease(t *testing.T) {
+	const version = "v99.0.0"
+	assetBody := []byte("<!doctype html><title>new panel</title>")
+	manifest := Manifest{Version: version, SHA256: testSHA256Bytes(assetBody), Asset: ManagementFileName}
 
 	var assetRequests atomic.Int32
 	releaseServer := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		switch r.URL.Path {
-		case "/releases":
-			_, _ = w.Write([]byte(`<a href="/releases/tag/v1.2.3">v1.2.3</a>`))
-		case "/releases/latest/download/management.html":
+		case "/acme/panel/releases/latest/download/panel-manifest.json":
+			writeTestManifestResponse(t, w, manifest)
+		case "/acme/panel/releases/download/v99.0.0/management.html":
 			assetRequests.Add(1)
-			_, _ = w.Write([]byte("new panel"))
+			_, _ = w.Write(assetBody)
 		default:
 			http.NotFound(w, r)
 		}
 	}))
 	defer releaseServer.Close()
 
-	resetManagementSyncThrottle(t)
-	if ok := ensureLatestManagementHTML(context.Background(), staticDir, releaseServer.Client(), releaseServer.URL); !ok {
-		t.Fatal("ensureLatestManagementHTML() = false, want true")
+	staticDir := t.TempDir()
+	result, err := updateLatestManagementHTML(context.Background(), staticDir, releaseServer.Client(), releaseServer.URL+"/acme/panel", "dev")
+	if err != nil {
+		t.Fatalf("updateLatestManagementHTML() error = %v", err)
+	}
+	if !result.Updated || result.Version != version || result.SHA256 != manifest.SHA256 {
+		t.Fatalf("update result = %+v", result)
 	}
 	if got := assetRequests.Load(); got != 1 {
-		t.Fatalf("asset requests = %d, want 1 when version changes", got)
+		t.Fatalf("asset requests = %d, want 1", got)
 	}
-	data, errRead := os.ReadFile(localPath)
-	if errRead != nil {
-		t.Fatalf("read management asset: %v", errRead)
+
+	t.Setenv("MANAGEMENT_STATIC_PATH", staticDir)
+	panel, err := LoadManagementPanel(filepath.Join(t.TempDir(), "config.yaml"))
+	if err != nil {
+		t.Fatalf("LoadManagementPanel() error = %v", err)
 	}
-	if string(data) != "new panel" {
-		t.Fatalf("management asset = %q, want new content", data)
-	}
-	version, errReadVersion := os.ReadFile(filepath.Join(staticDir, managementVersionFileName))
-	if errReadVersion != nil {
-		t.Fatalf("read management version: %v", errReadVersion)
-	}
-	if string(version) != "v1.2.3\n" {
-		t.Fatalf("management version = %q, want v1.2.3", version)
+	if panel.Source != PanelSourceDisk || string(panel.HTML) != string(assetBody) {
+		t.Fatalf("loaded panel source=%q body=%q", panel.Source, panel.HTML)
 	}
 }
 
-func resetManagementSyncThrottle(t *testing.T) {
-	t.Helper()
-	lastUpdateCheckMu.Lock()
-	previous := lastUpdateCheckTime
-	lastUpdateCheckTime = time.Time{}
-	lastUpdateCheckMu.Unlock()
-	t.Cleanup(func() {
-		lastUpdateCheckMu.Lock()
-		lastUpdateCheckTime = previous
-		lastUpdateCheckMu.Unlock()
-	})
-}
-
-func TestUpdateLatestManagementHTMLDownloadsDirectReleaseAsset(t *testing.T) {
-	const assetBody = "<!doctype html><title>new panel</title>"
-	sum := sha256.Sum256([]byte(assetBody))
-	digest := hex.EncodeToString(sum[:])
-
-	assetServer := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+func TestUpdateLatestManagementHTMLRejectsBadAssetHash(t *testing.T) {
+	manifest := Manifest{Version: "v99.0.0", SHA256: testSHA256("expected"), Asset: ManagementFileName}
+	releaseServer := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		switch r.URL.Path {
-		case "/acme/panel/releases":
-			_, _ = w.Write([]byte(`<a href="/acme/panel/releases/tag/v9.8.7">v9.8.7</a>`))
-		case "/acme/panel/releases/latest/download/management.html":
-			_, _ = w.Write([]byte(assetBody))
+		case "/releases/latest/download/panel-manifest.json":
+			writeTestManifestResponse(t, w, manifest)
+		case "/releases/download/v99.0.0/management.html":
+			_, _ = w.Write([]byte("tampered"))
 		default:
 			http.NotFound(w, r)
 		}
 	}))
-	defer assetServer.Close()
+	defer releaseServer.Close()
 
 	staticDir := t.TempDir()
-	gotHash, err := updateLatestManagementHTML(context.Background(), staticDir, assetServer.Client(), assetServer.URL+"/acme/panel")
-	if err != nil {
-		t.Fatalf("UpdateLatestManagementHTML() error = %v", err)
+	if _, err := updateLatestManagementHTML(context.Background(), staticDir, releaseServer.Client(), releaseServer.URL, "dev"); err == nil {
+		t.Fatal("updateLatestManagementHTML() error = nil, want hash mismatch")
 	}
-	if gotHash != digest {
-		t.Fatalf("hash = %q, want %q", gotHash, digest)
+	if _, err := os.Stat(filepath.Join(staticDir, panelManifestFileName)); !os.IsNotExist(err) {
+		t.Fatalf("disk manifest exists after rejected update: %v", err)
 	}
+}
 
-	data, err := os.ReadFile(filepath.Join(staticDir, ManagementFileName))
+func TestRejectedUpdatePreservesLastVerifiedDiskPanel(t *testing.T) {
+	staticDir := t.TempDir()
+	t.Setenv("MANAGEMENT_STATIC_PATH", staticDir)
+	previousBody := []byte("verified previous panel")
+	previousManifest := writeTestDiskPanel(t, staticDir, "v98.0.0", previousBody, "")
+	manifest := Manifest{Version: "v99.0.0", SHA256: testSHA256("expected"), Asset: ManagementFileName}
+	releaseServer := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch r.URL.Path {
+		case "/releases/latest/download/panel-manifest.json":
+			writeTestManifestResponse(t, w, manifest)
+		case "/releases/download/v99.0.0/management.html":
+			_, _ = w.Write([]byte("tampered"))
+		default:
+			http.NotFound(w, r)
+		}
+	}))
+	defer releaseServer.Close()
+
+	if _, err := updateLatestManagementHTML(context.Background(), staticDir, releaseServer.Client(), releaseServer.URL, "dev"); err == nil {
+		t.Fatal("updateLatestManagementHTML() error = nil, want hash mismatch")
+	}
+	panel, err := LoadManagementPanel(filepath.Join(t.TempDir(), "config.yaml"))
 	if err != nil {
-		t.Fatalf("failed to read management asset: %v", err)
+		t.Fatalf("LoadManagementPanel() error = %v", err)
 	}
-	if string(data) != assetBody {
-		t.Fatalf("management asset body = %q, want %q", string(data), assetBody)
+	if panel.Source != PanelSourceDisk || panel.Manifest.Version != previousManifest.Version || string(panel.HTML) != string(previousBody) {
+		t.Fatalf("active panel after rejected update = source=%q version=%q body=%q", panel.Source, panel.Manifest.Version, panel.HTML)
 	}
-	version, errReadVersion := os.ReadFile(filepath.Join(staticDir, managementVersionFileName))
-	if errReadVersion != nil {
-		t.Fatalf("failed to read management version: %v", errReadVersion)
+}
+
+func TestUpdateLatestManagementHTMLSkipsIncompatibleRelease(t *testing.T) {
+	manifest := Manifest{
+		Version:       "v99.0.0",
+		SHA256:        testSHA256("panel"),
+		Asset:         ManagementFileName,
+		MinCLIVersion: "v99.0.0",
 	}
-	if string(version) != "v9.8.7\n" {
-		t.Fatalf("management version = %q, want v9.8.7", version)
+	var assetRequests atomic.Int32
+	releaseServer := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch r.URL.Path {
+		case "/releases/latest/download/panel-manifest.json":
+			writeTestManifestResponse(t, w, manifest)
+		case "/releases/download/v99.0.0/management.html":
+			assetRequests.Add(1)
+		default:
+			http.NotFound(w, r)
+		}
+	}))
+	defer releaseServer.Close()
+
+	result, err := updateLatestManagementHTML(context.Background(), t.TempDir(), releaseServer.Client(), releaseServer.URL, "v8.31.0")
+	if err != nil {
+		t.Fatalf("updateLatestManagementHTML() error = %v", err)
 	}
+	if result.Updated {
+		t.Fatal("Updated = true, want false for incompatible release")
+	}
+	if got := assetRequests.Load(); got != 0 {
+		t.Fatalf("asset requests = %d, want 0", got)
+	}
+}
+
+func writeTestDiskPanel(t *testing.T, staticDir, version string, body []byte, minCLIVersion string) Manifest {
+	t.Helper()
+	manifest := Manifest{
+		Version:       version,
+		SHA256:        testSHA256Bytes(body),
+		Asset:         ManagementFileName,
+		MinCLIVersion: minCLIVersion,
+	}
+	if err := os.WriteFile(filepath.Join(staticDir, "management."+manifest.SHA256+".html"), body, 0o644); err != nil {
+		t.Fatalf("write disk panel: %v", err)
+	}
+	manifestData, err := json.Marshal(manifest)
+	if err != nil {
+		t.Fatalf("marshal manifest: %v", err)
+	}
+	if err = os.WriteFile(filepath.Join(staticDir, "panel-manifest.json"), manifestData, 0o644); err != nil {
+		t.Fatalf("write disk manifest: %v", err)
+	}
+	return manifest
+}
+
+func writeTestManifestResponse(t *testing.T, w http.ResponseWriter, manifest Manifest) {
+	t.Helper()
+	w.Header().Set("Content-Type", "application/json")
+	if err := json.NewEncoder(w).Encode(manifest); err != nil {
+		t.Fatalf("encode manifest: %v", err)
+	}
+}
+
+func assertPanelHash(t *testing.T, data []byte, want string) {
+	t.Helper()
+	if got := testSHA256Bytes(data); got != want {
+		t.Fatalf("panel hash = %q, want %q", got, want)
+	}
+}
+
+func testSHA256(value string) string {
+	return testSHA256Bytes([]byte(value))
+}
+
+func testSHA256Bytes(data []byte) string {
+	sum := sha256.Sum256(data)
+	return hex.EncodeToString(sum[:])
 }

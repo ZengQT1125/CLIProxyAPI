@@ -898,13 +898,33 @@ func TestHomeEnabledHidesManagementEndpointsAndControlPanel(t *testing.T) {
 	})
 }
 
+func TestManagementControlPanelUsesEmbeddedAssetWithoutDisk(t *testing.T) {
+	staticDir := t.TempDir()
+	t.Setenv("MANAGEMENT_STATIC_PATH", staticDir)
+	server := newTestServer(t)
+
+	req := httptest.NewRequest(http.MethodGet, "/management.html", nil)
+	rr := httptest.NewRecorder()
+	server.engine.ServeHTTP(rr, req)
+
+	if rr.Code != http.StatusOK {
+		t.Fatalf("status = %d, want %d body=%s", rr.Code, http.StatusOK, rr.Body.String())
+	}
+	if got := rr.Header().Get("Content-Type"); !strings.HasPrefix(got, "text/html") {
+		t.Fatalf("Content-Type = %q, want text/html", got)
+	}
+	if got := rr.Header().Get("X-Management-Panel-Version"); got == "" {
+		t.Fatal("X-Management-Panel-Version is empty")
+	}
+	if rr.Body.Len() == 0 {
+		t.Fatal("management panel body is empty")
+	}
+}
+
 func TestExampleAPIKeySafeModeShowsWarningAndKeepsManagement(t *testing.T) {
 	t.Setenv("MANAGEMENT_PASSWORD", "test-management-key")
 	staticDir := t.TempDir()
 	t.Setenv("MANAGEMENT_STATIC_PATH", staticDir)
-	if err := os.WriteFile(filepath.Join(staticDir, "management.html"), []byte("<html>management app</html>"), 0o600); err != nil {
-		t.Fatalf("failed to write management asset: %v", err)
-	}
 
 	server := newTestServerWithOptions(t, WithExampleAPIKeySafeMode())
 	cfg := *server.cfg
@@ -960,8 +980,11 @@ func TestExampleAPIKeySafeModeShowsWarningAndKeepsManagement(t *testing.T) {
 		if rr.Code != http.StatusOK {
 			t.Fatalf("status = %d, want %d body=%s", rr.Code, http.StatusOK, rr.Body.String())
 		}
-		if !strings.Contains(rr.Body.String(), "management app") {
-			t.Fatalf("management panel body missing: %s", rr.Body.String())
+		if got := rr.Header().Get("X-Management-Panel-Version"); got == "" {
+			t.Fatal("X-Management-Panel-Version is empty")
+		}
+		if rr.Body.Len() == 0 {
+			t.Fatal("management panel body is empty")
 		}
 	})
 

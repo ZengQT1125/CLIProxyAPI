@@ -5,8 +5,6 @@ import (
 	"encoding/json"
 	"net/http"
 	"net/http/httptest"
-	"os"
-	"path/filepath"
 	"testing"
 
 	"github.com/gin-gonic/gin"
@@ -44,20 +42,15 @@ func TestGetManagementPanelLatestVersion(t *testing.T) {
 	}
 }
 
-func TestUpdateManagementPanelWritesLatestAsset(t *testing.T) {
-	const assetBody = "<!doctype html><title>updated panel</title>"
-
+func TestUpdateManagementPanelReportsInstalledRelease(t *testing.T) {
 	staticDir := t.TempDir()
 	t.Setenv("MANAGEMENT_STATIC_PATH", staticDir)
 	previous := updateLatestManagementPanelHTML
-	updateLatestManagementPanelHTML = func(_ context.Context, gotStaticDir string, _ string) (string, error) {
+	updateLatestManagementPanelHTML = func(_ context.Context, gotStaticDir string, _ string) (managementasset.UpdateResult, error) {
 		if gotStaticDir != staticDir {
 			t.Fatalf("static directory = %q, want %q", gotStaticDir, staticDir)
 		}
-		if err := os.WriteFile(filepath.Join(gotStaticDir, managementasset.ManagementFileName), []byte(assetBody), 0o644); err != nil {
-			return "", err
-		}
-		return "test-hash", nil
+		return managementasset.UpdateResult{Updated: true, Version: "v3.2.1", SHA256: "test-hash"}, nil
 	}
 	t.Cleanup(func() { updateLatestManagementPanelHTML = previous })
 
@@ -76,11 +69,15 @@ func TestUpdateManagementPanelWritesLatestAsset(t *testing.T) {
 		t.Fatalf("status = %d, want %d; body=%s", rec.Code, http.StatusOK, rec.Body.String())
 	}
 
-	data, err := os.ReadFile(filepath.Join(staticDir, managementasset.ManagementFileName))
-	if err != nil {
-		t.Fatalf("failed to read management asset: %v", err)
+	var body struct {
+		Updated bool   `json:"updated"`
+		Version string `json:"version"`
+		Hash    string `json:"hash"`
 	}
-	if string(data) != assetBody {
-		t.Fatalf("management asset body = %q, want %q", string(data), assetBody)
+	if err := json.Unmarshal(rec.Body.Bytes(), &body); err != nil {
+		t.Fatalf("decode response: %v", err)
+	}
+	if !body.Updated || body.Version != "v3.2.1" || body.Hash != "test-hash" {
+		t.Fatalf("response = %+v", body)
 	}
 }

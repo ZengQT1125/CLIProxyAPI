@@ -1111,28 +1111,16 @@ func (s *Server) serveManagementControlPanel(c *gin.Context) {
 		c.AbortWithStatus(http.StatusNotFound)
 		return
 	}
-	filePath := managementasset.FilePath(s.configFilePath)
-	if strings.TrimSpace(filePath) == "" {
-		c.AbortWithStatus(http.StatusNotFound)
+	panel, err := managementasset.LoadManagementPanel(s.configFilePath)
+	if err != nil {
+		log.WithError(err).Error("failed to load management control panel")
+		c.AbortWithStatus(http.StatusInternalServerError)
 		return
 	}
 
-	if _, err := os.Stat(filePath); err != nil {
-		if os.IsNotExist(err) {
-			// Synchronously ensure management.html is available with a detached context.
-			// Control panel bootstrap should not be canceled by client disconnects.
-			if !managementasset.EnsureLatestManagementHTML(context.Background(), managementasset.StaticDir(s.configFilePath), cfg.ProxyURL) {
-				c.AbortWithStatus(http.StatusNotFound)
-				return
-			}
-		} else {
-			log.WithError(err).Error("failed to stat management control panel asset")
-			c.AbortWithStatus(http.StatusInternalServerError)
-			return
-		}
-	}
-
-	c.File(filePath)
+	c.Header("X-Management-Panel-Version", panel.Manifest.Version)
+	c.Header("X-Management-Panel-Source", panel.Source)
+	c.Data(http.StatusOK, "text/html; charset=utf-8", panel.HTML)
 }
 
 func (s *Server) enableKeepAlive(timeout time.Duration, onTimeout func()) {

@@ -16,10 +16,34 @@ env:
   IMAGE_NAME: ${{ github.repository }}
 
 jobs:
+  prepare-panel:
+    name: Prepare latest management panel
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Sync latest verified management panel
+        run: bash .github/scripts/sync-management-panel.sh
+
+      - name: Upload management panel assets
+        uses: actions/upload-artifact@v4
+        with:
+          name: management-panel-assets
+          path: |
+            internal/managementasset/assets/management.html.gz
+            internal/managementasset/assets/panel-manifest.json
+          if-no-files-found: error
+          retention-days: 1
+
   # ============================================
   # 阶段1: 并行构建各平台镜像
   # ============================================
   build:
+    needs: prepare-panel
     strategy:
       fail-fast: false
       matrix:
@@ -42,6 +66,12 @@ jobs:
 
       - name: Checkout
         uses: actions/checkout@v4
+
+      - name: Download management panel assets
+        uses: actions/download-artifact@v4
+        with:
+          name: management-panel-assets
+          path: internal/managementasset/assets
 
       - name: Set up Go
         uses: actions/setup-go@v5

@@ -49,7 +49,7 @@ func (h *Handler) UpdateManagementPanel(c *gin.Context) {
 		return
 	}
 
-	hash, err := updateLatestManagementPanelHTML(
+	result, err := updateLatestManagementPanelHTML(
 		c.Request.Context(),
 		staticDir,
 		h.cfg.ProxyURL,
@@ -59,5 +59,9 @@ func (h *Handler) UpdateManagementPanel(c *gin.Context) {
 		return
 	}
 
-	c.JSON(http.StatusOK, gin.H{"updated": true, "hash": hash})
+	c.JSON(http.StatusOK, gin.H{
+		"updated": result.Updated,
+		"version": result.Version,
+		"hash":    result.SHA256,
+	})
 }
