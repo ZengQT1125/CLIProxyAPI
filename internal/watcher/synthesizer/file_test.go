@@ -205,6 +205,25 @@ func TestSynthesizeNativeAuthFileRejectsMalformedJSON(t *testing.T) {
 	}
 }
 
+func TestSynthesizeNativeAuthFileCodexPlanTypeFallsBackToMetadata(t *testing.T) {
+	ctx := &SynthesisContext{
+		Config:  &config.Config{},
+		AuthDir: t.TempDir(),
+		Now:     time.Now(),
+	}
+	path := filepath.Join(ctx.AuthDir, "codex-imported.json")
+	result, errSynthesize := SynthesizeNativeAuthFile(ctx, path, []byte(`{"type":"codex","plan_type":"k12"}`))
+	if errSynthesize != nil {
+		t.Fatalf("SynthesizeNativeAuthFile() error = %v", errSynthesize)
+	}
+	if len(result.Auths) != 1 {
+		t.Fatalf("SynthesizeNativeAuthFile() auth count = %d, want 1", len(result.Auths))
+	}
+	if got := result.Auths[0].Attributes["plan_type"]; got != "k12" {
+		t.Fatalf("plan_type attribute = %q, want k12", got)
+	}
+}
+
 func TestSynthesizeAuthFileExpandsPluginMultiAuths(t *testing.T) {
 	tempDir := t.TempDir()
 	fullPath := filepath.Join(tempDir, "geminicli.json")

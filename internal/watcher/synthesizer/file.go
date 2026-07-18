@@ -242,14 +242,27 @@ func synthesizeNativeFileAuths(ctx *SynthesisContext, fullPath string, metadata 
 	coreauth.ApplyCustomHeadersFromMetadata(a)
 	coreauth.SetOAuthModelAliasesAttribute(a, perAccountModelAliases)
 	ApplyAuthExcludedModelsMeta(a, cfg, perAccountExcluded, "oauth")
-	// For codex auth files, extract plan_type from the JWT id_token.
+	// Prefer the signed JWT claim, then fall back to explicit metadata for imports
+	// that do not carry an ID token.
 	if provider == "codex" {
+		planType := ""
 		if idTokenRaw, ok := metadata["id_token"].(string); ok && strings.TrimSpace(idTokenRaw) != "" {
 			if claims, errParse := codex.ParseJWTToken(idTokenRaw); errParse == nil && claims != nil {
-				if pt := strings.TrimSpace(claims.CodexAuthInfo.ChatgptPlanType); pt != "" {
-					a.Attributes["plan_type"] = pt
+				planType = strings.TrimSpace(claims.CodexAuthInfo.ChatgptPlanType)
+			}
+		}
+		if planType == "" {
+			for _, key := range []string{"plan_type", "chatgpt_plan_type"} {
+				if value, ok := metadata[key].(string); ok {
+					planType = strings.TrimSpace(value)
+					if planType != "" {
+						break
+					}
 				}
 			}
+		}
+		if planType != "" {
+			a.Attributes["plan_type"] = planType
 		}
 	}
 	return []*coreauth.Auth{a}

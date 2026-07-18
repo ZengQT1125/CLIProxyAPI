@@ -187,15 +187,26 @@ func (o *CodexAuth) ExchangeCodeForTokensWithRedirect(ctx context.Context, code,
 // This method is called when an access token has expired. It makes a request to the
 // token endpoint to obtain a new set of tokens.
 func (o *CodexAuth) RefreshTokens(ctx context.Context, refreshToken string) (*CodexTokenData, error) {
+	return o.RefreshTokensWithClientID(ctx, refreshToken, "")
+}
+
+// RefreshTokensWithClientID refreshes a token with the OAuth client that issued it.
+// An empty client ID keeps the native Codex login behavior.
+func (o *CodexAuth) RefreshTokensWithClientID(ctx context.Context, refreshToken, clientID string) (*CodexTokenData, error) {
 	if refreshToken == "" {
 		return nil, fmt.Errorf("refresh token is required")
 	}
 	if ctx == nil {
 		ctx = context.Background()
 	}
+	clientID = strings.TrimSpace(clientID)
+	if clientID == "" {
+		clientID = ClientID
+	}
 
-	result, err, _ := codexRefreshGroup.Do(refreshToken, func() (interface{}, error) {
-		return o.refreshTokensSingleFlight(context.WithoutCancel(ctx), refreshToken)
+	refreshKey := clientID + "\x00" + refreshToken
+	result, err, _ := codexRefreshGroup.Do(refreshKey, func() (interface{}, error) {
+		return o.refreshTokensSingleFlight(context.WithoutCancel(ctx), refreshToken, clientID)
 	})
 	if err != nil {
 		return nil, err
@@ -207,9 +218,9 @@ func (o *CodexAuth) RefreshTokens(ctx context.Context, refreshToken string) (*Co
 	return tokenData, nil
 }
 
-func (o *CodexAuth) refreshTokensSingleFlight(ctx context.Context, refreshToken string) (*CodexTokenData, error) {
+func (o *CodexAuth) refreshTokensSingleFlight(ctx context.Context, refreshToken, clientID string) (*CodexTokenData, error) {
 	data := url.Values{
-		"client_id":     {ClientID},
+		"client_id":     {clientID},
 		"grant_type":    {"refresh_token"},
 		"refresh_token": {refreshToken},
 		"scope":         {"openid profile email"},
@@ -297,6 +308,11 @@ func (o *CodexAuth) CreateTokenStorage(bundle *CodexAuthBundle) *CodexTokenStora
 // It attempts to refresh the tokens up to a specified maximum number of retries,
 // with an exponential backoff strategy to handle transient network errors.
 func (o *CodexAuth) RefreshTokensWithRetry(ctx context.Context, refreshToken string, sourceLabel string, maxRetries int) (*CodexTokenData, error) {
+	return o.RefreshTokensWithRetryAndClientID(ctx, refreshToken, "", sourceLabel, maxRetries)
+}
+
+// RefreshTokensWithRetryAndClientID retries refreshes with the OAuth client that issued the token.
+func (o *CodexAuth) RefreshTokensWithRetryAndClientID(ctx context.Context, refreshToken, clientID, sourceLabel string, maxRetries int) (*CodexTokenData, error) {
 	var lastErr error
 	logLabel := refreshLogSourceLabel(sourceLabel)
 
@@ -310,7 +326,7 @@ func (o *CodexAuth) RefreshTokensWithRetry(ctx context.Context, refreshToken str
 			}
 		}
 
-		tokenData, err := o.RefreshTokens(ctx, refreshToken)
+		tokenData, err := o.RefreshTokensWithClientID(ctx, refreshToken, clientID)
 		if err == nil {
 			return tokenData, nil
 		}

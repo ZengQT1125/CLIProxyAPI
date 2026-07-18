@@ -52,6 +52,93 @@ func TestRefreshTokensWithRetry_NonRetryableOnlyAttemptsOnce(t *testing.T) {
 	}
 }
 
+func TestRefreshTokensWithClientID_UsesProvidedClientID(t *testing.T) {
+	resetCodexRefreshGroupForTest()
+	t.Cleanup(resetCodexRefreshGroupForTest)
+
+	var gotClientID string
+	auth := &CodexAuth{
+		httpClient: &http.Client{
+			Transport: roundTripFunc(func(req *http.Request) (*http.Response, error) {
+				if errParse := req.ParseForm(); errParse != nil {
+					t.Fatalf("parse refresh form: %v", errParse)
+				}
+				gotClientID = req.PostForm.Get("client_id")
+				return &http.Response{
+					StatusCode: http.StatusOK,
+					Body: io.NopCloser(strings.NewReader(`{
+						"access_token":"new-access",
+						"refresh_token":"new-refresh",
+						"expires_in":3600
+					}`)),
+					Header:  make(http.Header),
+					Request: req,
+				}, nil
+			}),
+		},
+	}
+
+	if _, errRefresh := auth.RefreshTokensWithClientID(context.Background(), "refresh-token", "imported-client-id"); errRefresh != nil {
+		t.Fatalf("refresh tokens: %v", errRefresh)
+	}
+	if gotClientID != "imported-client-id" {
+		t.Fatalf("refresh client_id = %q, want imported-client-id", gotClientID)
+	}
+}
+
+func TestRefreshTokensWithClientID_DoesNotMergeDifferentClients(t *testing.T) {
+	resetCodexRefreshGroupForTest()
+	t.Cleanup(resetCodexRefreshGroupForTest)
+
+	started := make(chan string, 2)
+	release := make(chan struct{})
+	auth := &CodexAuth{
+		httpClient: &http.Client{
+			Transport: roundTripFunc(func(req *http.Request) (*http.Response, error) {
+				if errParse := req.ParseForm(); errParse != nil {
+					return nil, errParse
+				}
+				started <- req.PostForm.Get("client_id")
+				<-release
+				return &http.Response{
+					StatusCode: http.StatusOK,
+					Body:       io.NopCloser(strings.NewReader(`{"access_token":"new-access","expires_in":3600}`)),
+					Header:     make(http.Header),
+					Request:    req,
+				}, nil
+			}),
+		},
+	}
+
+	errs := make(chan error, 2)
+	for _, clientID := range []string{"client-a", "client-b"} {
+		clientID := clientID
+		go func() {
+			_, errRefresh := auth.RefreshTokensWithClientID(context.Background(), "shared-refresh-token", clientID)
+			errs <- errRefresh
+		}()
+	}
+	gotClients := map[string]bool{}
+	for range 2 {
+		select {
+		case clientID := <-started:
+			gotClients[clientID] = true
+		case <-time.After(2 * time.Second):
+			close(release)
+			t.Fatal("different OAuth clients were merged into one refresh request")
+		}
+	}
+	close(release)
+	for range 2 {
+		if errRefresh := <-errs; errRefresh != nil {
+			t.Fatalf("refresh tokens: %v", errRefresh)
+		}
+	}
+	if !gotClients["client-a"] || !gotClients["client-b"] {
+		t.Fatalf("refresh client IDs = %#v, want client-a and client-b", gotClients)
+	}
+}
+
 func TestRefreshTokens_DeduplicatesConcurrentRefreshAcrossInstances(t *testing.T) {
 	resetCodexRefreshGroupForTest()
 	t.Cleanup(resetCodexRefreshGroupForTest)

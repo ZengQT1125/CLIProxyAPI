@@ -49,7 +49,7 @@ var lastRefreshKeys = []string{"last_refresh", "lastRefresh", "last_refreshed_at
 const (
 	anthropicCallbackPort = 54545
 	codexCallbackPort     = 1455
-	maxAuthUploadFiles = 10000
+	maxAuthUploadFiles    = 10000
 	// Hard caps against archive bombs when bulk-importing auth archives.
 	maxAuthArchiveUncompressedFile  = 8 << 20   // 8 MiB per entry
 	maxAuthArchiveUncompressedTotal = 512 << 20 // 512 MiB across the archive
@@ -860,6 +860,7 @@ func (h *Handler) DownloadAuthFile(c *gin.Context) {
 
 // Upload auth file: multipart (json and/or archives), raw JSON with ?name=.json,
 // or a raw archive body with ?name=.zip|.tar|.tar.gz|.tgz / matching Content-Type.
+// Sub2API account data is expanded into native Codex or xAI auth files.
 // Supported archives: zip, tar, tar.gz/tgz.
 func (h *Handler) UploadAuthFile(c *gin.Context) {
 	if h.authManager == nil {
@@ -886,7 +887,7 @@ func (h *Handler) UploadAuthFile(c *gin.Context) {
 			c.JSON(http.StatusBadRequest, gin.H{"error": "empty archive body"})
 			return
 		}
-		h.respondAuthArchiveUpload(c, h.importAuthFilesFromArchiveBytes(ctx, format, data))
+		h.respondAuthBatchUpload(c, h.importAuthFilesFromArchiveBytes(ctx, format, data, maxAuthUploadFiles))
 		return
 	}
 
@@ -901,6 +902,10 @@ func (h *Handler) UploadAuthFile(c *gin.Context) {
 	data, err := io.ReadAll(c.Request.Body)
 	if err != nil {
 		c.JSON(400, gin.H{"error": "failed to read body"})
+		return
+	}
+	if result, handled := h.importSub2APIData(ctx, data, maxAuthUploadFiles); handled {
+		h.respondAuthBatchUpload(c, result)
 		return
 	}
 	if err = h.writeAuthFile(ctx, filepath.Base(name), data); err != nil {
@@ -1187,10 +1192,10 @@ type authUploadFailure struct {
 	err  error
 }
 
-type authArchiveImportResult struct {
+type authFileImportResult struct {
 	uploaded int
 	failed   []authUploadFailure
-	// fatal is set when the archive itself is unusable (not per-entry failures).
+	// fatal is set when the uploaded container itself is unusable.
 	fatal error
 }
 
@@ -1266,6 +1271,11 @@ func (h *Handler) uploadMultipartAuthFiles(c *gin.Context, ctx context.Context) 
 		}
 
 		partCount++
+		if partCount > maxAuthUploadFiles {
+			_ = part.Close()
+			c.JSON(http.StatusRequestEntityTooLarge, gin.H{"error": fmt.Sprintf("too many files: maximum is %d", maxAuthUploadFiles)})
+			return
+		}
 		baseName := filepath.Base(filename)
 		if format := detectAuthArchiveFormat(baseName, ""); format != authArchiveUnknown {
 			data, errRead := io.ReadAll(part)
@@ -1276,8 +1286,12 @@ func (h *Handler) uploadMultipartAuthFiles(c *gin.Context, ctx context.Context) 
 				failed = append(failed, authUploadFailure{name: baseName, err: fmt.Errorf("failed to read uploaded archive: %w", errRead)})
 				continue
 			}
-			result := h.importAuthFilesFromArchiveBytes(ctx, format, data)
+			result := h.importAuthFilesFromArchiveBytes(ctx, format, data, maxAuthUploadFiles-fileCount)
 			if result.fatal != nil {
+				if errors.Is(result.fatal, errAuthUploadFileLimit) {
+					c.JSON(http.StatusRequestEntityTooLarge, gin.H{"error": result.fatal.Error()})
+					return
+				}
 				failed = append(failed, authUploadFailure{name: baseName, err: result.fatal})
 				continue
 			}
@@ -1291,22 +1305,32 @@ func (h *Handler) uploadMultipartAuthFiles(c *gin.Context, ctx context.Context) 
 			continue
 		}
 
-		fileCount++
-		if fileCount > maxAuthUploadFiles {
+		if fileCount >= maxAuthUploadFiles {
 			_ = part.Close()
 			c.JSON(http.StatusRequestEntityTooLarge, gin.H{"error": fmt.Sprintf("too many files: maximum is %d", maxAuthUploadFiles)})
 			return
 		}
 
-		_, errUpload := h.storeUploadedAuthFile(ctx, filename, part)
+		result := h.importUploadedAuthFile(ctx, filename, part, maxAuthUploadFiles-fileCount)
 		if errClose := part.Close(); errClose != nil {
 			log.WithError(errClose).Warn("failed to close uploaded auth file part")
 		}
-		if errUpload != nil {
-			failed = append(failed, authUploadFailure{name: baseName, err: errUpload})
+		if result.fatal != nil {
+			if errors.Is(result.fatal, errAuthUploadFileLimit) {
+				c.JSON(http.StatusRequestEntityTooLarge, gin.H{"error": result.fatal.Error()})
+				return
+			}
+			failed = append(failed, authUploadFailure{name: baseName, err: result.fatal})
 			continue
 		}
-		uploadedCount++
+		logicalFiles := result.uploaded + len(result.failed)
+		if fileCount+logicalFiles > maxAuthUploadFiles {
+			c.JSON(http.StatusRequestEntityTooLarge, gin.H{"error": fmt.Sprintf("too many files: maximum is %d", maxAuthUploadFiles)})
+			return
+		}
+		fileCount += logicalFiles
+		uploadedCount += result.uploaded
+		failed = append(failed, result.failed...)
 	}
 
 	switch {
@@ -1348,9 +1372,13 @@ func (h *Handler) uploadMultipartAuthFiles(c *gin.Context, ctx context.Context) 
 	}
 }
 
-func (h *Handler) respondAuthArchiveUpload(c *gin.Context, result authArchiveImportResult) {
+func (h *Handler) respondAuthBatchUpload(c *gin.Context, result authFileImportResult) {
 	if result.fatal != nil {
-		c.JSON(http.StatusBadRequest, gin.H{"error": result.fatal.Error()})
+		status := http.StatusBadRequest
+		if errors.Is(result.fatal, errAuthUploadFileLimit) {
+			status = http.StatusRequestEntityTooLarge
+		}
+		c.JSON(status, gin.H{"error": result.fatal.Error()})
 		return
 	}
 	total := result.uploaded + len(result.failed)
@@ -1376,37 +1404,40 @@ func (h *Handler) respondAuthArchiveUpload(c *gin.Context, result authArchiveImp
 	}
 }
 
-func (h *Handler) importAuthFilesFromArchiveBytes(ctx context.Context, format authArchiveFormat, data []byte) authArchiveImportResult {
+func (h *Handler) importAuthFilesFromArchiveBytes(ctx context.Context, format authArchiveFormat, data []byte, maxFiles int) authFileImportResult {
 	if len(data) == 0 {
-		return authArchiveImportResult{fatal: fmt.Errorf("empty archive body")}
+		return authFileImportResult{fatal: fmt.Errorf("empty archive body")}
+	}
+	if maxFiles < 1 {
+		return authFileImportResult{fatal: authUploadFileLimitError()}
 	}
 	switch format {
 	case authArchiveZip:
-		return h.importAuthFilesFromZipBytes(ctx, data)
+		return h.importAuthFilesFromZipBytes(ctx, data, maxFiles)
 	case authArchiveTar:
-		return h.importAuthFilesFromTarReader(ctx, tar.NewReader(bytes.NewReader(data)))
+		return h.importAuthFilesFromTarReader(ctx, tar.NewReader(bytes.NewReader(data)), maxFiles)
 	case authArchiveTarGz:
 		gz, err := gzip.NewReader(bytes.NewReader(data))
 		if err != nil {
-			return authArchiveImportResult{fatal: fmt.Errorf("invalid gzip archive: %w", err)}
+			return authFileImportResult{fatal: fmt.Errorf("invalid gzip archive: %w", err)}
 		}
 		defer gz.Close()
-		return h.importAuthFilesFromTarReader(ctx, tar.NewReader(gz))
+		return h.importAuthFilesFromTarReader(ctx, tar.NewReader(gz), maxFiles)
 	default:
-		return authArchiveImportResult{fatal: fmt.Errorf("unsupported archive format")}
+		return authFileImportResult{fatal: fmt.Errorf("unsupported archive format")}
 	}
 }
 
-func (h *Handler) importAuthFilesFromZipBytes(ctx context.Context, data []byte) authArchiveImportResult {
+func (h *Handler) importAuthFilesFromZipBytes(ctx context.Context, data []byte, maxFiles int) authFileImportResult {
 	reader, err := zip.NewReader(bytes.NewReader(data), int64(len(data)))
 	if err != nil {
-		return authArchiveImportResult{fatal: fmt.Errorf("invalid zip archive: %w", err)}
+		return authFileImportResult{fatal: fmt.Errorf("invalid zip archive: %w", err)}
 	}
-	return h.importAuthFilesFromZipReader(ctx, reader)
+	return h.importAuthFilesFromZipReader(ctx, reader, maxFiles)
 }
 
-func (h *Handler) importAuthFilesFromZipReader(ctx context.Context, reader *zip.Reader) authArchiveImportResult {
-	result := authArchiveImportResult{failed: make([]authUploadFailure, 0)}
+func (h *Handler) importAuthFilesFromZipReader(ctx context.Context, reader *zip.Reader, maxFiles int) authFileImportResult {
+	result := authFileImportResult{failed: make([]authUploadFailure, 0)}
 	if reader == nil {
 		result.fatal = fmt.Errorf("invalid zip archive")
 		return result
@@ -1427,8 +1458,8 @@ func (h *Handler) importAuthFilesFromZipReader(ctx context.Context, reader *zip.
 		}
 
 		seen++
-		if seen > maxAuthUploadFiles {
-			result.fatal = fmt.Errorf("too many files: maximum is %d", maxAuthUploadFiles)
+		if seen > maxFiles {
+			result.fatal = authUploadFileLimitError()
 			return result
 		}
 		if entry.UncompressedSize64 > maxAuthArchiveUncompressedFile {
@@ -1457,11 +1488,11 @@ func (h *Handler) importAuthFilesFromZipReader(ctx context.Context, reader *zip.
 		}
 		uncompressedTotal += int64(len(payload))
 
-		if errWrite := h.writeAuthFile(ctx, base, payload); errWrite != nil {
-			result.failed = append(result.failed, authUploadFailure{name: base, err: errWrite})
-			continue
+		logicalFiles := result.uploaded + len(result.failed)
+		entryResult := h.importUploadedAuthFile(ctx, base, bytes.NewReader(payload), maxFiles-logicalFiles)
+		if !mergeAuthFileImportResult(&result, base, entryResult) {
+			return result
 		}
-		result.uploaded++
 	}
 
 	if result.uploaded == 0 && len(result.failed) == 0 {
@@ -1470,8 +1501,8 @@ func (h *Handler) importAuthFilesFromZipReader(ctx context.Context, reader *zip.
 	return result
 }
 
-func (h *Handler) importAuthFilesFromTarReader(ctx context.Context, reader *tar.Reader) authArchiveImportResult {
-	result := authArchiveImportResult{failed: make([]authUploadFailure, 0)}
+func (h *Handler) importAuthFilesFromTarReader(ctx context.Context, reader *tar.Reader, maxFiles int) authFileImportResult {
+	result := authFileImportResult{failed: make([]authUploadFailure, 0)}
 	if reader == nil {
 		result.fatal = fmt.Errorf("invalid tar archive")
 		return result
@@ -1508,8 +1539,8 @@ func (h *Handler) importAuthFilesFromTarReader(ctx context.Context, reader *tar.
 		}
 
 		seen++
-		if seen > maxAuthUploadFiles {
-			result.fatal = fmt.Errorf("too many files: maximum is %d", maxAuthUploadFiles)
+		if seen > maxFiles {
+			result.fatal = authUploadFileLimitError()
 			return result
 		}
 		if header.Size > maxAuthArchiveUncompressedFile {
@@ -1533,17 +1564,31 @@ func (h *Handler) importAuthFilesFromTarReader(ctx context.Context, reader *tar.
 		}
 		uncompressedTotal += int64(len(payload))
 
-		if errWrite := h.writeAuthFile(ctx, base, payload); errWrite != nil {
-			result.failed = append(result.failed, authUploadFailure{name: base, err: errWrite})
-			continue
+		logicalFiles := result.uploaded + len(result.failed)
+		entryResult := h.importUploadedAuthFile(ctx, base, bytes.NewReader(payload), maxFiles-logicalFiles)
+		if !mergeAuthFileImportResult(&result, base, entryResult) {
+			return result
 		}
-		result.uploaded++
 	}
 
 	if result.uploaded == 0 && len(result.failed) == 0 {
 		result.fatal = fmt.Errorf("archive contains no .json auth files")
 	}
 	return result
+}
+
+func mergeAuthFileImportResult(result *authFileImportResult, containerName string, imported authFileImportResult) bool {
+	if imported.fatal != nil {
+		if errors.Is(imported.fatal, errAuthUploadFileLimit) {
+			result.fatal = imported.fatal
+			return false
+		}
+		result.failed = append(result.failed, authUploadFailure{name: containerName, err: imported.fatal})
+		return true
+	}
+	result.uploaded += imported.uploaded
+	result.failed = append(result.failed, imported.failed...)
+	return true
 }
 
 // authArchiveEntryBaseName normalizes an archive entry path into a safe basename.
@@ -1587,39 +1632,36 @@ func readAuthArchiveEntry(r io.Reader, declaredSize int64) ([]byte, error) {
 	return payload, nil
 }
 
-func (h *Handler) storeUploadedAuthFile(ctx context.Context, filename string, src io.Reader) (string, error) {
-	name := filepath.Base(strings.TrimSpace(filename))
-	if format := detectAuthArchiveFormat(name, ""); format != authArchiveUnknown {
-		data, err := io.ReadAll(src)
-		if err != nil {
-			return "", fmt.Errorf("failed to read uploaded archive: %w", err)
-		}
-		result := h.importAuthFilesFromArchiveBytes(ctx, format, data)
-		if result.fatal != nil {
-			return "", result.fatal
-		}
-		if result.uploaded == 0 && len(result.failed) > 0 {
-			return "", result.failed[0].err
-		}
-		if result.uploaded == 0 {
-			return "", fmt.Errorf("archive contains no .json auth files")
-		}
-		return name, nil
+func (h *Handler) importUploadedAuthFile(ctx context.Context, filename string, src io.Reader, maxFiles int) authFileImportResult {
+	if maxFiles < 1 {
+		return authFileImportResult{fatal: authUploadFileLimitError()}
 	}
+	name := filepath.Base(strings.TrimSpace(filename))
 	if !strings.HasSuffix(strings.ToLower(name), ".json") {
-		return "", errAuthFileMustBeJSON
+		return authFileImportResult{failed: []authUploadFailure{{name: name, err: errAuthFileMustBeJSON}}}
 	}
 	data, err := io.ReadAll(src)
 	if err != nil {
-		return "", fmt.Errorf("failed to read uploaded file: %w", err)
+		return authFileImportResult{failed: []authUploadFailure{{name: name, err: fmt.Errorf("failed to read uploaded file: %w", err)}}}
+	}
+	if result, handled := h.importSub2APIData(ctx, data, maxFiles); handled {
+		return result
 	}
 	if err := h.writeAuthFile(ctx, name, data); err != nil {
-		return "", err
+		return authFileImportResult{failed: []authUploadFailure{{name: name, err: err}}}
 	}
-	return name, nil
+	return authFileImportResult{uploaded: 1}
 }
 
 func (h *Handler) writeAuthFile(ctx context.Context, name string, data []byte) error {
+	return h.writeAuthFileWithMode(ctx, name, data, false)
+}
+
+func (h *Handler) writeNewAuthFile(ctx context.Context, name string, data []byte) error {
+	return h.writeAuthFileWithMode(ctx, name, data, true)
+}
+
+func (h *Handler) writeAuthFileWithMode(ctx context.Context, name string, data []byte, exclusive bool) error {
 	dst := filepath.Join(h.cfg.AuthDir, filepath.Base(name))
 	if !filepath.IsAbs(dst) {
 		if abs, errAbs := filepath.Abs(dst); errAbs == nil {
@@ -1640,7 +1682,21 @@ func (h *Handler) writeAuthFile(ctx context.Context, name string, data []byte) e
 			return errBuild
 		}
 	}
-	if errWrite := os.WriteFile(dst, data, 0o600); errWrite != nil {
+	if exclusive {
+		file, errOpen := os.OpenFile(dst, os.O_WRONLY|os.O_CREATE|os.O_EXCL, 0o600)
+		if errOpen != nil {
+			return fmt.Errorf("failed to create file: %w", errOpen)
+		}
+		if _, errWrite := file.Write(data); errWrite != nil {
+			_ = file.Close()
+			_ = os.Remove(dst)
+			return fmt.Errorf("failed to write file: %w", errWrite)
+		}
+		if errClose := file.Close(); errClose != nil {
+			_ = os.Remove(dst)
+			return fmt.Errorf("failed to close file: %w", errClose)
+		}
+	} else if errWrite := os.WriteFile(dst, data, 0o600); errWrite != nil {
 		return fmt.Errorf("failed to write file: %w", errWrite)
 	}
 	h.notifyAuthFileMutation(dst)
