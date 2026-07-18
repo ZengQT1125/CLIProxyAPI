@@ -759,6 +759,23 @@ func isUnsafeAuthFileName(name string) bool {
 	return false
 }
 
+// isAuthUploadCredentialName reports whether a direct upload basename is an auth
+// credential payload. .txt is accepted as an alias and rewritten to .json on save.
+func isAuthUploadCredentialName(name string) bool {
+	lower := strings.ToLower(strings.TrimSpace(name))
+	return strings.HasSuffix(lower, ".json") || strings.HasSuffix(lower, ".txt")
+}
+
+// normalizeAuthUploadCredentialName rewrites upload aliases to the on-disk name.
+// Auth credentials are always stored as .json.
+func normalizeAuthUploadCredentialName(name string) string {
+	base := filepath.Base(strings.TrimSpace(name))
+	if strings.HasSuffix(strings.ToLower(base), ".txt") {
+		return base[:len(base)-4] + ".json"
+	}
+	return base
+}
+
 func queryRequestsAll(value string) bool {
 	switch strings.TrimSpace(strings.ToLower(value)) {
 	case "1", "true", "*":
@@ -858,8 +875,9 @@ func (h *Handler) DownloadAuthFile(c *gin.Context) {
 	c.Data(200, "application/json", data)
 }
 
-// Upload auth file: multipart (json and/or archives), raw JSON with ?name=.json,
+// Upload auth file: multipart (json/txt and/or archives), raw JSON with ?name=.json|.txt,
 // or a raw archive body with ?name=.zip|.tar|.tar.gz|.tgz / matching Content-Type.
+// .txt is accepted as a credential alias and rewritten to .json on disk.
 // Sub2API account data is expanded into native Codex or xAI auth files.
 // Supported archives: zip, tar, tar.gz/tgz.
 func (h *Handler) UploadAuthFile(c *gin.Context) {
@@ -895,8 +913,8 @@ func (h *Handler) UploadAuthFile(c *gin.Context) {
 		c.JSON(400, gin.H{"error": "invalid name"})
 		return
 	}
-	if !strings.HasSuffix(strings.ToLower(name), ".json") {
-		c.JSON(400, gin.H{"error": "name must end with .json, .zip, .tar, .tar.gz, or .tgz"})
+	if !isAuthUploadCredentialName(name) {
+		c.JSON(400, gin.H{"error": "name must end with .json, .txt, .zip, .tar, .tar.gz, or .tgz"})
 		return
 	}
 	data, err := io.ReadAll(c.Request.Body)
@@ -908,7 +926,7 @@ func (h *Handler) UploadAuthFile(c *gin.Context) {
 		h.respondAuthBatchUpload(c, result)
 		return
 	}
-	if err = h.writeAuthFile(ctx, filepath.Base(name), data); err != nil {
+	if err = h.writeAuthFile(ctx, normalizeAuthUploadCredentialName(name), data); err != nil {
 		c.JSON(500, gin.H{"error": err.Error()})
 		return
 	}
@@ -1340,14 +1358,14 @@ func (h *Handler) uploadMultipartAuthFiles(c *gin.Context, ctx context.Context) 
 		// Single archive/part that produced only a fatal/entry failure with zero successes.
 		failure := failed[0]
 		if errors.Is(failure.err, errAuthFileMustBeJSON) {
-			c.JSON(http.StatusBadRequest, gin.H{"error": "file must be .json, .zip, .tar, .tar.gz, or .tgz"})
+			c.JSON(http.StatusBadRequest, gin.H{"error": "file must be .json, .txt, .zip, .tar, .tar.gz, or .tgz"})
 			return
 		}
 		c.JSON(http.StatusBadRequest, gin.H{"error": failure.err.Error()})
 	case fileCount == 1 && len(failed) == 1 && uploadedCount == 0:
 		failure := failed[0]
 		if errors.Is(failure.err, errAuthFileMustBeJSON) {
-			c.JSON(http.StatusBadRequest, gin.H{"error": "file must be .json, .zip, .tar, .tar.gz, or .tgz"})
+			c.JSON(http.StatusBadRequest, gin.H{"error": "file must be .json, .txt, .zip, .tar, .tar.gz, or .tgz"})
 			return
 		}
 		c.JSON(http.StatusInternalServerError, gin.H{"error": failure.err.Error()})
@@ -1358,7 +1376,7 @@ func (h *Handler) uploadMultipartAuthFiles(c *gin.Context, ctx context.Context) 
 		for _, failure := range failed {
 			msg := failure.err.Error()
 			if errors.Is(failure.err, errAuthFileMustBeJSON) {
-				msg = "file must be .json"
+				msg = "file must be .json or .txt"
 			}
 			failedPayload = append(failedPayload, gin.H{"name": failure.name, "error": msg})
 		}
@@ -1637,9 +1655,10 @@ func (h *Handler) importUploadedAuthFile(ctx context.Context, filename string, s
 		return authFileImportResult{fatal: authUploadFileLimitError()}
 	}
 	name := filepath.Base(strings.TrimSpace(filename))
-	if !strings.HasSuffix(strings.ToLower(name), ".json") {
+	if !isAuthUploadCredentialName(name) {
 		return authFileImportResult{failed: []authUploadFailure{{name: name, err: errAuthFileMustBeJSON}}}
 	}
+	storedName := normalizeAuthUploadCredentialName(name)
 	data, err := io.ReadAll(src)
 	if err != nil {
 		return authFileImportResult{failed: []authUploadFailure{{name: name, err: fmt.Errorf("failed to read uploaded file: %w", err)}}}
@@ -1647,7 +1666,7 @@ func (h *Handler) importUploadedAuthFile(ctx context.Context, filename string, s
 	if result, handled := h.importSub2APIData(ctx, data, maxFiles); handled {
 		return result
 	}
-	if err := h.writeAuthFile(ctx, name, data); err != nil {
+	if err := h.writeAuthFile(ctx, storedName, data); err != nil {
 		return authFileImportResult{failed: []authUploadFailure{{name: name, err: err}}}
 	}
 	return authFileImportResult{uploaded: 1}

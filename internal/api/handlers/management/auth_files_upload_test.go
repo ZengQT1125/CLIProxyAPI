@@ -317,3 +317,67 @@ func TestUploadAuthFile_ReplacingSameNameClearsRuntimeErrorState(t *testing.T) {
 		t.Fatalf("model states survived same-name replacement: %+v", replacedAuth.ModelStates)
 	}
 }
+
+func TestUploadAuthFile_TxtMultipartRewritesToJSON(t *testing.T) {
+	t.Setenv("MANAGEMENT_PASSWORD", "")
+	gin.SetMode(gin.TestMode)
+
+	authDir := t.TempDir()
+	manager := coreauth.NewManager(nil, nil, nil)
+	h := NewHandlerWithoutConfigFilePath(&config.Config{AuthDir: authDir}, manager)
+
+	uploadMultipartAuthFile(t, h, "codex-user@example.com.txt", `{"type":"codex","email":"user@example.com"}`)
+
+	storedName := "codex-user@example.com.json"
+	if _, err := os.Stat(filepath.Join(authDir, storedName)); err != nil {
+		t.Fatalf("expected rewritten auth file %q: %v", storedName, err)
+	}
+	if _, err := os.Stat(filepath.Join(authDir, "codex-user@example.com.txt")); !os.IsNotExist(err) {
+		t.Fatalf("did not expect .txt file on disk, err=%v", err)
+	}
+	if _, ok := manager.GetByID(storedName); !ok {
+		t.Fatalf("expected uploaded auth record %q to exist", storedName)
+	}
+}
+
+func TestUploadAuthFile_TxtRawBodyRewritesToJSON(t *testing.T) {
+	t.Setenv("MANAGEMENT_PASSWORD", "")
+	gin.SetMode(gin.TestMode)
+
+	authDir := t.TempDir()
+	manager := coreauth.NewManager(nil, nil, nil)
+	h := NewHandlerWithoutConfigFilePath(&config.Config{AuthDir: authDir}, manager)
+
+	content := `{"type":"codex","email":"raw@example.com"}`
+	rec := httptest.NewRecorder()
+	ctx, _ := gin.CreateTestContext(rec)
+	req := httptest.NewRequest(
+		http.MethodPost,
+		"/v0/management/auth-files?name="+url.QueryEscape("codex-raw@example.com.txt"),
+		bytes.NewReader([]byte(content)),
+	)
+	req.Header.Set("Content-Type", "application/json")
+	ctx.Request = req
+
+	h.UploadAuthFile(ctx)
+
+	if rec.Code != http.StatusOK {
+		t.Fatalf("expected upload status %d, got %d with body %s", http.StatusOK, rec.Code, rec.Body.String())
+	}
+
+	storedName := "codex-raw@example.com.json"
+	data, err := os.ReadFile(filepath.Join(authDir, storedName))
+	if err != nil {
+		t.Fatalf("expected rewritten auth file %q: %v", storedName, err)
+	}
+	var saved map[string]any
+	if err = json.Unmarshal(data, &saved); err != nil {
+		t.Fatalf("failed to decode saved auth file: %v", err)
+	}
+	if got := saved["email"]; got != "raw@example.com" {
+		t.Fatalf("saved email = %#v, want %q", got, "raw@example.com")
+	}
+	if _, ok := manager.GetByID(storedName); !ok {
+		t.Fatalf("expected uploaded auth record %q to exist", storedName)
+	}
+}
