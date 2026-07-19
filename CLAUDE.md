@@ -8,14 +8,14 @@ AI 工作指南。**必读 Fork-Specific 部分**——合并上游或重构时�
 
 - Module: `github.com/router-for-me/CLIProxyAPI/v7`
 - Go 1.26.0
-- 上游 `router-for-me/CLIProxyAPI`（远程 `upstream`），当前基于 v7.2.73
-- Fork 增量: SF routing · usage 持久化 · 管理中心 · TUI · 管理面板自动更新
+- 上游 `router-for-me/CLIProxyAPI`（远程 `upstream`），当前基于 v7.2.88
+- Fork 增量: SF routing · 冷却状态持久化 · 渐进式凭证加载 · usage 持久化 · 管理中心 · 管理面板资源管理 · provider/protocol 修复
 - Fork tag 命名: `fork/v*`（如 `fork/v8.20.1`），与上游 `v7.x.x` tag 共存
 
 ## Hard Constraints
 
 - `internal/translator/` 是 PR 受保护路径——上游 CI 自动拒绝该目录的 PR。修改需走 issue。
-- `fork/v*` tag 触发 docker-image 工作流，构建多架构镜像推送到 `ghcr.io`（非 DockerHub）。
+- `fork/v*` tag 同时触发 release 和 docker-image 工作流；构建前同步并校验管理面板资源，多架构镜像推送到 `ghcr.io`（非 DockerHub）。
 - 构建参数: `CGO_ENABLED=0`，静态链接，`-trimpath`，版本通过 ldflags 注入。
 - 合并上游前必读「Fork-Specific Modifications」清单；任何 fork-only 文件被删/覆盖即为合并错误。
 
@@ -60,7 +60,8 @@ Executor 负责：构造上游请求、处理认证、流式/非流式转发、�
 
 ### 热重载
 
-`internal/watcher/` 通过 `fsnotify` 监控 config 和 auth 文件变更，变更后自动重载配置和凭证，无需重启。
+`internal/watcher/` 通过 `fsnotify` 监控 config 和 auth 文件变更，变更后自动重载，无需重启。
+启动时 auth 文件由有界 worker pool 渐进加载；服务先启动，再持续注册扫描结果。新扫描会取代旧扫描，失败或过期结果不得污染运行态。
 
 ## Module Map
 
@@ -72,13 +73,13 @@ Executor 负责：构造上游请求、处理认证、流式/非流式转发、�
 | `internal/runtime/executor/` | Provider executor: Gemini / Gemini-CLI / Gemini-Vertex / Claude / Codex / Codex-WebSocket / Antigravity / Kimi / AIStudio / OpenAI-compat / xAI |
 | `internal/translator/` | 请求/响应跨格式转换（受 PR 守卫保护） |
 | `internal/thinking/provider/` | 扩展思考/推理 |
-| `internal/watcher/` | config & auth 文件热重载 |
+| `internal/watcher/` | config/auth 热重载；**fork**：渐进式并行 auth 加载与状态快照 |
 | `internal/auth/` | 每 provider OAuth；`xai/` 使用 PKCE |
 | `internal/home/` | Home 控制平面：Redis 集群协调、TLS、cluster nodes 解析、Pub/Sub |
 | `internal/usage/` | **fork**：SQLite usage 日志、监控查询、PG 镜像 |
 | `internal/registry/` | 动态模型注册表 + `models/codex_client_models.json` |
 | `internal/tui/` | bubbletea TUI（dashboard/auth/config/keys/logs/oauth/usage） |
-| `internal/managementasset/` | **fork**：管理面板 HTML 自动下载更新（SHA256 校验、原子写） |
+| `internal/managementasset/` | **fork**：内嵌管理面板基线、manifest/SHA256 校验、磁盘升级与原子替换 |
 
 ## Key Interfaces
 
@@ -134,9 +135,10 @@ go test -count=1 ./internal/usage/                         # 禁用缓存
 ## Config
 
 - `config.yaml`（template: `config.example.yaml`）；`auths/*.json`；`.env`
-- 主要 sections: `tls` `remote-management` `routing` `proxy-url` `request-retry` `quota-exceeded` `payload` `oauth-model-alias` `oauth-excluded-models` `ws-auth` `usage-persistence-enabled` `delete-unauthorized-auth` `claude-header-defaults` `cloak` `passthrough-headers` `streaming` `home` `save-cooldown-status`
+- 主要 sections: `tls` `remote-management` `routing` `proxy-url` `request-retry` `quota-exceeded` `payload` `oauth-model-alias` `oauth-excluded-models` `ws-auth` `usage-persistence-enabled` `delete-unauthorized-auth` `auth-load-workers` `local-model` `claude-header-defaults` `codex.strip-intermediary-updates` `cloak` `passthrough-headers` `streaming` `home` `save-cooldown-status`
 - Token store env: 默认本地 file；`PGSTORE_*` / `GITSTORE_*` / `OBJECTSTORE_*`
-- `MANAGEMENT_STATIC_PATH`: 覆盖管理面板 HTML 目录（默认临时目录）
+- `MANAGEMENT_STATIC_PATH`: 覆盖管理面板磁盘升级目录；默认使用 writable path 下的 `static/`，否则回退到 config 所在目录的 `static/`
+- `MANAGEMENT_PANEL_DEV_PATH`: 显式开发面板覆盖；设置后直接使用该文件并跳过自动更新
 - Routing 策略: `round-robin`（default）· `fill-first`/`ff` · `sequential-fill`/`sf`（**fork**）
 
 ## API Routes
@@ -147,8 +149,8 @@ go test -count=1 ./internal/usage/                         # 禁用缓存
 | `/v1/images/generations`, `/v1/images/edits` | xAI Grok 等图像 |
 | `/v1/videos`, `/v1/videos/{generations,edits,extensions,:request_id}` | xAI Grok 视频 |
 | `/v1/responses` POST/GET | Responses API + WS 升级 |
-| `/v0/management/*` | 管理 API；`auth-files/*` CRUD；`plugins/:id` DELETE |
-| `/v0/management/custom/monitor/*` | **fork** 11 个监控端点 |
+| `/v0/management/*` | 管理 API；增强 auth-files 分页/批量修改/归档导入/过滤删除；panel latest/update；auth load status；`plugins/:id` DELETE |
+| `/v0/management/custom/monitor/*` | **fork** 13 个监控端点 |
 | `/v0/management/custom/codex-cleanup` | **fork** Codex 认证清理 |
 | `/xai/callback`, `/v1/ws` | xAI OAuth 回调 / WS |
 
@@ -156,92 +158,137 @@ go test -count=1 ./internal/usage/                         # 禁用缓存
 
 | Workflow | 触发 | 用途 |
 |---|---|---|
-| `release.yaml` | `fork/v*` tag · `workflow_dispatch` | 5 平台交叉编译（darwin/linux/windows × amd64/arm64），Conventional Commits release notes |
-| `docker-image.yml` | `fork/v*` tag · `workflow_dispatch` | 并行构建 linux/amd64 + linux/arm64，推送 `ghcr.io`，GHA 缓存 |
+| `release.yaml` | `fork/v*` tag · `workflow_dispatch` | 同步管理面板；5 平台交叉编译（darwin/linux/windows × amd64/arm64）；Conventional Commits release notes |
+| `docker-image.yml` | `fork/v*` tag · `workflow_dispatch` | 同步管理面板；并行构建 linux/amd64 + linux/arm64；推送 `ghcr.io`；GHA 缓存 |
 | `pr-path-guard.yml` | PR | 保护 `internal/translator/` 目录 |
 
 ---
 
 ## Fork-Specific Modifications (Upstream Merge Protection)
 
-> **合并上游时必须保护下列文件**。Upstream 不包含这些变更，被覆盖/删除 = 合并错误。
+> **合并上游时必须保护下列行为和文件**。清单以当前 `upstream/main`（v7.2.88）为基线；TUI 已在上游，不是 fork 增量。被覆盖/删除，或重新引入下面明确删除的上游文件，均属于合并错误。
 
 ### 1. Usage Persistence & SQLite Store
 
 Fork-only:
-- `internal/usage/store.go`（+`_test.go`）— SQLite usage log persistence with auto-cleanup
-- `internal/usage/database_plugin.go`（+`_test.go`）— PG log mirroring to local SQLite
-- `internal/usage/monitor_queries.go`（+`_test.go`）— dashboard 聚合查询 API
+- `internal/usage/store.go`（+`_test.go`）— SQLite usage 日志持久化与自动清理
+- `internal/usage/database_plugin.go`（+`_test.go`）— PG 日志镜像到本地 SQLite
+- `internal/usage/monitor_queries.go`（+`_test.go`）— dashboard 聚合查询
 - `internal/usage/logger_plugin.go`（+`_test.go`）— usage 统计 logger plugin
 
 Modified:
-- `internal/config/config.go` — `usage-persistence-enabled` 字段
+- `internal/config/config.go` — `usage-persistence-enabled`
 - `sdk/cliproxy/builder.go` — usage persistence builder option
-- `sdk/cliproxy/service.go`（+`service_usage_persistence_test.go`）— 生命周期 init/close
+- `sdk/cliproxy/service.go`（+`service_usage_persistence_test.go`）— store 生命周期 init/close
 
-### 2. Management Center Monitor & Tools
-
-Fork-only:
-- `internal/api/handlers/management/monitor.go`（+`_test.go`）— 11 monitor 端点（含 service-health、key-stats、request-details）
-
-Modified:
-- `internal/api/handlers/management/api_tools.go` — `CleanupCodexAuth` 端点
-- `internal/api/handlers/management/usage.go` — 增强 usage export/import
-- `internal/api/server.go` — 注册 `/custom/monitor/*`（11 端点）和 `/custom/codex-cleanup`
-
-### 3. Sequential-Fill (SF) Selector
+### 2. Management Center, Auth Files & Response Compression
 
 Fork-only:
-- `sdk/cliproxy/auth/routing_strategy.go`（+`_test.go`）— SF 策略常量与 `NormalizeRoutingStrategy`
-
-Modified（文件上游已存在，SF 代码为 fork 新增）:
-- `sdk/cliproxy/auth/selector.go`（+`_test.go`）— `SequentialFillSelector`（sticky 行为）
-- `sdk/cliproxy/auth/conductor.go` — SF 集成，two-level provider rotation（SF 遵循配置的 `request-retry`/`max-retry-credentials`，无 selector 级 retry override）
-
-### 4. Antigravity Enhancements
-
-> Web Search 已由上游 v7.1.74（PR #3824）原生实现，fork 简易实现已删除。
+- `internal/api/handlers/management/monitor.go`、`monitor_provider_map.go`（+tests）— 13 个 monitor 端点：dashboard、provider-map、request-logs、channel-stats、failure-analysis、kpi、model-distribution、daily-trend、hourly-models、hourly-tokens、service-health、key-stats、request-details
+- `internal/api/handlers/management/auth_files_list.go`（+tests）— auth 文件服务端分页、过滤与排序
+- `internal/api/handlers/management/auth_files_sub2api.go` — sub2api 凭证导入
+- `internal/api/handlers/management/panel.go`（+tests）— panel latest/version 与手动更新 API
+- `internal/api/middleware/response_compression.go`（+tests）— `/v0` 响应压缩
 
 Modified:
-- `internal/runtime/executor/antigravity_executor.go` — 稳定 fallback project ID、404 base URL fallback、降低 refresh skew、404 `disable-cooling`
-- `internal/translator/antigravity/openai/chat-completions/antigravity_openai_request.go` — 支持 OpenAI `type: "web_search"` 工具（上游仅支持 `google_search`）
+- `internal/api/handlers/management/auth_files.go`（+tests）— 大批量处理、字段批量 patch、`.txt`/zip/tar/tar.gz 上传、过滤删除、symlink/path traversal 防护、delete-all 流式处理，并通过 watcher 同步运行态
+- `internal/api/handlers/management/api_tools.go` — `CleanupCodexAuth`
+- `internal/api/handlers/management/usage.go` — usage export/import 增强
+- `internal/api/server.go` — 注册 13 个 monitor 端点、panel API、auth load status、auth batch fields 与 `/custom/codex-cleanup`
 
-### 5. Request Handler Fixes & Codex Enhancements
+### 3. Routing, Cooldown Persistence & Credential Lifecycle
 
 Fork-only:
-- `cmd/server/config_bootstrap.go`（+`_test.go`）— Git-backed config bootstrap
-- `cmd/server/local_model.go`（+`_test.go`）— 本地模型目录支持
-- `internal/codexapi/base_url.go` — Codex API base URL 解析
-- `internal/runtime/executor/codex_base_url.go`（+`_test.go`）— Codex executor base URL 解析
-- `internal/runtime/executor/responses_encrypted_retry.go`（+`_test.go`）— Responses API 加密重试
+- `sdk/cliproxy/auth/routing_strategy.go`（+tests）— SF 策略常量与 `NormalizeRoutingStrategy`
+- `sdk/cliproxy/auth/cooldown_state_persister.go` — 增量、合并批次式冷却状态持久化
+- `internal/store/postgres_cooldown_store.go`（+tests）— PostgreSQL 事务型 cooldown store
 
 Modified:
-- `internal/runtime/executor/helps/utls_client.go`（+`_test.go`）— **fork** uTLS protected host 自动降级：`uTLS HTTP/2 -> uTLS HTTP/1.1 -> standard HTTP/1.1`；只在没有拿到 HTTP response 的 transport error 时降级，任何 HTTP status（含 401/403/429/5xx）都直接返回；POST 降级必须通过 `GetBody` 重放请求体。
-  - 合并保护：不要恢复 `CLIPROXY_CODEX_TRANSPORT` / `codexTransportMode` 手动开关。
-  - 合并保护：不要重新套用上游/PR #4012 的"所有 fallback upstream 强制 HTTP/1.1"。普通非 protected host 必须保留默认 HTTP/2 能力；只有 protected host 的第三段 `protectedFallbackHTTP11` 使用 standard HTTP/1.1。
-  - **fork** h2 降级内存缓存（`utlsH2DegradeCache`）：protected host 的 h2 发生 response-less transport error 后，按 `scope+host`（scope=`direct`/`proxy:<redacted>` 脱敏）进程内标记跳过 h2，初始 2m、指数退避封顶 30m；h2 拿到任何 `*http.Response`（含 4xx/5xx）立即重置；scope 为空（注入式 ctx transport）或非 protected host 不进缓存。无后台 goroutine、无持久化、无配置开关。
-  - 合并保护：`roundTripProtected` 用 `sentAttempts`（实际发送数）而非循环下标传给 `requestForProtectedAttempt`——跳过 h2 时 HTTP/1.1 为首次发送、无需 `GetBody`，合并时不要回退成下标。
-- `sdk/api/handlers/handlers.go`（+`handlers_request_details_test.go`）— Codex chat completions 暴露 cached tokens；mixed search/function tool calls 路由到兼容 provider
+- `sdk/cliproxy/auth/selector.go`、`scheduler.go`、`conductor.go`（+tests）— `SequentialFillSelector` sticky 推进、按凭证 priority 分组、单/混合 provider 调度；SF 使用统一的 `request-retry`/`max-retry-credentials`，不得恢复 selector 级 retry override
+- `sdk/cliproxy/auth/cooldown_state.go`（+tests）— 文件 cooldown store、启动恢复与按 auth 增量清理
+- `sdk/cliproxy/auth/auto_refresh_loop.go`、`persist_policy.go` — 刷新失败生命周期处理；`delete-unauthorized-auth` 对终态无效凭证及 401 生效
+- `internal/runtime/executor/xai_executor.go` — 删除前执行 xAI 凭证探测，避免把瞬时刷新错误误判为终态失效
 
-### 6. Utility Additions
+合并保护:
+- 凭证删除/替换必须串行完成并同步 token store、watcher 与调度器状态；多 provider 清理按类型执行。
+- `save-cooldown-status` 关闭时不得残留运行态或持久化冷却；开启时文件/PG 后端均须在启动时恢复。
 
-- `internal/util/util.go` — helper 函数
+### 4. Progressive Auth Loading & Watcher
 
-### 7. CI/CD & Build
+Fork-only:
+- `internal/watcher/auth_load.go`、`auth_load_status.go`（+benchmark/tests）— 有界 worker pool、渐进式注册、扫描代次与加载状态
+- `sdk/cliproxy/service_progressive_auth_loading_test.go` — 服务先启动、凭证后台持续加载的回归覆盖
+
+Modified:
+- `internal/config/config.go`、`config.example.yaml` — `auth-load-workers`，默认 16，限制为 1–64
+- `internal/watcher/{watcher,clients,events,dispatcher,config_reload}.go`、`synthesizer/file.go` — 新扫描取代旧扫描；过期/失败扫描不得发布；文件事件与全量扫描保持一致
+- `sdk/cliproxy/service.go`、`watcher.go` — 启动不等待全部 auth 文件；暴露 `/v0/management/auth-files/load-status`
+
+### 5. Management Panel Assets
+
+Fork-only:
+- `internal/managementasset/assets/management.html.gz`、`panel-manifest.json` — 构建时内嵌的已校验基线
+- `internal/managementasset/embed.go`、`manifest.go`、`replace_file_{unix,windows}.go` — manifest/SHA256 验证、兼容版本选择、跨平台原子替换
+- `.github/scripts/sync-management-panel.sh` — release/docker 构建前从 fork 面板仓库同步并校验资源
+
+Modified:
+- `internal/managementasset/updater.go`（+tests）— 固定仓库 `caidaoli/Cli-Proxy-API-Management-Center`；每 3 小时检查；仅安装更新且兼容的磁盘版本
+- `internal/config/config.go` — 移除用户自定义 panel repository 的实际控制权，防止运行时切换资源来源
+
+资源选择优先级:
+1. `MANAGEMENT_PANEL_DEV_PATH` 显式开发覆盖；跳过自动更新。
+2. SHA256 正确、版本更新且兼容的磁盘资源。
+3. 内嵌基线；磁盘资源损坏、过旧或不兼容时回退。
+
+自动更新在开发覆盖、Home/cluster 模式、面板禁用或 `disable-auto-update` 时必须跳过。`MANAGEMENT_STATIC_PATH` 只控制磁盘升级目录，不得绕过 manifest/hash 校验。
+
+### 6. Provider, Protocol & Codex Enhancements
+
+Fork-only:
+- `cmd/server/config_bootstrap.go`（+tests）— Git-backed config 缺失时从模板初始化并持久化
+- `cmd/server/local_model.go`（+tests）— `local-model` CLI/config 优先级；启用后禁用远程模型刷新并使用内嵌 catalog，不是本地模型目录
+- `internal/codexapi/base_url.go`、`internal/runtime/executor/codex_base_url.go`（+tests）— Codex API base URL 解析
+- `internal/runtime/executor/responses_encrypted_retry.go`（+tests）— Responses API encrypted content 重试
+- `internal/runtime/executor/codex_prompt_patch.go` — `codex.strip-intermediary-updates` 控制删除 prompt 的 `## Intermediary updates` 段
+
+Modified:
+- `internal/runtime/executor/antigravity_executor.go`（+tests）— 稳定 fallback project ID、404 base URL fallback、降低 refresh skew、transport 复用与 request-scoped 404 cooling 处理
+- `internal/translator/antigravity/` — OpenAI `type: "web_search"` 注入、伪 thinking block 规范化
+- `internal/runtime/executor/claude_executor.go`（+tests）— 可配置 Claude masquerading/default headers
+- `internal/runtime/executor/xai_executor.go`、`xai_websockets_executor.go`（+tests）— refresh error 语义、凭证探测/清理、`prompt_cache_key` 与原生 web search 注入
+- `internal/translator/codex/`（+tests）— Responses reasoning tokens 映射为 Claude `thinking_tokens`、tool-call streaming 与 cached token 暴露
+- `sdk/api/handlers/handlers.go`（+tests）— Codex chat completions 暴露 cached tokens；mixed search/function tool calls 路由到兼容 provider
+
+`internal/translator/` 仍是受保护路径。合并冲突必须按协议结构解析后验证，不得用字符串拼接或脆弱源码测试掩盖行为差异。
+
+### 7. uTLS Protected-Host Transport
+
+Modified:
+- `internal/runtime/executor/helps/utls_client.go`（+tests）— protected host 自动降级：`uTLS HTTP/2 -> uTLS HTTP/1.1 -> standard HTTP/1.1`；仅在未取得 HTTP response 的 transport error 时继续，任何 HTTP status（含 401/403/429/5xx）都直接返回；POST 降级必须通过 `GetBody` 重放请求体。
+  - 不得恢复 `CLIPROXY_CODEX_TRANSPORT` / `codexTransportMode` 手动开关。
+  - 不得套用“所有 fallback upstream 强制 HTTP/1.1”；普通非 protected host 保留默认 HTTP/2，只有第三段 `protectedFallbackHTTP11` 使用 standard HTTP/1.1。
+  - `utlsH2DegradeCache` 按 `scope+host`（scope=`direct`/`proxy:<redacted>`）缓存 response-less h2 transport error；初始 2m，指数退避封顶 30m；任意 h2 response 立即重置；注入 transport 或非 protected host 不缓存。
+  - `roundTripProtected` 必须用 `sentAttempts` 而非循环下标；跳过 h2 时 HTTP/1.1 是首次实际发送，不要求 `GetBody`。
+
+### 8. Utilities
+
+- `internal/util/util.go` — `GetEnvTrimmed(keys...)`：按顺序读取并 trim 首个非空环境变量
+
+### 9. CI/CD, Build & Dependencies
 
 Modified:
 - `Dockerfile` — native `GOARCH` 交叉编译（弃用 QEMU）
-- `.github/workflows/docker-image.yml` — DockerHub→GHCR，matrix，GHA 缓存，`fork/v*` 触发，`workflow_dispatch`
-- `.github/workflows/release.yaml` — 改为 `fork/v*` 触发 + `workflow_dispatch`，构建 release artifacts
+- `.github/workflows/docker-image.yml` — DockerHub→GHCR、matrix、GHA 缓存、`fork/v*`、`workflow_dispatch`、panel sync
+- `.github/workflows/release.yaml` — `fork/v*`、`workflow_dispatch`、release artifacts、panel sync
 
-Fork deletions（删除上游文件）:
+Fork deletions（上游同步后仍必须删除）:
 - `.github/workflows/pr-test-build.yml`
 - `.github/workflows/auto-retarget-main-pr-to-dev.yml`
 
 Other:
 - `.gitignore` — 忽略 `usage.*`
-- `go.mod`/`go.sum` — `golang.org/x/exp`、`charmbracelet/{bubbletea,bubbles,lipgloss}`
+- `go.mod`/`go.sum` — fork 增量依赖为 `modernc.org/sqlite` 及其间接依赖、`golang.org/x/exp`；Charmbracelet/TUI 依赖已属于上游
 
-### 8. Documentation
+### 10. Documentation
 
-- `README.md`/`README_CN.md` — Fork Features + Management Center 描述
+- `README.md`/`README_CN.md` — Fork Features、SF、Management Center、重试语义与配置说明
