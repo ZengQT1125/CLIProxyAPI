@@ -260,6 +260,8 @@ func convertSub2APIAccount(candidate sub2APIAccountCandidate, now time.Time) (su
 	switch platform {
 	case "openai":
 		provider = "codex"
+	case "anthropic":
+		provider = "claude"
 	case "grok", "grok_build", "xai":
 		provider = "xai"
 	}
@@ -296,8 +298,10 @@ func convertSub2APIAccount(candidate sub2APIAccountCandidate, now time.Time) (su
 
 	name := sub2APIFirstString(record, []string{"name"}, []string{"label"})
 	email := sub2APIFirstString(record,
-		[]string{"credentials", "email"}, []string{"credential", "email"},
-		[]string{"extra", "email"}, []string{"email"},
+		[]string{"credentials", "email"}, []string{"credentials", "email_address"},
+		[]string{"credential", "email"}, []string{"credential", "email_address"},
+		[]string{"extra", "email"}, []string{"extra", "email_address"},
+		[]string{"email"}, []string{"email_address"},
 	)
 	if email == "" {
 		email = firstSub2APIMapString([]map[string]any{idPayload, accessProfile, accessPayload}, "email")
@@ -338,6 +342,12 @@ func convertSub2APIAccount(candidate sub2APIAccountCandidate, now time.Time) (su
 	if subject == "" {
 		subject = firstSub2APIMapString([]map[string]any{accessPayload, idPayload}, "sub")
 	}
+	accountUUID := sub2APIFirstString(record,
+		[]string{"credentials", "account_uuid"}, []string{"credentials", "accountUuid"},
+		[]string{"credential", "account_uuid"}, []string{"credential", "accountUuid"},
+		[]string{"extra", "account_uuid"}, []string{"extra", "accountUuid"},
+		[]string{"account_uuid"}, []string{"accountUuid"},
+	)
 
 	expiresIn, hasExpiresIn, errExpiresIn := sub2APIFirstInteger(record,
 		[]string{"credentials", "expires_in"}, []string{"credentials", "expiresIn"},
@@ -388,12 +398,15 @@ func convertSub2APIAccount(candidate sub2APIAccountCandidate, now time.Time) (su
 	if identity == "" && provider == "xai" {
 		identity = subject
 	}
+	if identity == "" && provider == "claude" {
+		identity = accountUUID
+	}
 	if identity == "" {
 		identity = name
 	}
 	filenameToken := sanitizeSub2APIFileToken(identity)
 	if filenameToken == "" {
-		return sub2APIConvertedAuth{}, fmt.Errorf("account has no usable email, subject, account id, or name")
+		return sub2APIConvertedAuth{}, fmt.Errorf("account has no usable email, subject, account id, account UUID, or name")
 	}
 	baseFilename := provider + "-" + filenameToken + ".json"
 
@@ -416,7 +429,8 @@ func convertSub2APIAccount(candidate sub2APIAccountCandidate, now time.Time) (su
 	if name != "" && provider == "codex" {
 		native["name"] = name
 	}
-	if provider == "codex" {
+	switch provider {
+	case "codex":
 		setSub2APIString(native, "account_id", accountID)
 		setSub2APIString(native, "chatgpt_account_id", accountID)
 		setSub2APIString(native, "workspace_id", accountID)
@@ -426,7 +440,7 @@ func convertSub2APIAccount(candidate sub2APIAccountCandidate, now time.Time) (su
 		setSub2APIString(native, "session_token", sub2APIFirstString(record,
 			[]string{"credentials", "session_token"}, []string{"credential", "session_token"}, []string{"session_token"},
 		))
-	} else {
+	case "xai":
 		native["auth_kind"] = "oauth"
 		setSub2APIString(native, "sub", subject)
 		setSub2APIString(native, "token_type", sub2APIFirstString(record,
@@ -468,7 +482,10 @@ func convertSub2APIAccount(candidate sub2APIAccountCandidate, now time.Time) (su
 		return sub2APIConvertedAuth{baseFilename: baseFilename}, fmt.Errorf("encode %s auth file: %w", provider, errMarshal)
 	}
 	fingerprintIdentity := accountID
-	if provider == "xai" {
+	switch provider {
+	case "claude":
+		fingerprintIdentity = accountUUID
+	case "xai":
 		fingerprintIdentity = subject
 	}
 	fingerprint := sha256.Sum256([]byte(accessToken + "\x00" + fingerprintIdentity))

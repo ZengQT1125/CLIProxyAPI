@@ -1029,6 +1029,91 @@ func TestUploadAuthFile_Sub2APIConvertsGrokOAuthToXAI(t *testing.T) {
 	}
 }
 
+func TestUploadAuthFile_Sub2APIConvertsAnthropicOAuthToClaude(t *testing.T) {
+	t.Setenv("MANAGEMENT_PASSWORD", "")
+	gin.SetMode(gin.TestMode)
+
+	authDir := t.TempDir()
+	manager := coreauth.NewManager(nil, nil, nil)
+	h := NewHandlerWithoutConfigFilePath(&config.Config{AuthDir: authDir}, manager)
+	payload, errMarshal := json.Marshal(map[string]any{
+		"exported_at": "2026-07-19T08:09:38Z",
+		"proxies":     []any{},
+		"accounts": []any{
+			map[string]any{
+				"name":     "A",
+				"platform": "anthropic",
+				"type":     "oauth",
+				"credentials": map[string]any{
+					"access_token":  "anthropic-access",
+					"account_uuid":  "11111111-1111-1111-1111-111111111111",
+					"email_address": "claude@example.com",
+					"expires_at":    1784477337,
+					"expires_in":    28800,
+					"org_uuid":      "22222222-2222-2222-2222-222222222222",
+					"refresh_token": "anthropic-refresh",
+					"scope":         "user:profile user:inference user:sessions:claude_code",
+					"token_type":    "Bearer",
+				},
+				"extra": map[string]any{
+					"account_uuid":               "11111111-1111-1111-1111-111111111111",
+					"email_address":              "claude@example.com",
+					"org_uuid":                   "22222222-2222-2222-2222-222222222222",
+					"session_window_utilization": 1,
+				},
+				"priority":              1,
+				"auto_pause_on_expired": true,
+			},
+		},
+	})
+	if errMarshal != nil {
+		t.Fatalf("marshal Sub2API payload: %v", errMarshal)
+	}
+
+	rec := uploadRawAuthPayload(t, h, "anthropic.json", payload)
+	if rec.Code != http.StatusOK {
+		t.Fatalf("upload status = %d, want %d; body = %s", rec.Code, http.StatusOK, rec.Body.String())
+	}
+	path := filepath.Join(authDir, "claude-claude@example.com.json")
+	data, errRead := os.ReadFile(path)
+	if errRead != nil {
+		t.Fatalf("read converted Claude auth file: %v", errRead)
+	}
+	var document map[string]any
+	if errDecode := json.Unmarshal(data, &document); errDecode != nil {
+		t.Fatalf("decode converted Claude auth file: %v", errDecode)
+	}
+	wantStrings := map[string]string{
+		"type":          "claude",
+		"email":         "claude@example.com",
+		"access_token":  "anthropic-access",
+		"refresh_token": "anthropic-refresh",
+		"expired":       time.Unix(1784477337, 0).UTC().Format(time.RFC3339),
+		"last_refresh":  time.Unix(1784477337-28800, 0).UTC().Format(time.RFC3339),
+	}
+	for key, want := range wantStrings {
+		if got, _ := document[key].(string); got != want {
+			t.Fatalf("converted %s = %q, want %q", key, got, want)
+		}
+	}
+	if got := int(document["priority"].(float64)); got != 1 {
+		t.Fatalf("converted priority = %d, want 1", got)
+	}
+	if got, _ := document["disabled"].(bool); got {
+		t.Fatalf("converted disabled = true, want false")
+	}
+	if _, exists := document["session_window_utilization"]; exists {
+		t.Fatalf("converted Claude auth must not persist Sub2API usage snapshots")
+	}
+	auth, okAuth := manager.GetByID("claude-claude@example.com.json")
+	if !okAuth || auth.Provider != "claude" {
+		t.Fatalf("converted runtime auth = %#v, want claude", auth)
+	}
+	if got, _ := auth.Metadata["refresh_token"].(string); got != "anthropic-refresh" {
+		t.Fatalf("converted runtime refresh token = %q, want synthetic refresh token", got)
+	}
+}
+
 func TestUploadAuthFile_GrokBuildFlatAccountConvertsToXAI(t *testing.T) {
 	t.Setenv("MANAGEMENT_PASSWORD", "")
 	gin.SetMode(gin.TestMode)
@@ -1228,7 +1313,7 @@ func TestUploadAuthFile_Sub2APIDataMultipartReportsUnsupportedAccount(t *testing
 		"version":1,
 		"accounts":[
 			{"name":"valid@example.com","platform":"openai","type":"oauth","credentials":{"access_token":"access","refresh_token":"refresh","chatgpt_account_id":"account"}},
-			{"name":"unsupported@example.com","platform":"anthropic","type":"oauth","credentials":{"access_token":"access","refresh_token":"refresh","chatgpt_account_id":"account"}}
+			{"name":"unsupported@example.com","platform":"gemini","type":"oauth","credentials":{"access_token":"access","refresh_token":"refresh"}}
 		]
 	}`
 

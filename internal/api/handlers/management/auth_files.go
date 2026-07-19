@@ -878,7 +878,7 @@ func (h *Handler) DownloadAuthFile(c *gin.Context) {
 // Upload auth file: multipart (json/txt and/or archives), raw JSON with ?name=.json|.txt,
 // or a raw archive body with ?name=.zip|.tar|.tar.gz|.tgz / matching Content-Type.
 // .txt is accepted as a credential alias and rewritten to .json on disk.
-// Sub2API account data is expanded into native Codex or xAI auth files.
+// Sub2API account data is expanded into native Codex, Claude, or xAI auth files.
 // Supported archives: zip, tar, tar.gz/tgz.
 func (h *Handler) UploadAuthFile(c *gin.Context) {
 	if h.authManager == nil {
