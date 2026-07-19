@@ -82,7 +82,7 @@ func (h *Handler) importSub2APIData(ctx context.Context, data []byte, maxAccount
 		seenFingerprints[converted.fingerprint] = struct{}{}
 
 		for {
-			filename := reserveSub2APIAuthFileName(converted.baseFilename, reservedNames)
+			filename := reserveImportedAuthFileName(converted.baseFilename, reservedNames)
 			errWrite := h.writeNewAuthFile(ctx, filename, converted.payload)
 			if errors.Is(errWrite, os.ErrExist) {
 				continue
@@ -135,10 +135,14 @@ func containsSub2APIValue(value any, depth int) bool {
 	}
 	switch typed := value.(type) {
 	case map[string]any:
-		if strings.EqualFold(strings.TrimSpace(sub2APIString(typed["type"])), sub2APIDataType) {
+		containerType := strings.ToLower(strings.TrimSpace(sub2APIString(typed["type"])))
+		if containerType == sub2APIDataType {
 			return true
 		}
-		if _, hasAccounts := typed["accounts"]; hasAccounts || looksLikeSub2APIAccount(typed) {
+		if _, hasAccounts := typed["accounts"]; hasAccounts && containerType == "" {
+			return true
+		}
+		if looksLikeSub2APIAccount(typed) {
 			return true
 		}
 		for _, child := range typed {
@@ -182,7 +186,7 @@ func visitSub2APIValue(value any, path string, depth int, inheritedExportedAt ti
 			}
 			return appendSub2APIAccounts(typed["accounts"], path+".accounts", exportedAt, candidates)
 		}
-		if rawAccounts, exists := typed["accounts"]; exists {
+		if rawAccounts, exists := typed["accounts"]; exists && containerType == "" {
 			*handled = true
 			return appendSub2APIAccounts(rawAccounts, path+".accounts", exportedAt, candidates)
 		}
@@ -404,7 +408,7 @@ func convertSub2APIAccount(candidate sub2APIAccountCandidate, now time.Time) (su
 	if identity == "" {
 		identity = name
 	}
-	filenameToken := sanitizeSub2APIFileToken(identity)
+	filenameToken := sanitizeAuthFileToken(identity)
 	if filenameToken == "" {
 		return sub2APIConvertedAuth{}, fmt.Errorf("account has no usable email, subject, account id, account UUID, or name")
 	}
@@ -524,7 +528,7 @@ func copySub2APIConfiguration(record, native map[string]any) error {
 	return nil
 }
 
-func reserveSub2APIAuthFileName(baseName string, reserved map[string]struct{}) string {
+func reserveImportedAuthFileName(baseName string, reserved map[string]struct{}) string {
 	baseName = filepath.Base(strings.TrimSpace(baseName))
 	stem := strings.TrimSuffix(baseName, filepath.Ext(baseName))
 	candidate := baseName
@@ -538,7 +542,7 @@ func reserveSub2APIAuthFileName(baseName string, reserved map[string]struct{}) s
 	}
 }
 
-func sanitizeSub2APIFileToken(value string) string {
+func sanitizeAuthFileToken(value string) string {
 	value = strings.TrimSpace(value)
 	var builder strings.Builder
 	lastSeparator := false

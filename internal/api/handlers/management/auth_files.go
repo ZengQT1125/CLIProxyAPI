@@ -878,7 +878,7 @@ func (h *Handler) DownloadAuthFile(c *gin.Context) {
 // Upload auth file: multipart (json/txt and/or archives), raw JSON with ?name=.json|.txt,
 // or a raw archive body with ?name=.zip|.tar|.tar.gz|.tgz / matching Content-Type.
 // .txt is accepted as a credential alias and rewritten to .json on disk.
-// Sub2API account data is expanded into native Codex, Claude, or xAI auth files.
+// CLIProxyAPI auth bundles and Sub2API account data are expanded into native auth files.
 // Supported archives: zip, tar, tar.gz/tgz.
 func (h *Handler) UploadAuthFile(c *gin.Context) {
 	if h.authManager == nil {
@@ -920,6 +920,10 @@ func (h *Handler) UploadAuthFile(c *gin.Context) {
 	data, err := io.ReadAll(c.Request.Body)
 	if err != nil {
 		c.JSON(400, gin.H{"error": "failed to read body"})
+		return
+	}
+	if result, handled := h.importCLIProxyAPIAuthBundle(ctx, data, maxAuthUploadFiles); handled {
+		h.respondAuthBatchUpload(c, result)
 		return
 	}
 	if result, handled := h.importSub2APIData(ctx, data, maxAuthUploadFiles); handled {
@@ -1662,6 +1666,9 @@ func (h *Handler) importUploadedAuthFile(ctx context.Context, filename string, s
 	data, err := io.ReadAll(src)
 	if err != nil {
 		return authFileImportResult{failed: []authUploadFailure{{name: name, err: fmt.Errorf("failed to read uploaded file: %w", err)}}}
+	}
+	if result, handled := h.importCLIProxyAPIAuthBundle(ctx, data, maxFiles); handled {
+		return result
 	}
 	if result, handled := h.importSub2APIData(ctx, data, maxFiles); handled {
 		return result

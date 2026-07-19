@@ -775,6 +775,103 @@ func TestUploadAuthFile_Sub2APIDataRawBody(t *testing.T) {
 	}
 }
 
+func TestUploadAuthFile_CLIProxyAPIAuthBundleMultipart(t *testing.T) {
+	t.Setenv("MANAGEMENT_PASSWORD", "")
+	gin.SetMode(gin.TestMode)
+
+	authDir := t.TempDir()
+	manager := coreauth.NewManager(nil, nil, nil)
+	h := NewHandlerWithoutConfigFilePath(&config.Config{AuthDir: authDir}, manager)
+	payload := []byte(`{
+		"type":"cliproxyapi-auth-bundle",
+		"version":1,
+		"source":"test-exporter",
+		"exported_at":"2026-07-19T08:48:52Z",
+		"accounts":[
+			{
+				"type":"xai",
+				"auth_kind":"oauth",
+				"email":"native-one@example.com",
+				"sub":"native-sub-1",
+				"local_account_id":"local-1",
+				"access_token":"bundle-access-1",
+				"refresh_token":"bundle-refresh-1",
+				"base_url":"https://api.x.ai/v1",
+				"disabled":false,
+				"headers":{"X-Native-Test":"one"}
+			},
+			{
+				"type":"xai",
+				"auth_kind":"oauth",
+				"email":"native-two@example.com",
+				"sub":"native-sub-2",
+				"local_account_id":"local-2",
+				"access_token":"bundle-access-2",
+				"refresh_token":"bundle-refresh-2",
+				"base_url":"https://api.x.ai/v1",
+				"disabled":true
+			}
+		]
+	}`)
+
+	var body bytes.Buffer
+	writer := multipart.NewWriter(&body)
+	part, errCreate := writer.CreateFormFile("file", "native-bundle.json")
+	if errCreate != nil {
+		t.Fatalf("create multipart file: %v", errCreate)
+	}
+	if _, errWrite := part.Write(payload); errWrite != nil {
+		t.Fatalf("write multipart file: %v", errWrite)
+	}
+	if errClose := writer.Close(); errClose != nil {
+		t.Fatalf("close multipart writer: %v", errClose)
+	}
+	rec := httptest.NewRecorder()
+	ctx, _ := gin.CreateTestContext(rec)
+	req := httptest.NewRequest(http.MethodPost, "/v0/management/auth-files", &body)
+	req.Header.Set("Content-Type", writer.FormDataContentType())
+	ctx.Request = req
+	h.UploadAuthFile(ctx)
+	if rec.Code != http.StatusOK {
+		t.Fatalf("upload status = %d, want %d; body = %s", rec.Code, http.StatusOK, rec.Body.String())
+	}
+	var response struct {
+		Uploaded int `json:"uploaded"`
+	}
+	if errDecode := json.Unmarshal(rec.Body.Bytes(), &response); errDecode != nil {
+		t.Fatalf("decode response: %v", errDecode)
+	}
+	if response.Uploaded != 2 {
+		t.Fatalf("uploaded = %d, want 2; body = %s", response.Uploaded, rec.Body.String())
+	}
+
+	firstPath := filepath.Join(authDir, "xai-native-one@example.com.json")
+	firstData, errRead := os.ReadFile(firstPath)
+	if errRead != nil {
+		t.Fatalf("read imported native auth file: %v", errRead)
+	}
+	var first map[string]any
+	if errDecode := json.Unmarshal(firstData, &first); errDecode != nil {
+		t.Fatalf("decode imported native auth file: %v", errDecode)
+	}
+	if got, _ := first["type"].(string); got != "xai" {
+		t.Fatalf("imported type = %q, want xai", got)
+	}
+	if got, _ := first["local_account_id"].(string); got != "local-1" {
+		t.Fatalf("imported local_account_id = %q, want local-1", got)
+	}
+	headers, _ := first["headers"].(map[string]any)
+	if got, _ := headers["X-Native-Test"].(string); got != "one" {
+		t.Fatalf("imported header = %q, want one", got)
+	}
+	if _, errStat := os.Stat(filepath.Join(authDir, "native-bundle.json")); !os.IsNotExist(errStat) {
+		t.Fatalf("native bundle container should not be persisted, stat err = %v", errStat)
+	}
+	if got := len(manager.List()); got != 2 {
+		t.Fatalf("registered auth count = %d, want 2", got)
+	}
+}
+
 func TestUploadAuthFile_Sub2APICompatibleDocumentShapes(t *testing.T) {
 	t.Setenv("MANAGEMENT_PASSWORD", "")
 	gin.SetMode(gin.TestMode)
