@@ -276,3 +276,147 @@ func TestPatchAuthFileFields_ArbitraryFieldsPersistToFile(t *testing.T) {
 		t.Fatalf("fgh.ijk = %#v, want true", got)
 	}
 }
+
+func TestPatchAuthFileFieldsBatch_UpdatesValidItemsAndReportsFailures(t *testing.T) {
+	t.Setenv("MANAGEMENT_PASSWORD", "")
+
+	store := &memoryAuthStore{}
+	manager := coreauth.NewManager(store, nil, nil)
+	for _, record := range []*coreauth.Auth{
+		{
+			ID:       "first.json",
+			FileName: "first.json",
+			Provider: "claude",
+			Metadata: map[string]any{"type": "claude"},
+		},
+		{
+			ID:       "second.json",
+			FileName: "second.json",
+			Provider: "codex",
+			Metadata: map[string]any{"type": "codex", "websockets": true},
+		},
+	} {
+		if _, errRegister := manager.Register(context.Background(), record); errRegister != nil {
+			t.Fatalf("failed to register auth record: %v", errRegister)
+		}
+	}
+
+	h := NewHandlerWithoutConfigFilePath(&config.Config{AuthDir: t.TempDir()}, manager)
+	body := `{"updates":[{"name":"first.json","fields":{"note":"updated"}},{"name":"missing.json","fields":{"note":"ignored"}},{"name":"second.json","fields":{"websockets":false}}]}`
+	rec := httptest.NewRecorder()
+	ctx, _ := gin.CreateTestContext(rec)
+	req := httptest.NewRequest(http.MethodPatch, "/v0/management/auth-files/fields/batch", strings.NewReader(body))
+	req.Header.Set("Content-Type", "application/json")
+	ctx.Request = req
+	h.PatchAuthFileFieldsBatch(ctx)
+
+	if rec.Code != http.StatusOK {
+		t.Fatalf("expected status %d, got %d with body %s", http.StatusOK, rec.Code, rec.Body.String())
+	}
+
+	var response struct {
+		Updated int `json:"updated"`
+		Failed  []struct {
+			Name  string `json:"name"`
+			Error string `json:"error"`
+		} `json:"failed"`
+	}
+	if errDecode := json.NewDecoder(rec.Body).Decode(&response); errDecode != nil {
+		t.Fatalf("failed to decode response: %v", errDecode)
+	}
+	if response.Updated != 2 {
+		t.Fatalf("updated = %d, want 2", response.Updated)
+	}
+	if len(response.Failed) != 1 {
+		t.Fatalf("failed = %#v, want one item", response.Failed)
+	}
+	if response.Failed[0].Name != "missing.json" || response.Failed[0].Error != "auth file not found" {
+		t.Fatalf("failed item = %#v", response.Failed[0])
+	}
+
+	first, ok := manager.GetByID("first.json")
+	if !ok || first == nil {
+		t.Fatal("first auth record not found")
+	}
+	if got := first.Metadata["note"]; got != "updated" {
+		t.Fatalf("first note = %#v, want updated", got)
+	}
+
+	second, ok := manager.GetByID("second.json")
+	if !ok || second == nil {
+		t.Fatal("second auth record not found")
+	}
+	if got := second.Metadata["websockets"]; got != false {
+		t.Fatalf("second websockets = %#v, want false", got)
+	}
+}
+
+func TestPatchAuthFileFieldsBatch_PriorityZeroIsImmediatelyListed(t *testing.T) {
+	t.Setenv("MANAGEMENT_PASSWORD", "")
+
+	store := &memoryAuthStore{}
+	manager := coreauth.NewManager(store, nil, nil)
+	for _, record := range []*coreauth.Auth{
+		{
+			ID:         "selected.json",
+			FileName:   "selected.json",
+			Provider:   "codex",
+			Attributes: map[string]string{"path": "/tmp/selected.json", "priority": "1"},
+			Metadata:   map[string]any{"type": "codex", "priority": float64(1)},
+		},
+		{
+			ID:         "untouched.json",
+			FileName:   "untouched.json",
+			Provider:   "codex",
+			Attributes: map[string]string{"path": "/tmp/untouched.json", "priority": "7"},
+			Metadata:   map[string]any{"type": "codex", "priority": float64(7)},
+		},
+	} {
+		if _, errRegister := manager.Register(context.Background(), record); errRegister != nil {
+			t.Fatalf("failed to register auth record: %v", errRegister)
+		}
+	}
+
+	h := NewHandlerWithoutConfigFilePath(&config.Config{AuthDir: t.TempDir()}, manager)
+	patchRecorder := httptest.NewRecorder()
+	patchContext, _ := gin.CreateTestContext(patchRecorder)
+	patchRequest := httptest.NewRequest(
+		http.MethodPatch,
+		"/v0/management/auth-files/fields/batch",
+		strings.NewReader(`{"updates":[{"name":"selected.json","fields":{"priority":0}}]}`),
+	)
+	patchRequest.Header.Set("Content-Type", "application/json")
+	patchContext.Request = patchRequest
+	h.PatchAuthFileFieldsBatch(patchContext)
+
+	if patchRecorder.Code != http.StatusOK {
+		t.Fatalf("expected status %d, got %d with body %s", http.StatusOK, patchRecorder.Code, patchRecorder.Body.String())
+	}
+
+	listRecorder := httptest.NewRecorder()
+	listContext, _ := gin.CreateTestContext(listRecorder)
+	listContext.Request = httptest.NewRequest(http.MethodGet, "/v0/management/auth-files", nil)
+	h.ListAuthFiles(listContext)
+
+	if listRecorder.Code != http.StatusOK {
+		t.Fatalf("expected list status %d, got %d with body %s", http.StatusOK, listRecorder.Code, listRecorder.Body.String())
+	}
+	var response struct {
+		Files []map[string]any `json:"files"`
+	}
+	if errDecode := json.NewDecoder(listRecorder.Body).Decode(&response); errDecode != nil {
+		t.Fatalf("failed to decode list response: %v", errDecode)
+	}
+
+	priorities := make(map[string]any, len(response.Files))
+	for _, file := range response.Files {
+		name, _ := file["name"].(string)
+		priorities[name] = file["priority"]
+	}
+	if got := priorities["selected.json"]; got != float64(0) {
+		t.Fatalf("selected priority = %#v, want 0", got)
+	}
+	if got := priorities["untouched.json"]; got != float64(7) {
+		t.Fatalf("untouched priority = %#v, want 7", got)
+	}
+}

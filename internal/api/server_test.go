@@ -899,6 +899,7 @@ func TestHomeEnabledHidesManagementEndpointsAndControlPanel(t *testing.T) {
 }
 
 func TestManagementControlPanelUsesEmbeddedAssetWithoutDisk(t *testing.T) {
+	t.Setenv("MANAGEMENT_PANEL_DEV_PATH", "")
 	staticDir := t.TempDir()
 	t.Setenv("MANAGEMENT_STATIC_PATH", staticDir)
 	server := newTestServer(t)
@@ -918,6 +919,35 @@ func TestManagementControlPanelUsesEmbeddedAssetWithoutDisk(t *testing.T) {
 	}
 	if rr.Body.Len() == 0 {
 		t.Fatal("management panel body is empty")
+	}
+}
+
+func TestManagementControlPanelUsesDevelopmentOverride(t *testing.T) {
+	panelPath := filepath.Join(t.TempDir(), "index.html")
+	if err := os.WriteFile(panelPath, []byte("development panel"), 0o644); err != nil {
+		t.Fatalf("write development panel: %v", err)
+	}
+	t.Setenv("MANAGEMENT_PANEL_DEV_PATH", panelPath)
+	server := newTestServer(t)
+
+	req := httptest.NewRequest(http.MethodGet, "/management.html", nil)
+	rr := httptest.NewRecorder()
+	server.engine.ServeHTTP(rr, req)
+
+	if rr.Code != http.StatusOK {
+		t.Fatalf("status = %d, want %d body=%s", rr.Code, http.StatusOK, rr.Body.String())
+	}
+	if got := rr.Header().Get("X-Management-Panel-Source"); got != "development" {
+		t.Fatalf("X-Management-Panel-Source = %q, want development", got)
+	}
+	if got := rr.Header().Get("X-Management-Panel-Version"); got != "dev" {
+		t.Fatalf("X-Management-Panel-Version = %q, want dev", got)
+	}
+	if got := rr.Header().Get("Cache-Control"); got != "no-store" {
+		t.Fatalf("Cache-Control = %q, want no-store", got)
+	}
+	if got := rr.Body.String(); got != "development panel" {
+		t.Fatalf("body = %q, want development panel", got)
 	}
 }
 

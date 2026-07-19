@@ -100,6 +100,9 @@ func runAutoUpdater(ctx context.Context, configFilePath string) {
 }
 
 func autoUpdateSkipReason(cfg *config.Config) (string, bool) {
+	if developmentPanelPath() != "" {
+		return "development panel override is enabled", true
+	}
 	if cfg == nil {
 		return "config not yet available", true
 	}

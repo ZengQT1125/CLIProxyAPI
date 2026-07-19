@@ -987,6 +987,7 @@ func (s *Server) registerManagementRoutes() {
 		mgmt.DELETE("/auth-files", s.mgmt.DeleteAuthFile)
 		mgmt.PATCH("/auth-files/status", s.mgmt.PatchAuthFileStatus)
 		mgmt.PATCH("/auth-files/fields", s.mgmt.PatchAuthFileFields)
+		mgmt.PATCH("/auth-files/fields/batch", s.mgmt.PatchAuthFileFieldsBatch)
 		mgmt.POST("/vertex/import", s.mgmt.ImportVertexCredential)
 
 		mgmt.GET("/anthropic-auth-url", s.mgmt.RequestAnthropicToken)
@@ -1120,6 +1121,9 @@ func (s *Server) serveManagementControlPanel(c *gin.Context) {
 
 	c.Header("X-Management-Panel-Version", panel.Manifest.Version)
 	c.Header("X-Management-Panel-Source", panel.Source)
+	if panel.Source == managementasset.PanelSourceDevelopment {
+		c.Header("Cache-Control", "no-store")
+	}
 	c.Data(http.StatusOK, "text/html; charset=utf-8", panel.HTML)
 }
 

@@ -8,6 +8,7 @@ import (
 	"io"
 	"os"
 	"path/filepath"
+	"strings"
 	"sync"
 
 	"github.com/router-for-me/CLIProxyAPI/v7/internal/buildinfo"
@@ -15,8 +16,10 @@ import (
 )
 
 const (
-	PanelSourceEmbedded = "embedded"
-	PanelSourceDisk     = "disk"
+	PanelSourceEmbedded       = "embedded"
+	PanelSourceDisk           = "disk"
+	PanelSourceDevelopment    = "development"
+	managementPanelDevPathEnv = "MANAGEMENT_PANEL_DEV_PATH"
 )
 
 //go:embed assets/management.html.gz
@@ -31,16 +34,40 @@ var (
 	embeddedPanelErr  error
 )
 
-// Panel is a verified management panel selected for serving.
+// Panel is a management panel selected for serving.
 type Panel struct {
 	HTML     []byte
 	Manifest Manifest
 	Source   string
 }
 
-// LoadManagementPanel selects a verified newer disk panel or the embedded baseline.
+// LoadManagementPanel selects an explicit development override, a verified newer disk panel, or the embedded baseline.
 func LoadManagementPanel(configFilePath string) (Panel, error) {
+	if path := developmentPanelPath(); path != "" {
+		return loadDevelopmentManagementPanel(path)
+	}
 	return loadManagementPanel(StaticDir(configFilePath), buildinfo.Version)
+}
+
+func developmentPanelPath() string {
+	return strings.TrimSpace(os.Getenv(managementPanelDevPathEnv))
+}
+
+func loadDevelopmentManagementPanel(path string) (Panel, error) {
+	path = filepath.Clean(path)
+	data, err := readFileLimited(path, maxAssetDownloadSize)
+	if err != nil {
+		return Panel{}, fmt.Errorf("read development management panel %s: %w", path, err)
+	}
+	return Panel{
+		HTML: data,
+		Manifest: Manifest{
+			Version: "dev",
+			SHA256:  sha256Hex(data),
+			Asset:   managementAssetName,
+		},
+		Source: PanelSourceDevelopment,
+	}, nil
 }
 
 func loadManagementPanel(staticDir, cliVersion string) (Panel, error) {

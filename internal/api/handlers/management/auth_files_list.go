@@ -61,8 +61,8 @@ func parseAuthFileListQuery(c *gin.Context) (authFileListQuery, bool, error) {
 	}
 	if hasPageSize {
 		pageSize, errPageSize := strconv.Atoi(strings.TrimSpace(c.Query("page_size")))
-		if errPageSize != nil || pageSize < 3 || pageSize > 40 {
-			return query, false, fmt.Errorf("page_size must be an integer between 3 and 40")
+		if errPageSize != nil || pageSize < 3 {
+			return query, false, fmt.Errorf("page_size must be an integer greater than or equal to 3")
 		}
 		query.PageSize = pageSize
 	}
@@ -300,17 +300,7 @@ func authFilePriority(auth *coreauth.Auth) (int, bool) {
 	if auth.Metadata == nil {
 		return 0, false
 	}
-	switch value := auth.Metadata["priority"].(type) {
-	case float64:
-		return int(value), true
-	case int:
-		return value, true
-	case string:
-		if priority, errParse := strconv.Atoi(strings.TrimSpace(value)); errParse == nil {
-			return priority, true
-		}
-	}
-	return 0, false
+	return authFileIntValue(auth.Metadata["priority"])
 }
 
 func (h *Handler) writeFullAuthFileList(c *gin.Context, auths []*coreauth.Auth) {

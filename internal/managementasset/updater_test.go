@@ -16,6 +16,8 @@ import (
 )
 
 func TestAutoUpdateSkipReason(t *testing.T) {
+	t.Setenv("MANAGEMENT_PANEL_DEV_PATH", "")
+
 	tests := []struct {
 		name       string
 		cfg        *config.Config
@@ -37,6 +39,14 @@ func TestAutoUpdateSkipReason(t *testing.T) {
 			}
 		})
 	}
+
+	t.Run("development override", func(t *testing.T) {
+		t.Setenv("MANAGEMENT_PANEL_DEV_PATH", filepath.Join(t.TempDir(), "index.html"))
+		gotReason, gotSkip := autoUpdateSkipReason(&config.Config{})
+		if gotReason != "development panel override is enabled" || !gotSkip {
+			t.Fatalf("autoUpdateSkipReason() = (%q, %t), want development override skip", gotReason, gotSkip)
+		}
+	})
 }
 
 func TestDefaultManagementRepositoryTargetsForkManifest(t *testing.T) {
@@ -56,6 +66,7 @@ func TestDefaultManagementRepositoryTargetsForkManifest(t *testing.T) {
 }
 
 func TestLoadManagementPanelUsesEmbeddedBaselineWithoutDisk(t *testing.T) {
+	t.Setenv("MANAGEMENT_PANEL_DEV_PATH", "")
 	t.Setenv("MANAGEMENT_STATIC_PATH", t.TempDir())
 
 	panel, err := LoadManagementPanel(filepath.Join(t.TempDir(), "config.yaml"))
@@ -69,6 +80,42 @@ func TestLoadManagementPanelUsesEmbeddedBaselineWithoutDisk(t *testing.T) {
 		t.Fatal("embedded panel is empty")
 	}
 	assertPanelHash(t, panel.HTML, panel.Manifest.SHA256)
+}
+
+func TestLoadManagementPanelUsesDevelopmentOverrideAndReloads(t *testing.T) {
+	panelPath := filepath.Join(t.TempDir(), "index.html")
+	t.Setenv("MANAGEMENT_PANEL_DEV_PATH", panelPath)
+	if err := os.WriteFile(panelPath, []byte("first panel"), 0o644); err != nil {
+		t.Fatalf("write first panel: %v", err)
+	}
+
+	first, err := LoadManagementPanel(filepath.Join(t.TempDir(), "config.yaml"))
+	if err != nil {
+		t.Fatalf("LoadManagementPanel() first error = %v", err)
+	}
+	if first.Source != "development" || string(first.HTML) != "first panel" {
+		t.Fatalf("first panel = source %q, HTML %q", first.Source, first.HTML)
+	}
+
+	if err = os.WriteFile(panelPath, []byte("second panel"), 0o644); err != nil {
+		t.Fatalf("write second panel: %v", err)
+	}
+	second, err := LoadManagementPanel(filepath.Join(t.TempDir(), "config.yaml"))
+	if err != nil {
+		t.Fatalf("LoadManagementPanel() second error = %v", err)
+	}
+	if second.Source != "development" || string(second.HTML) != "second panel" {
+		t.Fatalf("second panel = source %q, HTML %q", second.Source, second.HTML)
+	}
+}
+
+func TestLoadManagementPanelReturnsErrorForMissingDevelopmentOverride(t *testing.T) {
+	panelPath := filepath.Join(t.TempDir(), "missing.html")
+	t.Setenv("MANAGEMENT_PANEL_DEV_PATH", panelPath)
+
+	if _, err := LoadManagementPanel(filepath.Join(t.TempDir(), "config.yaml")); err == nil {
+		t.Fatal("LoadManagementPanel() error = nil, want missing development panel error")
+	}
 }
 
 func TestLoadManagementPanelUsesVerifiedNewerDiskPanel(t *testing.T) {

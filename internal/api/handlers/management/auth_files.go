@@ -2247,6 +2247,23 @@ func applyAuthDisabledState(auth *coreauth.Auth, disabled bool) {
 	auth.Metadata["disabled"] = disabled
 }
 
+type authFileFieldsPatchError struct {
+	status  int
+	message string
+}
+
+type authFileFieldsBatchRequest struct {
+	Updates []struct {
+		Name   string                     `json:"name"`
+		Fields map[string]json.RawMessage `json:"fields"`
+	} `json:"updates"`
+}
+
+type authFileFieldsBatchFailure struct {
+	Name  string `json:"name"`
+	Error string `json:"error"`
+}
+
 // PatchAuthFileFields updates arbitrary metadata fields of an auth file.
 func (h *Handler) PatchAuthFileFields(c *gin.Context) {
 	if h.authManager == nil {
@@ -2279,7 +2296,62 @@ func (h *Handler) PatchAuthFileFields(c *gin.Context) {
 	}
 	delete(req, "name")
 
+	if patchErr := h.patchAuthFileFields(c.Request.Context(), name, req); patchErr != nil {
+		c.JSON(patchErr.status, gin.H{"error": patchErr.message})
+		return
+	}
+
+	c.JSON(http.StatusOK, gin.H{"status": "ok"})
+}
+
+// PatchAuthFileFieldsBatch updates multiple auth files in one management request.
+func (h *Handler) PatchAuthFileFieldsBatch(c *gin.Context) {
+	if h.authManager == nil {
+		c.JSON(http.StatusServiceUnavailable, gin.H{"error": "core auth manager unavailable"})
+		return
+	}
+
+	var req authFileFieldsBatchRequest
+	decoder := json.NewDecoder(c.Request.Body)
+	decoder.UseNumber()
+	if err := decoder.Decode(&req); err != nil {
+		c.JSON(http.StatusBadRequest, gin.H{"error": "invalid request body"})
+		return
+	}
+	if len(req.Updates) == 0 {
+		c.JSON(http.StatusBadRequest, gin.H{"error": "updates are required"})
+		return
+	}
+
+	updated := 0
+	failed := make([]authFileFieldsBatchFailure, 0)
 	ctx := c.Request.Context()
+	for _, update := range req.Updates {
+		name := strings.TrimSpace(update.Name)
+		if patchErr := h.patchAuthFileFields(ctx, name, update.Fields); patchErr != nil {
+			failed = append(failed, authFileFieldsBatchFailure{
+				Name:  name,
+				Error: patchErr.message,
+			})
+			continue
+		}
+		updated++
+	}
+
+	c.JSON(http.StatusOK, gin.H{
+		"updated": updated,
+		"failed":  failed,
+	})
+}
+
+func (h *Handler) patchAuthFileFields(
+	ctx context.Context,
+	name string,
+	fields map[string]json.RawMessage,
+) *authFileFieldsPatchError {
+	if name == "" {
+		return &authFileFieldsPatchError{status: http.StatusBadRequest, message: "name is required"}
+	}
 
 	// Find auth by name or ID
 	var targetAuth *coreauth.Auth
@@ -2296,26 +2368,25 @@ func (h *Handler) PatchAuthFileFields(c *gin.Context) {
 	}
 
 	if targetAuth == nil {
-		c.JSON(http.StatusNotFound, gin.H{"error": "auth file not found"})
-		return
+		return &authFileFieldsPatchError{status: http.StatusNotFound, message: "auth file not found"}
 	}
 	if coreauth.IsPluginVirtualAuth(targetAuth) {
-		c.JSON(http.StatusConflict, gin.H{"error": errPluginVirtualAuth.Error()})
-		return
+		return &authFileFieldsPatchError{status: http.StatusConflict, message: errPluginVirtualAuth.Error()}
 	}
 
 	changed := false
-	touchedRoots := make(map[string]struct{}, len(req))
-	for key, rawValue := range req {
+	touchedRoots := make(map[string]struct{}, len(fields))
+	for key, rawValue := range fields {
 		fieldPath := strings.TrimSpace(key)
 		if fieldPath == "" {
-			c.JSON(http.StatusBadRequest, gin.H{"error": "field name is required"})
-			return
+			return &authFileFieldsPatchError{status: http.StatusBadRequest, message: "field name is required"}
 		}
 		value, errDecode := decodeAuthFileFieldValue(rawValue)
 		if errDecode != nil {
-			c.JSON(http.StatusBadRequest, gin.H{"error": fmt.Sprintf("invalid field %s", fieldPath)})
-			return
+			return &authFileFieldsPatchError{
+				status:  http.StatusBadRequest,
+				message: fmt.Sprintf("invalid field %s", fieldPath),
+			}
 		}
 		if targetAuth.Metadata == nil {
 			targetAuth.Metadata = make(map[string]any)
@@ -2324,8 +2395,7 @@ func (h *Handler) PatchAuthFileFields(c *gin.Context) {
 		if fieldPath == "headers" {
 			applyAuthFileHeadersPatch(targetAuth, value)
 		} else if errSet := setAuthFileMetadataValue(targetAuth.Metadata, fieldPath, value); errSet != nil {
-			c.JSON(http.StatusBadRequest, gin.H{"error": errSet.Error()})
-			return
+			return &authFileFieldsPatchError{status: http.StatusBadRequest, message: errSet.Error()}
 		}
 		if root := rootAuthFileField(fieldPath); root != "" {
 			touchedRoots[root] = struct{}{}
@@ -2337,18 +2407,19 @@ func (h *Handler) PatchAuthFileFields(c *gin.Context) {
 	}
 
 	if !changed {
-		c.JSON(http.StatusBadRequest, gin.H{"error": "no fields to update"})
-		return
+		return &authFileFieldsPatchError{status: http.StatusBadRequest, message: "no fields to update"}
 	}
 
 	targetAuth.UpdatedAt = time.Now()
 
 	if _, err := h.authManager.Update(ctx, targetAuth); err != nil {
-		c.JSON(http.StatusInternalServerError, gin.H{"error": fmt.Sprintf("failed to update auth: %v", err)})
-		return
+		return &authFileFieldsPatchError{
+			status:  http.StatusInternalServerError,
+			message: fmt.Sprintf("failed to update auth: %v", err),
+		}
 	}
 
-	c.JSON(http.StatusOK, gin.H{"status": "ok"})
+	return nil
 }
 
 func decodeAuthFileFieldValue(raw json.RawMessage) (any, error) {

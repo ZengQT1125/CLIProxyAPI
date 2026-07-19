@@ -91,14 +91,13 @@ func TestParseAuthFileListQuery(t *testing.T) {
 			},
 		},
 		{
-			name:      "page size selects paginated mode with default page",
-			path:      "/v0/management/auth-files?page_size=40&sort=az",
+			name:      "page size above forty selects paginated mode with default page",
+			path:      "/v0/management/auth-files?page_size=500&sort=az",
 			paginated: true,
-			want:      authFileListQuery{Page: 1, PageSize: 40, Sort: authFileSortAZ},
+			want:      authFileListQuery{Page: 1, PageSize: 500, Sort: authFileSortAZ},
 		},
 		{name: "rejects page below one", path: "/v0/management/auth-files?page=0", wantErr: true},
 		{name: "rejects page size below lower bound", path: "/v0/management/auth-files?page_size=2", wantErr: true},
-		{name: "rejects page size above upper bound", path: "/v0/management/auth-files?page_size=41", wantErr: true},
 		{name: "rejects unknown sort", path: "/v0/management/auth-files?page=1&sort=recent", wantErr: true},
 		{name: "rejects malformed boolean", path: "/v0/management/auth-files?page=1&problem_only=maybe", wantErr: true},
 	}
