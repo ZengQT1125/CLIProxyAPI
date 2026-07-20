@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"net/http"
 	"testing"
 	"time"
@@ -38,6 +39,24 @@ func (schedulerTestExecutor) CountTokens(ctx context.Context, auth *Auth, req cl
 func (schedulerTestExecutor) HttpRequest(ctx context.Context, auth *Auth, req *http.Request) (*http.Response, error) {
 	return nil, nil
 }
+
+type schedulerSnapshotStore struct {
+	auths []*Auth
+}
+
+func (s *schedulerSnapshotStore) List(context.Context) ([]*Auth, error) {
+	auths := make([]*Auth, 0, len(s.auths))
+	for _, auth := range s.auths {
+		if auth != nil {
+			auths = append(auths, auth.Clone())
+		}
+	}
+	return auths, nil
+}
+
+func (*schedulerSnapshotStore) Save(context.Context, *Auth) (string, error) { return "", nil }
+
+func (*schedulerSnapshotStore) Delete(context.Context, string) error { return nil }
 
 type fakePluginScheduler struct {
 	resp     pluginapi.SchedulerPickResponse
@@ -163,6 +182,210 @@ func TestSchedulerPick_FillFirstSticksToFirstReady(t *testing.T) {
 		}
 		if got.ID != "a" {
 			t.Fatalf("pickSingle() #%d auth.ID = %q, want %q", index, got.ID, "a")
+		}
+	}
+}
+
+func TestSchedulerPick_SequentialFillStickyBehavior(t *testing.T) {
+	t.Parallel()
+
+	scheduler := newSchedulerForTest(
+		&SequentialFillSelector{},
+		&Auth{ID: "b", Provider: "gemini"},
+		&Auth{ID: "a", Provider: "gemini"},
+		&Auth{ID: "c", Provider: "gemini"},
+	)
+
+	first, errPick := scheduler.pickSingle(context.Background(), "gemini", "", cliproxyexecutor.Options{}, nil)
+	if errPick != nil {
+		t.Fatalf("pickSingle() #1 error = %v", errPick)
+	}
+	if first == nil {
+		t.Fatalf("pickSingle() #1 auth = nil")
+	}
+	valid := map[string]bool{"a": true, "b": true, "c": true}
+	if !valid[first.ID] {
+		t.Fatalf("pickSingle() #1 auth.ID = %q, want one of a/b/c", first.ID)
+	}
+
+	for index := 2; index <= 5; index++ {
+		got, errPick := scheduler.pickSingle(context.Background(), "gemini", "", cliproxyexecutor.Options{}, nil)
+		if errPick != nil {
+			t.Fatalf("pickSingle() #%d error = %v", index, errPick)
+		}
+		if got == nil {
+			t.Fatalf("pickSingle() #%d auth = nil", index)
+		}
+		if got.ID != first.ID {
+			t.Fatalf("pickSingle() #%d auth.ID = %q, want sticky %q", index, got.ID, first.ID)
+		}
+	}
+}
+
+func TestSchedulerPick_SequentialFillRandomStartNotAlwaysSmallestID(t *testing.T) {
+	t.Parallel()
+
+	auths := []*Auth{
+		{ID: "a", Provider: "gemini"},
+		{ID: "b", Provider: "gemini"},
+		{ID: "c", Provider: "gemini"},
+	}
+	counts := make(map[string]int, 3)
+	const trials = 90
+	for i := 0; i < trials; i++ {
+		scheduler := newSchedulerForTest(&SequentialFillSelector{}, auths...)
+		got, errPick := scheduler.pickSingle(context.Background(), "gemini", "", cliproxyexecutor.Options{}, nil)
+		if errPick != nil {
+			t.Fatalf("pickSingle() trial %d error = %v", i, errPick)
+		}
+		if got == nil {
+			t.Fatalf("pickSingle() trial %d auth = nil", i)
+		}
+		counts[got.ID]++
+	}
+	if counts["a"] == trials {
+		t.Fatalf("SequentialFill always started on smallest ID %q across %d trials; still behaving like FillFirst", "a", trials)
+	}
+	if len(counts) < 2 {
+		t.Fatalf("SequentialFill first picks = %#v, want multiple start IDs across trials", counts)
+	}
+}
+
+func TestSchedulerPick_SequentialFillAdvanceOnUnavailable(t *testing.T) {
+	t.Parallel()
+
+	model := "gemini-2.5-pro"
+	registerSchedulerModels(t, "gemini", model, "a", "b", "c")
+
+	scheduler := newSchedulerForTest(
+		&SequentialFillSelector{},
+		&Auth{ID: "a", Provider: "gemini"},
+		&Auth{ID: "b", Provider: "gemini"},
+		&Auth{ID: "c", Provider: "gemini"},
+	)
+
+	first, errPick := scheduler.pickSingle(context.Background(), "gemini", model, cliproxyexecutor.Options{}, nil)
+	if errPick != nil {
+		t.Fatalf("pickSingle() #1 error = %v", errPick)
+	}
+	if first == nil {
+		t.Fatalf("pickSingle() #1 auth = nil")
+	}
+
+	// Burn the sticky credential into cooldown, then the scheduler must advance permanently.
+	scheduler.upsertAuth(&Auth{
+		ID:       first.ID,
+		Provider: "gemini",
+		ModelStates: map[string]*ModelState{
+			model: {
+				Status:         StatusError,
+				Unavailable:    true,
+				NextRetryAfter: time.Now().Add(time.Hour),
+				Quota:          QuotaState{Exceeded: true, NextRecoverAt: time.Now().Add(time.Hour)},
+			},
+		},
+	})
+
+	second, errPick := scheduler.pickSingle(context.Background(), "gemini", model, cliproxyexecutor.Options{}, nil)
+	if errPick != nil {
+		t.Fatalf("pickSingle() after cooldown error = %v", errPick)
+	}
+	if second == nil {
+		t.Fatalf("pickSingle() after cooldown auth = nil")
+	}
+	if second.ID == first.ID {
+		t.Fatalf("pickSingle() after cooldown stayed on %q, want advance", first.ID)
+	}
+
+	third, errPick := scheduler.pickSingle(context.Background(), "gemini", model, cliproxyexecutor.Options{}, nil)
+	if errPick != nil {
+		t.Fatalf("pickSingle() sticky after advance error = %v", errPick)
+	}
+	if third == nil || third.ID != second.ID {
+		t.Fatalf("pickSingle() sticky after advance = %v, want %q", third, second.ID)
+	}
+}
+
+func TestSchedulerPick_SequentialFillTriedDoesNotBurnSticky(t *testing.T) {
+	t.Parallel()
+
+	scheduler := newSchedulerForTest(
+		&SequentialFillSelector{},
+		&Auth{ID: "a", Provider: "gemini"},
+		&Auth{ID: "b", Provider: "gemini"},
+		&Auth{ID: "c", Provider: "gemini"},
+	)
+
+	first, errPick := scheduler.pickSingle(context.Background(), "gemini", "", cliproxyexecutor.Options{}, nil)
+	if errPick != nil {
+		t.Fatalf("pickSingle() #1 error = %v", errPick)
+	}
+	if first == nil {
+		t.Fatalf("pickSingle() #1 auth = nil")
+	}
+
+	tried := map[string]struct{}{first.ID: {}}
+	failover, errPick := scheduler.pickSingle(context.Background(), "gemini", "", cliproxyexecutor.Options{}, tried)
+	if errPick != nil {
+		t.Fatalf("pickSingle() failover error = %v", errPick)
+	}
+	if failover == nil {
+		t.Fatalf("pickSingle() failover auth = nil")
+	}
+	if failover.ID == first.ID {
+		t.Fatalf("pickSingle() failover returned sticky %q, want temporary other auth", first.ID)
+	}
+
+	restored, errPick := scheduler.pickSingle(context.Background(), "gemini", "", cliproxyexecutor.Options{}, nil)
+	if errPick != nil {
+		t.Fatalf("pickSingle() restore error = %v", errPick)
+	}
+	if restored == nil || restored.ID != first.ID {
+		t.Fatalf("pickSingle() restore = %v, want sticky %q", restored, first.ID)
+	}
+}
+
+func TestManagerExecute_SequentialFillLoadPreservesSticky(t *testing.T) {
+	t.Parallel()
+
+	const (
+		provider     = "gemini"
+		authCount    = 64
+		rebuildCount = 8
+	)
+	auths := make([]*Auth, 0, authCount)
+	for index := 0; index < authCount; index++ {
+		auths = append(auths, &Auth{
+			ID:       fmt.Sprintf("auth-%02d", index),
+			Provider: provider,
+		})
+	}
+	manager := NewManager(&schedulerSnapshotStore{auths: auths}, &SequentialFillSelector{}, nil)
+	manager.RegisterExecutor(&authFallbackExecutor{id: provider})
+
+	ctx := context.Background()
+	if errLoad := manager.Load(ctx); errLoad != nil {
+		t.Fatalf("Load() initial error = %v", errLoad)
+	}
+	first, errExecute := manager.Execute(ctx, []string{provider}, cliproxyexecutor.Request{}, cliproxyexecutor.Options{})
+	if errExecute != nil {
+		t.Fatalf("Execute() initial error = %v", errExecute)
+	}
+	firstID := string(first.Payload)
+	if firstID == "" {
+		t.Fatalf("Execute() initial payload is empty")
+	}
+
+	for rebuild := 0; rebuild < rebuildCount; rebuild++ {
+		if errLoad := manager.Load(ctx); errLoad != nil {
+			t.Fatalf("Load() #%d error = %v", rebuild+1, errLoad)
+		}
+		response, errExecute := manager.Execute(ctx, []string{provider}, cliproxyexecutor.Request{}, cliproxyexecutor.Options{})
+		if errExecute != nil {
+			t.Fatalf("Execute() after Load() #%d error = %v", rebuild+1, errExecute)
+		}
+		if got := string(response.Payload); got != firstID {
+			t.Fatalf("Execute() after Load() #%d auth = %q, want sticky %q", rebuild+1, got, firstID)
 		}
 	}
 }
@@ -1119,8 +1342,8 @@ func TestManager_InitializesSchedulerForBuiltInSelector(t *testing.T) {
 	}
 
 	manager.SetSelector(&SequentialFillSelector{})
-	if manager.scheduler.strategy != schedulerStrategyFillFirst {
-		t.Fatalf("manager.scheduler.strategy after SF = %v, want %v", manager.scheduler.strategy, schedulerStrategyFillFirst)
+	if manager.scheduler.strategy != schedulerStrategySequentialFill {
+		t.Fatalf("manager.scheduler.strategy after SF = %v, want %v", manager.scheduler.strategy, schedulerStrategySequentialFill)
 	}
 }
 
