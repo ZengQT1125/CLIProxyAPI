@@ -70,6 +70,7 @@ type codexOAuthService interface {
 var (
 	callbackForwardersMu  sync.Mutex
 	callbackForwarders    = make(map[int]*callbackForwarder)
+	authFileEntryMu       sync.Mutex
 	errAuthFileMustBeJSON = errors.New("auth file must be .json")
 	errAuthFileNotFound   = errors.New("auth file not found")
 	errPluginVirtualAuth  = errors.New("plugin virtual auth cannot be modified directly; edit or delete the source auth file")
@@ -354,7 +355,18 @@ func (h *Handler) ListAuthFiles(c *gin.Context) {
 		h.listAuthFilesFromDisk(c, query, paginated)
 		return
 	}
+	nameFilter := strings.TrimSpace(c.Query("name"))
+	authIndexFilter := strings.TrimSpace(c.Query("auth_index"))
 	auths := h.authManager.List()
+	if nameFilter != "" || authIndexFilter != "" {
+		filtered := make([]*coreauth.Auth, 0, len(auths))
+		for _, auth := range auths {
+			if matchesAuthFileLookup(auth, nameFilter, authIndexFilter) {
+				filtered = append(filtered, auth)
+			}
+		}
+		auths = filtered
+	}
 	if !paginated {
 		h.writeFullAuthFileList(c, auths)
 		return
@@ -375,6 +387,55 @@ func (h *Handler) ListAuthFiles(c *gin.Context) {
 		"type_counts":         page.TypeCounts,
 		"enabled_type_counts": page.EnabledTypeCounts,
 	})
+}
+
+func lockedAuthIndex(auth *coreauth.Auth) string {
+	if auth == nil {
+		return ""
+	}
+	authFileEntryMu.Lock()
+	defer authFileEntryMu.Unlock()
+	return strings.TrimSpace(auth.EnsureIndex())
+}
+
+func matchesAuthFileLookup(auth *coreauth.Auth, name string, authIndex string) bool {
+	if auth == nil {
+		return false
+	}
+	if name != "" && strings.TrimSpace(auth.ID) != name && strings.TrimSpace(auth.FileName) != name {
+		return false
+	}
+	if authIndex != "" && lockedAuthIndex(auth) != authIndex {
+		return false
+	}
+	return true
+}
+
+func (h *Handler) lookupAuthFile(name string, authIndex string) (*coreauth.Auth, bool) {
+	name = strings.TrimSpace(name)
+	authIndex = strings.TrimSpace(authIndex)
+	if h == nil || h.authManager == nil || name == "" {
+		return nil, false
+	}
+	if authIndex == "" {
+		if auth, ok := h.authManager.GetByID(name); ok {
+			return auth, true
+		}
+		auths := h.authManager.List()
+		for _, auth := range auths {
+			if auth != nil && strings.TrimSpace(auth.FileName) == name {
+				return auth, true
+			}
+		}
+		return nil, false
+	}
+	auths := h.authManager.List()
+	for _, auth := range auths {
+		if matchesAuthFileLookup(auth, name, authIndex) {
+			return auth, true
+		}
+	}
+	return nil, false
 }
 
 // GetAuthFileModels returns the models supported by a specific auth file
@@ -439,6 +500,8 @@ func (h *Handler) GetAuthFileLoadStatus(c *gin.Context) {
 
 // List auth files from disk when the auth manager is unavailable.
 func (h *Handler) listAuthFilesFromDisk(c *gin.Context, query authFileListQuery, paginated bool) {
+	nameFilter := strings.TrimSpace(c.Query("name"))
+	authIndexFilter := strings.TrimSpace(c.Query("auth_index"))
 	entries, err := os.ReadDir(h.cfg.AuthDir)
 	if err != nil {
 		c.JSON(500, gin.H{"error": fmt.Sprintf("failed to read auth dir: %v", err)})
@@ -447,11 +510,31 @@ func (h *Handler) listAuthFilesFromDisk(c *gin.Context, query authFileListQuery,
 	files := make([]gin.H, 0)
 	diskAuths := make([]*coreauth.Auth, 0)
 	diskEntries := make(map[*coreauth.Auth]gin.H)
+	// Disk fallback has no stable auth_index identity; reject that filter.
+	if authIndexFilter != "" {
+		if !paginated {
+			c.JSON(200, gin.H{"files": files})
+			return
+		}
+		c.JSON(http.StatusOK, gin.H{
+			"files":               files,
+			"total":               0,
+			"page":                query.Page,
+			"page_size":           query.PageSize,
+			"types":               []string{},
+			"type_counts":         map[string]int{"all": 0},
+			"enabled_type_counts": map[string]int{"all": 0},
+		})
+		return
+	}
 	for _, e := range entries {
 		if e.IsDir() {
 			continue
 		}
 		name := e.Name()
+		if nameFilter != "" && name != nameFilter {
+			continue
+		}
 		if !strings.HasSuffix(strings.ToLower(name), ".json") {
 			continue
 		}
@@ -539,6 +622,12 @@ func (h *Handler) listAuthFilesFromDisk(c *gin.Context, query authFileListQuery,
 }
 
 func (h *Handler) buildAuthFileEntry(auth *coreauth.Auth) gin.H {
+	authFileEntryMu.Lock()
+	defer authFileEntryMu.Unlock()
+	return h.buildAuthFileEntryLocked(auth)
+}
+
+func (h *Handler) buildAuthFileEntryLocked(auth *coreauth.Auth) gin.H {
 	if auth == nil {
 		return nil
 	}
@@ -2072,8 +2161,9 @@ func (h *Handler) PatchAuthFileStatus(c *gin.Context) {
 	}
 
 	var req struct {
-		Name     string `json:"name"`
-		Disabled *bool  `json:"disabled"`
+		Name      string `json:"name"`
+		AuthIndex string `json:"auth_index"`
+		Disabled  *bool  `json:"disabled"`
 	}
 	if err := c.ShouldBindJSON(&req); err != nil {
 		c.JSON(http.StatusBadRequest, gin.H{"error": "invalid request body"})
@@ -2081,6 +2171,7 @@ func (h *Handler) PatchAuthFileStatus(c *gin.Context) {
 	}
 
 	name := strings.TrimSpace(req.Name)
+	authIndex := strings.TrimSpace(req.AuthIndex)
 	if name == "" {
 		c.JSON(http.StatusBadRequest, gin.H{"error": "name is required"})
 		return
@@ -2092,20 +2183,7 @@ func (h *Handler) PatchAuthFileStatus(c *gin.Context) {
 
 	ctx := c.Request.Context()
 
-	// Find auth by name or ID
-	var targetAuth *coreauth.Auth
-	if auth, ok := h.authManager.GetByID(name); ok {
-		targetAuth = auth
-	} else {
-		auths := h.authManager.List()
-		for _, auth := range auths {
-			if auth.FileName == name {
-				targetAuth = auth
-				break
-			}
-		}
-	}
-
+	targetAuth, _ := h.lookupAuthFile(name, authIndex)
 	if targetAuth == nil {
 		c.JSON(http.StatusNotFound, gin.H{"error": "auth file not found"})
 		return
