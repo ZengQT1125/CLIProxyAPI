@@ -72,35 +72,42 @@ func TestReconcileRegistryModelStates_PreservesActiveQuotaCooldown(t *testing.T)
 	}
 }
 
-// ReconcileRegistryModelStates must still reset non-quota error states
-// (e.g. transient 500 errors).
-func TestReconcileRegistryModelStates_ResetsNonQuotaErrors(t *testing.T) {
-	model := "gpt-5.5"
-	registerSchedulerModels(t, "codex", model, "non-quota-1")
+// ReconcileRegistryModelStates must preserve active credential cooldowns even
+// when they are not quota failures. Model re-registration must not make an
+// exhausted credential immediately selectable again.
+func TestReconcileRegistryModelStates_PreservesActivePaymentCooldown(t *testing.T) {
+	model := "grok-4.5"
+	authID := "payment-cooldown-1"
+	registerSchedulerModels(t, "xai", model, authID)
 
 	m := NewManager(nil, &RoundRobinSelector{}, nil)
-	m.executors["codex"] = schedulerTestExecutor{}
-	if _, err := m.Register(context.Background(), &Auth{ID: "non-quota-1", Provider: "codex"}); err != nil {
+	m.RegisterExecutor(schedulerProviderTestExecutor{provider: "xai"})
+	if _, err := m.Register(context.Background(), &Auth{ID: authID, Provider: "xai"}); err != nil {
 		t.Fatalf("register: %v", err)
 	}
 
 	m.MarkResult(context.Background(), Result{
-		AuthID:   "non-quota-1",
-		Provider: "codex",
+		AuthID:   authID,
+		Provider: "xai",
 		Model:    model,
 		Success:  false,
-		Error:    &Error{Code: "server_error", Message: "internal server error", HTTPStatus: http.StatusInternalServerError},
+		Error:    &Error{Message: `{"error":"Grok Build usage balance exhausted"}`, HTTPStatus: http.StatusPaymentRequired},
 	})
 
-	m.ReconcileRegistryModelStates(context.Background(), "non-quota-1")
+	m.ReconcileRegistryModelStates(context.Background(), authID)
 
-	auth, ok := m.GetByID("non-quota-1")
+	auth, ok := m.GetByID(authID)
 	if !ok || auth == nil {
 		t.Fatal("auth missing")
 	}
 	state := auth.ModelStates[model]
-	if state != nil && state.Unavailable {
-		t.Fatalf("expected non-quota error state to be reset by reconcile, got %+v", state)
+	if state == nil || !state.Unavailable || !state.NextRetryAfter.After(time.Now()) {
+		t.Fatalf("active payment cooldown was cleared by reconcile: %+v", state)
+	}
+
+	picked, errSelect := m.SelectAuth(context.Background(), "xai", model, cliproxyexecutor.Options{})
+	if errSelect == nil || picked != nil {
+		t.Fatalf("SelectAuth returned cooling auth after reconcile: auth=%+v err=%v", picked, errSelect)
 	}
 }
 

@@ -410,10 +410,11 @@ func (m *Manager) RefreshSchedulerAll() {
 // ReconcileRegistryModelStates aligns per-model runtime state with the current
 // registry snapshot for one auth.
 //
-// Supported models are reset to a clean state because re-registration already
-// cleared the registry-side cooldown/suspension snapshot. ModelStates for
-// models that are no longer present in the registry are pruned entirely so
-// renamed/removed models cannot keep auth-level status stale.
+// Active cooldowns remain authoritative across model re-registration. Other
+// supported-model errors are reset because re-registration already cleared the
+// registry-side suspension snapshot. ModelStates for models that are no longer
+// present in the registry are pruned entirely so renamed/removed models cannot
+// keep auth-level status stale.
 func (m *Manager) ReconcileRegistryModelStates(ctx context.Context, authID string) {
 	if m == nil || authID == "" {
 		return
@@ -458,7 +459,7 @@ func (m *Manager) ReconcileRegistryModelStates(ctx context.Context, authID strin
 			if modelStateIsClean(state) {
 				continue
 			}
-			if modelStateHasActiveQuotaCooldown(state, now) {
+			if modelStateHasActiveCooldown(state, now) {
 				continue
 			}
 			resetModelState(state, now)
@@ -4322,17 +4323,14 @@ func modelStateIsClean(state *ModelState) bool {
 	return true
 }
 
-func modelStateHasActiveQuotaCooldown(state *ModelState, now time.Time) bool {
+func modelStateHasActiveCooldown(state *ModelState, now time.Time) bool {
 	if state == nil {
 		return false
 	}
-	if !state.Quota.Exceeded {
-		return false
-	}
-	if !state.Quota.NextRecoverAt.IsZero() && state.Quota.NextRecoverAt.After(now) {
+	if !state.NextRetryAfter.IsZero() && state.NextRetryAfter.After(now) {
 		return true
 	}
-	if !state.NextRetryAfter.IsZero() && state.NextRetryAfter.After(now) {
+	if state.Quota.Exceeded && !state.Quota.NextRecoverAt.IsZero() && state.Quota.NextRecoverAt.After(now) {
 		return true
 	}
 	return false
