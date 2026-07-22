@@ -148,8 +148,10 @@ func (h *Handler) APICall(c *gin.Context) {
 				c.JSON(http.StatusBadRequest, gin.H{"error": "auth token refresh failed"})
 				return
 			}
-			c.JSON(http.StatusBadRequest, gin.H{"error": "auth token not found"})
-			return
+			// Some credentials do not have a bearer token. Their provider executor injects
+			// the native authentication scheme immediately before sending the request.
+			delete(reqHeaders, key)
+			continue
 		}
 		if token == "" {
 			continue
@@ -179,12 +181,19 @@ func (h *Handler) APICall(c *gin.Context) {
 		req.Host = hostOverride
 	}
 
-	httpClient := &http.Client{
-		Timeout: defaultAPICallTimeout,
+	var resp *http.Response
+	var errDo error
+	if auth != nil && h != nil && h.authManager != nil {
+		requestContext, cancelRequest := context.WithTimeout(c.Request.Context(), defaultAPICallTimeout)
+		defer cancelRequest()
+		resp, errDo = h.authManager.HttpRequest(requestContext, auth, req.WithContext(requestContext))
+	} else {
+		httpClient := &http.Client{
+			Timeout: defaultAPICallTimeout,
+		}
+		httpClient.Transport = h.apiCallTransport(auth)
+		resp, errDo = httpClient.Do(req)
 	}
-	httpClient.Transport = h.apiCallTransport(auth)
-
-	resp, errDo := httpClient.Do(req)
 	if errDo != nil {
 		log.WithError(errDo).Debug("management APICall request failed")
 		c.JSON(http.StatusBadGateway, gin.H{"error": "request failed"})

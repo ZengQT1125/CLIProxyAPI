@@ -2,7 +2,12 @@ package management
 
 import (
 	"context"
+	"crypto/ed25519"
+	"crypto/rand"
 	"crypto/tls"
+	"crypto/x509"
+	"encoding/base64"
+	"encoding/json"
 	"fmt"
 	"net"
 	"net/http"
@@ -17,6 +22,7 @@ import (
 	"github.com/gin-gonic/gin"
 	xaiauth "github.com/router-for-me/CLIProxyAPI/v7/internal/auth/xai"
 	"github.com/router-for-me/CLIProxyAPI/v7/internal/config"
+	runtimeexecutor "github.com/router-for-me/CLIProxyAPI/v7/internal/runtime/executor"
 	coreauth "github.com/router-for-me/CLIProxyAPI/v7/sdk/cliproxy/auth"
 	sdkconfig "github.com/router-for-me/CLIProxyAPI/v7/sdk/config"
 )
@@ -37,6 +43,69 @@ func TestAPICallTransportDirectBypassesGlobalProxy(t *testing.T) {
 	}
 	if httpTransport.Proxy != nil {
 		t.Fatal("expected direct transport to disable proxy function")
+	}
+}
+
+func TestAPICallUsesProviderAuthenticationForAgentIdentity(t *testing.T) {
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if got := r.Header.Get("Authorization"); !strings.HasPrefix(got, "AgentAssertion ") {
+			t.Errorf("authorization header = %q, want AgentAssertion", got)
+		}
+		if got := r.Header.Get("Chatgpt-Account-Id"); got != "account-id" {
+			t.Errorf("Chatgpt-Account-Id = %q, want account-id", got)
+		}
+		w.WriteHeader(http.StatusNoContent)
+	}))
+	defer upstream.Close()
+
+	_, privateKey, errKey := ed25519.GenerateKey(rand.Reader)
+	if errKey != nil {
+		t.Fatalf("generate agent identity key: %v", errKey)
+	}
+	privateKeyDER, errMarshalKey := x509.MarshalPKCS8PrivateKey(privateKey)
+	if errMarshalKey != nil {
+		t.Fatalf("marshal agent identity key: %v", errMarshalKey)
+	}
+
+	manager := coreauth.NewManager(nil, nil, nil)
+	manager.RegisterExecutor(runtimeexecutor.NewCodexExecutor(&config.Config{}))
+	auth := &coreauth.Auth{
+		ID:       "agent-identity",
+		Index:    "agent-auth-index",
+		Provider: "codex",
+		Status:   coreauth.StatusActive,
+		Metadata: map[string]any{
+			"auth_kind":         "agent_identity",
+			"agent_runtime_id":  "runtime-id",
+			"agent_private_key": base64.StdEncoding.EncodeToString(privateKeyDER),
+			"task_id":           "task-id",
+			"account_id":        "account-id",
+		},
+	}
+	if _, errRegister := manager.Register(context.Background(), auth); errRegister != nil {
+		t.Fatalf("register auth: %v", errRegister)
+	}
+
+	h := NewHandlerWithoutConfigFilePath(&config.Config{}, manager)
+
+	payload := fmt.Sprintf(`{"authIndex":"agent-auth-index","method":"POST","url":%q,"header":{"Authorization":"Bearer $TOKEN$"}}`, upstream.URL)
+	gin.SetMode(gin.TestMode)
+	recorder := httptest.NewRecorder()
+	c, _ := gin.CreateTestContext(recorder)
+	c.Request = httptest.NewRequest(http.MethodPost, "/v0/management/api-call", strings.NewReader(payload))
+	c.Request.Header.Set("Content-Type", "application/json")
+
+	h.APICall(c)
+
+	if recorder.Code != http.StatusOK {
+		t.Fatalf("APICall status = %d, want %d; body=%s", recorder.Code, http.StatusOK, recorder.Body.String())
+	}
+	var response apiCallResponse
+	if errDecode := json.Unmarshal(recorder.Body.Bytes(), &response); errDecode != nil {
+		t.Fatalf("decode APICall response: %v", errDecode)
+	}
+	if response.StatusCode != http.StatusNoContent {
+		t.Fatalf("upstream status = %d, want %d", response.StatusCode, http.StatusNoContent)
 	}
 }
 
