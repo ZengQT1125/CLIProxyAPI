@@ -81,8 +81,8 @@ func TestXAIExecutorProbeCredentialUsesConversation(t *testing.T) {
 	if gotPath != "/responses" {
 		t.Fatalf("request path = %q, want /responses", gotPath)
 	}
-	if model := gjson.GetBytes(gotBody, "model").String(); model == "" {
-		t.Fatalf("probe model is empty: %s", string(gotBody))
+	if model := gjson.GetBytes(gotBody, "model").String(); model != "grok-4.5" {
+		t.Fatalf("probe model = %q, want grok-4.5; body=%s", model, string(gotBody))
 	}
 	if input := gjson.GetBytes(gotBody, "input.0.content.0.text").String(); input != "Reply with OK." {
 		t.Fatalf("probe input text = %q, want minimal conversation; body=%s", input, string(gotBody))
