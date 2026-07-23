@@ -1497,16 +1497,18 @@ type routingRuntimeState struct {
 
 func normalizedRoutingRuntimeState(cfg *config.Config) routingRuntimeState {
 	state := routingRuntimeState{
-		strategy:           "round-robin",
+		strategy:           coreauth.RoutingStrategyRoundRobin,
 		sessionAffinityTTL: time.Hour,
 	}
 	if cfg == nil {
 		return state
 	}
 
-	switch strings.ToLower(strings.TrimSpace(cfg.Routing.Strategy)) {
-	case "fill-first", "fillfirst", "ff":
-		state.strategy = "fill-first"
+	// Reuse the shared normalizer so aliases (rr/ff/sf) stay in lockstep with
+	// SelectorForRoutingStrategy and the management API — do not re-handroll
+	// a partial switch here (that previously dropped sequential-fill entirely).
+	if normalized, ok := coreauth.NormalizeRoutingStrategy(cfg.Routing.Strategy); ok {
+		state.strategy = normalized
 	}
 	state.sessionAffinity = cfg.Routing.SessionAffinity
 	if ttl := strings.TrimSpace(cfg.Routing.SessionAffinityTTL); ttl != "" {
@@ -1518,12 +1520,7 @@ func normalizedRoutingRuntimeState(cfg *config.Config) routingRuntimeState {
 }
 
 func newRoutingSelector(state routingRuntimeState) coreauth.Selector {
-	var selector coreauth.Selector
-	if state.strategy == "fill-first" {
-		selector = &coreauth.FillFirstSelector{}
-	} else {
-		selector = &coreauth.RoundRobinSelector{}
-	}
+	selector := coreauth.SelectorForRoutingStrategy(state.strategy)
 	if state.sessionAffinity {
 		selector = coreauth.NewSessionAffinitySelectorWithConfig(coreauth.SessionAffinityConfig{
 			Fallback: selector,
