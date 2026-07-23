@@ -4654,6 +4654,7 @@ func (m *Manager) MarkResult(ctx context.Context, result Result) {
 	clearModelQuota := false
 	setModelQuota := false
 	deleteAuthID := ""
+	deleteAuthIndex := ""
 	var deleteStore Store
 	var authSnapshot *Auth
 	cooldownStateChanged := false
@@ -4675,6 +4676,7 @@ func (m *Manager) MarkResult(ctx context.Context, result Result) {
 
 		if deleteUnauthorized {
 			deleteAuthID = auth.ID
+			deleteAuthIndex = auth.EnsureIndex()
 			deleteStore = m.store
 			delete(m.auths, auth.ID)
 			shouldDeleteAuth = true
@@ -4819,7 +4821,7 @@ func (m *Manager) MarkResult(ctx context.Context, result Result) {
 	}
 	m.mu.Unlock()
 	if shouldDeleteAuth {
-		m.removeDeletedAuth(ctx, deleteAuthID, deleteStore)
+		m.removeDeletedAuth(ctx, deleteAuthID, deleteAuthIndex, deleteStore)
 		unlockLifecycle()
 		m.hook.OnResult(ctx, result)
 		return
@@ -4902,14 +4904,21 @@ func (m *Manager) lockAuthLifecycle(authID string) func() {
 	return lock.Unlock
 }
 
-func (m *Manager) removeDeletedAuth(ctx context.Context, authID string, store Store) {
+func (m *Manager) removeDeletedAuth(ctx context.Context, authID, authIndex string, store Store) {
 	if authID == "" {
 		return
 	}
 	m.queueCooldownStatePersist(authID)
+	deleted := true
 	if store != nil {
 		if err := store.Delete(ctx, authID); err != nil {
+			deleted = false
 			logEntryWithRequestID(ctx).WithField("auth_id", authID).Warnf("failed to delete unauthorized auth: %v", err)
+		}
+	}
+	if deleted && strings.TrimSpace(authIndex) != "" {
+		if err := coreusage.DeleteAuthUsage(ctx, authIndex); err != nil {
+			logEntryWithRequestID(ctx).WithFields(log.Fields{"auth_id": authID, "auth_index": authIndex}).Warnf("failed to delete unauthorized auth usage: %v", err)
 		}
 	}
 	if m.scheduler != nil {
@@ -7874,12 +7883,14 @@ func (m *Manager) refreshAuthWithPolicy(ctx context.Context, id, failedAccessTok
 		shouldDelete := false
 		shouldReschedule := false
 		shouldUnschedule := false
+		deleteAuthIndex := ""
 		var deleteStore Store
 		m.mu.Lock()
 		if current := m.auths[id]; current == auth {
 			current.LastError = refreshErrorFromError(err)
 			if deleteTerminal {
 				deleteStore = m.store
+				deleteAuthIndex = current.EnsureIndex()
 				delete(m.auths, id)
 				shouldDelete = true
 			} else {
@@ -7909,7 +7920,7 @@ func (m *Manager) refreshAuthWithPolicy(ctx context.Context, id, failedAccessTok
 		}
 		m.mu.Unlock()
 		if shouldDelete {
-			m.removeDeletedAuth(ctx, id, deleteStore)
+			m.removeDeletedAuth(ctx, id, deleteAuthIndex, deleteStore)
 		} else if shouldUnschedule {
 			m.queueRefreshUnschedule(id)
 		} else if shouldReschedule {

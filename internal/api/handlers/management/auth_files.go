@@ -34,11 +34,13 @@ import (
 	"github.com/router-for-me/CLIProxyAPI/v7/internal/misc"
 	"github.com/router-for-me/CLIProxyAPI/v7/internal/pluginhost"
 	"github.com/router-for-me/CLIProxyAPI/v7/internal/registry"
+	internalusage "github.com/router-for-me/CLIProxyAPI/v7/internal/usage"
 	"github.com/router-for-me/CLIProxyAPI/v7/internal/util"
 	"github.com/router-for-me/CLIProxyAPI/v7/internal/watcher"
 	"github.com/router-for-me/CLIProxyAPI/v7/internal/watcher/synthesizer"
 	sdkAuth "github.com/router-for-me/CLIProxyAPI/v7/sdk/auth"
 	coreauth "github.com/router-for-me/CLIProxyAPI/v7/sdk/cliproxy/auth"
+	coreusage "github.com/router-for-me/CLIProxyAPI/v7/sdk/cliproxy/usage"
 	"github.com/router-for-me/CLIProxyAPI/v7/sdk/pluginapi"
 	log "github.com/sirupsen/logrus"
 	"github.com/tidwall/gjson"
@@ -1284,6 +1286,9 @@ func (h *Handler) deleteFilteredAuthFile(ctx context.Context, candidate filtered
 	if isUnsafeAuthFileName(name) {
 		return "", http.StatusBadRequest, fmt.Errorf("invalid name")
 	}
+	if errUsage := h.deleteAuthUsage(ctx, h.authsForPath(candidate.path, candidate.authID)...); errUsage != nil {
+		return name, http.StatusInternalServerError, fmt.Errorf("failed to delete usage statistics: %w", errUsage)
+	}
 	if errRemove := os.Remove(candidate.path); errRemove != nil {
 		if os.IsNotExist(errRemove) {
 			return name, http.StatusNotFound, errAuthFileNotFound
@@ -1955,6 +1960,9 @@ func (h *Handler) deleteAuthFileByName(ctx context.Context, name string) (string
 		if abs, errAbs := filepath.Abs(targetPath); errAbs == nil {
 			targetPath = abs
 		}
+	}
+	if errUsage := h.deleteAuthUsage(ctx, h.authsForPath(targetPath, targetID)...); errUsage != nil {
+		return filepath.Base(name), http.StatusInternalServerError, fmt.Errorf("failed to delete usage statistics: %w", errUsage)
 	}
 	if errRemove := os.Remove(targetPath); errRemove != nil {
 		if os.IsNotExist(errRemove) {
@@ -2786,6 +2794,69 @@ func (h *Handler) removeAuth(ctx context.Context, id string) {
 		return
 	}
 	h.authManager.Remove(ctx, authID)
+}
+
+func (h *Handler) deleteAuthUsage(ctx context.Context, auths ...*coreauth.Auth) error {
+	if h == nil || len(auths) == 0 {
+		return nil
+	}
+	seen := make(map[string]struct{}, len(auths))
+	authIndexes := make([]string, 0, len(auths))
+	for _, auth := range auths {
+		if auth == nil {
+			continue
+		}
+		authIndex := strings.TrimSpace(auth.Index)
+		if authIndex == "" {
+			authIndex = strings.TrimSpace(auth.EnsureIndex())
+		}
+		if authIndex == "" {
+			continue
+		}
+		if _, ok := seen[authIndex]; ok {
+			continue
+		}
+		seen[authIndex] = struct{}{}
+		authIndexes = append(authIndexes, authIndex)
+	}
+	if len(authIndexes) == 0 {
+		return nil
+	}
+	if h.usageStats != nil && h.usageStats != internalusage.GetRequestStatistics() {
+		h.usageStats.DeleteAuthUsage(authIndexes)
+	}
+	if err := coreusage.DeleteAuthUsage(ctx, authIndexes...); err != nil {
+		return fmt.Errorf("delete auth usage: %w", err)
+	}
+	return nil
+}
+
+func (h *Handler) authsForPath(path string, fallbackID string) []*coreauth.Auth {
+	if h == nil || h.authManager == nil {
+		return nil
+	}
+	auths := make([]*coreauth.Auth, 0)
+	for _, auth := range h.authManager.List() {
+		if auth == nil {
+			continue
+		}
+		if sameAuthFilePath(authAttribute(auth, "path"), path) || sameAuthFilePath(authAttribute(auth, coreauth.AttributeVirtualSource), path) {
+			auths = append(auths, auth)
+		}
+	}
+	if len(auths) > 0 {
+		return auths
+	}
+	for _, id := range []string{fallbackID, h.authIDForPath(path)} {
+		id = strings.TrimSpace(id)
+		if id == "" {
+			continue
+		}
+		if auth, ok := h.authManager.GetByID(id); ok && auth != nil {
+			return []*coreauth.Auth{auth}
+		}
+	}
+	return nil
 }
 
 func (h *Handler) removeAuthsForPath(ctx context.Context, path string, fallbackID string) {

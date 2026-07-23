@@ -2,6 +2,8 @@ package usage
 
 import (
 	"context"
+	"errors"
+	"fmt"
 	"net/http"
 	"strings"
 	"sync"
@@ -211,6 +213,12 @@ type Plugin interface {
 	HandleUsage(ctx context.Context, record Record)
 }
 
+// AuthUsageCleaner removes usage statistics for deleted credentials.
+// Auth indexes are stable credential identities used by usage records.
+type AuthUsageCleaner interface {
+	DeleteAuthUsage(ctx context.Context, authIndexes []string) error
+}
+
 type queueItem struct {
 	ctx    context.Context
 	record Record
@@ -304,6 +312,38 @@ func (m *Manager) RegisterNamed(name string, plugin Plugin) {
 	m.pluginsMu.Unlock()
 }
 
+// DeleteAuthUsage notifies plugins that usage records for the supplied credentials must be removed.
+func (m *Manager) DeleteAuthUsage(ctx context.Context, authIndexes []string) error {
+	if m == nil || len(authIndexes) == 0 {
+		return nil
+	}
+	m.pluginsMu.RLock()
+	plugins := make([]Plugin, len(m.plugins))
+	copy(plugins, m.plugins)
+	m.pluginsMu.RUnlock()
+
+	var result error
+	for _, plugin := range plugins {
+		cleaner, ok := plugin.(AuthUsageCleaner)
+		if !ok {
+			continue
+		}
+		if err := safeDeleteAuthUsage(cleaner, ctx, append([]string(nil), authIndexes...)); err != nil {
+			result = errors.Join(result, err)
+		}
+	}
+	return result
+}
+
+func safeDeleteAuthUsage(cleaner AuthUsageCleaner, ctx context.Context, authIndexes []string) (err error) {
+	defer func() {
+		if recovered := recover(); recovered != nil {
+			err = fmt.Errorf("usage: auth usage cleaner panic recovered: %v", recovered)
+		}
+	}()
+	return cleaner.DeleteAuthUsage(ctx, authIndexes)
+}
+
 // Publish enqueues a usage record for processing. If no plugin is registered
 // the record will be discarded downstream.
 func (m *Manager) Publish(ctx context.Context, record Record) {
@@ -377,6 +417,11 @@ func RegisterNamedPlugin(name string, plugin Plugin) { DefaultManager().Register
 
 // PublishRecord publishes a record using the default manager.
 func PublishRecord(ctx context.Context, record Record) { DefaultManager().Publish(ctx, record) }
+
+// DeleteAuthUsage removes usage statistics for credentials identified by their stable auth indexes.
+func DeleteAuthUsage(ctx context.Context, authIndexes ...string) error {
+	return DefaultManager().DeleteAuthUsage(ctx, authIndexes)
+}
 
 // StartDefault starts the default manager's dispatcher.
 func StartDefault(ctx context.Context) { DefaultManager().Start(ctx) }

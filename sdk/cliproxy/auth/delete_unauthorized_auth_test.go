@@ -10,7 +10,9 @@ import (
 	"time"
 
 	"github.com/router-for-me/CLIProxyAPI/v7/internal/registry"
+	internalusage "github.com/router-for-me/CLIProxyAPI/v7/internal/usage"
 	cliproxyexecutor "github.com/router-for-me/CLIProxyAPI/v7/sdk/cliproxy/executor"
+	coreusage "github.com/router-for-me/CLIProxyAPI/v7/sdk/cliproxy/usage"
 )
 
 type deleteTrackingStore struct {
@@ -202,6 +204,53 @@ func TestManagerMarkResultDeletesUnauthorizedAuthWhenEnabled(t *testing.T) {
 	}
 	if got := store.deleted(); len(got) != 1 || got[0] != "auth-1" {
 		t.Fatalf("expected auth-1 to be deleted, got %v", got)
+	}
+}
+
+func TestManagerMarkResultDeletesUsageForUnauthorizedAuth(t *testing.T) {
+	SetDeleteUnauthorizedAuth(true)
+	t.Cleanup(func() { SetDeleteUnauthorizedAuth(false) })
+
+	oldStatisticsEnabled := internalusage.StatisticsEnabled()
+	internalusage.SetStatisticsEnabled(true)
+	t.Cleanup(func() { internalusage.SetStatisticsEnabled(oldStatisticsEnabled) })
+
+	store := &deleteTrackingStore{}
+	manager := NewManager(store, nil, nil)
+	auth := &Auth{
+		ID:       "usage-delete-auth",
+		Provider: "codex",
+		Metadata: map[string]any{"type": "codex"},
+	}
+	if _, errRegister := manager.Register(WithSkipPersist(context.Background()), auth); errRegister != nil {
+		t.Fatalf("register auth: %v", errRegister)
+	}
+	authIndex := auth.EnsureIndex()
+	stats := internalusage.GetRequestStatistics()
+	t.Cleanup(func() { stats.DeleteAuthUsage([]string{authIndex}) })
+	stats.Record(context.Background(), coreusage.Record{
+		APIKey:      "usage-delete-test",
+		Model:       "gpt-5",
+		AuthIndex:   authIndex,
+		RequestedAt: time.Now(),
+		Detail:      coreusage.Detail{TotalTokens: 1},
+	})
+
+	manager.MarkResult(context.Background(), Result{
+		AuthID:  auth.ID,
+		Model:   "gpt-5",
+		Success: false,
+		Error:   &Error{HTTPStatus: http.StatusUnauthorized, Message: "unauthorized"},
+	})
+
+	for _, apiStats := range stats.Snapshot().APIs {
+		for _, modelStats := range apiStats.Models {
+			for _, detail := range modelStats.Details {
+				if detail.AuthIndex == authIndex {
+					t.Fatalf("usage for deleted auth index %q was retained", authIndex)
+				}
+			}
+		}
 	}
 }
 

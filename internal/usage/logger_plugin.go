@@ -50,6 +50,15 @@ func (p *LoggerPlugin) HandleUsage(ctx context.Context, record coreusage.Record)
 	p.stats.Record(ctx, record)
 }
 
+// DeleteAuthUsage removes in-memory usage statistics for deleted credentials.
+func (p *LoggerPlugin) DeleteAuthUsage(_ context.Context, authIndexes []string) error {
+	if p == nil || p.stats == nil {
+		return nil
+	}
+	p.stats.DeleteAuthUsage(authIndexes)
+	return nil
+}
+
 // SetStatisticsEnabled toggles whether in-memory statistics are recorded.
 func SetStatisticsEnabled(enabled bool) { statisticsEnabled.Store(enabled) }
 
@@ -213,6 +222,89 @@ func (s *RequestStatistics) Record(ctx context.Context, record coreusage.Record)
 	s.requestsByHour[hourKey]++
 	s.tokensByDay[dayKey] += totalTokens
 	s.tokensByHour[hourKey] += totalTokens
+}
+
+// DeleteAuthUsage removes statistics associated with the supplied stable auth indexes.
+func (s *RequestStatistics) DeleteAuthUsage(authIndexes []string) int64 {
+	if s == nil {
+		return 0
+	}
+	indexes := make(map[string]struct{}, len(authIndexes))
+	for _, authIndex := range authIndexes {
+		if authIndex = strings.TrimSpace(authIndex); authIndex != "" {
+			indexes[authIndex] = struct{}{}
+		}
+	}
+	if len(indexes) == 0 {
+		return 0
+	}
+
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	previousAPIs := s.apis
+	found := false
+	for _, stats := range previousAPIs {
+		if stats == nil {
+			continue
+		}
+		for _, modelStatsValue := range stats.Models {
+			if modelStatsValue == nil {
+				continue
+			}
+			for _, detail := range modelStatsValue.Details {
+				if _, ok := indexes[strings.TrimSpace(detail.AuthIndex)]; ok {
+					found = true
+					break
+				}
+			}
+			if found {
+				break
+			}
+		}
+		if found {
+			break
+		}
+	}
+	if !found {
+		return 0
+	}
+
+	s.totalRequests = 0
+	s.successCount = 0
+	s.failureCount = 0
+	s.totalTokens = 0
+	s.apis = make(map[string]*apiStats)
+	s.requestsByDay = make(map[string]int64)
+	s.requestsByHour = make(map[int]int64)
+	s.tokensByDay = make(map[string]int64)
+	s.tokensByHour = make(map[int]int64)
+
+	var removed int64
+	for apiName, stats := range previousAPIs {
+		if stats == nil {
+			continue
+		}
+		for modelName, modelStatsValue := range stats.Models {
+			if modelStatsValue == nil {
+				continue
+			}
+			for _, detail := range modelStatsValue.Details {
+				if _, ok := indexes[strings.TrimSpace(detail.AuthIndex)]; ok {
+					removed++
+					continue
+				}
+				currentStats, ok := s.apis[apiName]
+				if !ok {
+					currentStats = &apiStats{Models: make(map[string]*modelStats)}
+					s.apis[apiName] = currentStats
+				}
+				s.recordImported(apiName, modelName, currentStats, detail)
+			}
+		}
+	}
+
+	return removed
 }
 
 func (s *RequestStatistics) updateAPIStats(stats *apiStats, model string, detail RequestDetail) {

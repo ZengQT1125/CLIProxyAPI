@@ -84,9 +84,57 @@ type UsageStore interface {
 	InsertBatch(ctx context.Context, records []UsageRecord) (added, skipped int64, err error)
 	GetAggregatedStats(ctx context.Context) (AggregatedStats, error)
 	GetDetails(ctx context.Context, offset, limit int) ([]DetailRecord, error)
+	DeleteAuthUsage(ctx context.Context, authIndexes []string) (deleted int64, err error)
 	DeleteOldRecords(ctx context.Context, retentionDays int) (deleted int64, err error)
 	EnsureSchema(ctx context.Context) error
 	Close() error
+}
+
+type usageRecordExecer interface {
+	ExecContext(ctx context.Context, query string, args ...any) (sql.Result, error)
+}
+
+func normalizedAuthIndexes(authIndexes []string) []string {
+	if len(authIndexes) == 0 {
+		return nil
+	}
+	seen := make(map[string]struct{}, len(authIndexes))
+	normalized := make([]string, 0, len(authIndexes))
+	for _, authIndex := range authIndexes {
+		authIndex = strings.TrimSpace(authIndex)
+		if authIndex == "" {
+			continue
+		}
+		if _, ok := seen[authIndex]; ok {
+			continue
+		}
+		seen[authIndex] = struct{}{}
+		normalized = append(normalized, authIndex)
+	}
+	return normalized
+}
+
+func deleteUsageByAuthIndexes(ctx context.Context, executor usageRecordExecer, table string, placeholder func(int) string, authIndexes []string) (int64, error) {
+	authIndexes = normalizedAuthIndexes(authIndexes)
+	if len(authIndexes) == 0 {
+		return 0, nil
+	}
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	placeholders := make([]string, len(authIndexes))
+	args := make([]any, len(authIndexes))
+	for i, authIndex := range authIndexes {
+		placeholders[i] = placeholder(i + 1)
+		args[i] = authIndex
+	}
+	query := fmt.Sprintf("DELETE FROM %s WHERE auth_index IN (%s)", table, strings.Join(placeholders, ", "))
+	result, err := executor.ExecContext(ctx, query, args...)
+	if err != nil {
+		return 0, fmt.Errorf("usage store: delete auth usage: %w", err)
+	}
+	deleted, _ := result.RowsAffected()
+	return deleted, nil
 }
 
 const (
@@ -240,6 +288,28 @@ func (s *mirrorUsageStore) GetDetails(ctx context.Context, offset, limit int) ([
 		return nil, fmt.Errorf("usage store: mirror store not initialized")
 	}
 	return s.local.GetDetails(ctx, offset, limit)
+}
+
+func (s *mirrorUsageStore) DeleteAuthUsage(ctx context.Context, authIndexes []string) (deleted int64, err error) {
+	if s == nil || s.primary == nil || s.local == nil {
+		return 0, fmt.Errorf("usage store: mirror store not initialized")
+	}
+	authIndexes = normalizedAuthIndexes(authIndexes)
+	if len(authIndexes) == 0 {
+		return 0, nil
+	}
+	deletedPrimary, err := s.primary.DeleteAuthUsage(ctx, authIndexes)
+	if err != nil {
+		return 0, err
+	}
+	deletedLocal, err := s.local.DeleteAuthUsage(ctx, authIndexes)
+	if err != nil {
+		return 0, fmt.Errorf("usage store: delete auth usage in sqlite mirror: %w", err)
+	}
+	if deletedPrimary > deletedLocal {
+		return deletedPrimary, nil
+	}
+	return deletedLocal, nil
 }
 
 func (s *mirrorUsageStore) DeleteOldRecords(ctx context.Context, retentionDays int) (deleted int64, err error) {
@@ -743,6 +813,15 @@ func (s *pgUsageStore) DeleteOldRecords(ctx context.Context, retentionDays int) 
 	return deleted, nil
 }
 
+func (s *pgUsageStore) DeleteAuthUsage(ctx context.Context, authIndexes []string) (int64, error) {
+	if s == nil || s.db == nil {
+		return 0, fmt.Errorf("usage store: postgres store not initialized")
+	}
+	return deleteUsageByAuthIndexes(ctx, s.db, s.fullTableName("usage_records"), func(index int) string {
+		return fmt.Sprintf("$%d", index)
+	}, authIndexes)
+}
+
 func (s *pgUsageStore) Close() error {
 	if s == nil || s.db == nil {
 		return nil
@@ -1163,6 +1242,15 @@ func (s *sqliteUsageStore) DeleteOldRecords(ctx context.Context, retentionDays i
 	}
 	deleted, _ = result.RowsAffected()
 	return deleted, nil
+}
+
+func (s *sqliteUsageStore) DeleteAuthUsage(ctx context.Context, authIndexes []string) (int64, error) {
+	if s == nil || s.db == nil {
+		return 0, fmt.Errorf("usage store: sqlite store not initialized")
+	}
+	return deleteUsageByAuthIndexes(ctx, s.db, "usage_records", func(int) string {
+		return "?"
+	}, authIndexes)
 }
 
 func (s *sqliteUsageStore) Close() error {

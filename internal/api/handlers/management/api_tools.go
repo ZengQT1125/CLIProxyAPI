@@ -1108,6 +1108,9 @@ func (h *Handler) deleteAuthBacking(ctx context.Context, auth *coreauth.Auth) er
 	if path == "" {
 		return fmt.Errorf("auth path is empty")
 	}
+	if errUsage := h.deleteAuthUsage(ctx, auth); errUsage != nil {
+		return fmt.Errorf("failed to delete usage statistics: %w", errUsage)
+	}
 	if err := os.Remove(path); err != nil && !os.IsNotExist(err) {
 		return fmt.Errorf("failed to remove file: %w", err)
 	}

@@ -2,6 +2,7 @@ package usage
 
 import (
 	"context"
+	"fmt"
 	"os"
 	"strconv"
 	"strings"
@@ -36,6 +37,14 @@ func (databasePluginAdapter) HandleUsage(ctx context.Context, record coreusage.R
 	plugin.HandleUsage(ctx, record)
 }
 
+func (databasePluginAdapter) DeleteAuthUsage(ctx context.Context, authIndexes []string) error {
+	plugin := GetDatabasePlugin()
+	if plugin == nil {
+		return nil
+	}
+	return plugin.DeleteAuthUsage(ctx, authIndexes)
+}
+
 func init() {
 	coreusage.RegisterPlugin(databasePluginAdapter{})
 }
@@ -49,6 +58,7 @@ type DatabasePlugin struct {
 	// Write buffer
 	buffer    []UsageRecord
 	bufferMu  sync.Mutex
+	flushMu   sync.Mutex
 	flushCh   chan struct{}
 	closeCh   chan struct{}
 	closeOnce sync.Once
@@ -200,6 +210,12 @@ func (p *DatabasePlugin) cleanup(startup bool) {
 
 // flush writes all buffered records to the database.
 func (p *DatabasePlugin) flush() {
+	if p == nil || p.store == nil {
+		return
+	}
+	p.flushMu.Lock()
+	defer p.flushMu.Unlock()
+
 	p.bufferMu.Lock()
 	if len(p.buffer) == 0 {
 		p.bufferMu.Unlock()
@@ -215,6 +231,43 @@ func (p *DatabasePlugin) flush() {
 	} else if skipped > 0 {
 		log.WithFields(log.Fields{"added": added, "skipped": skipped}).Debug("usage: flushed records")
 	}
+}
+
+// DeleteAuthUsage removes persisted and pending usage records for deleted credentials.
+func (p *DatabasePlugin) DeleteAuthUsage(ctx context.Context, authIndexes []string) error {
+	if p == nil {
+		return nil
+	}
+	authIndexes = normalizedAuthIndexes(authIndexes)
+	if len(authIndexes) == 0 {
+		return nil
+	}
+	indexes := make(map[string]struct{}, len(authIndexes))
+	for _, authIndex := range authIndexes {
+		indexes[authIndex] = struct{}{}
+	}
+
+	p.flushMu.Lock()
+	defer p.flushMu.Unlock()
+
+	p.bufferMu.Lock()
+	remaining := p.buffer[:0]
+	for _, record := range p.buffer {
+		if _, ok := indexes[strings.TrimSpace(record.AuthIndex)]; ok {
+			continue
+		}
+		remaining = append(remaining, record)
+	}
+	p.buffer = remaining
+	p.bufferMu.Unlock()
+
+	if p.store == nil {
+		return nil
+	}
+	if _, err := p.store.DeleteAuthUsage(ctx, authIndexes); err != nil {
+		return fmt.Errorf("usage: delete auth usage: %w", err)
+	}
+	return nil
 }
 
 // triggerFlush signals the flush loop to flush immediately if buffer is full.

@@ -9,10 +9,13 @@ import (
 	"os"
 	"path/filepath"
 	"testing"
+	"time"
 
 	"github.com/gin-gonic/gin"
 	"github.com/router-for-me/CLIProxyAPI/v7/internal/config"
+	internalusage "github.com/router-for-me/CLIProxyAPI/v7/internal/usage"
 	coreauth "github.com/router-for-me/CLIProxyAPI/v7/sdk/cliproxy/auth"
+	coreusage "github.com/router-for-me/CLIProxyAPI/v7/sdk/cliproxy/usage"
 )
 
 func TestDeleteAuthFile_UsesAuthPathFromManager(t *testing.T) {
@@ -183,5 +186,81 @@ func TestDeleteAuthFile_RemovesRuntimeAuth(t *testing.T) {
 	}
 	if _, ok := manager.GetByID(record.ID); ok {
 		t.Fatalf("expected runtime auth %q to be removed", record.ID)
+	}
+}
+
+func TestDeleteAuthFile_RemovesUsageForDeletedCredential(t *testing.T) {
+	t.Setenv("MANAGEMENT_PASSWORD", "")
+
+	authDir := t.TempDir()
+	fileName := "usage-remove-user.json"
+	filePath := filepath.Join(authDir, fileName)
+	if errWrite := os.WriteFile(filePath, []byte(`{"type":"codex","email":"usage@example.com"}`), 0o600); errWrite != nil {
+		t.Fatalf("failed to write auth file: %v", errWrite)
+	}
+
+	manager := coreauth.NewManager(nil, nil, nil)
+	record := &coreauth.Auth{
+		ID:       "usage-remove-auth",
+		FileName: fileName,
+		Provider: "codex",
+		Status:   coreauth.StatusActive,
+		Attributes: map[string]string{
+			"path": filePath,
+		},
+		Metadata: map[string]any{
+			"type":  "codex",
+			"email": "usage@example.com",
+		},
+	}
+	if _, errRegister := manager.Register(context.Background(), record); errRegister != nil {
+		t.Fatalf("failed to register auth record: %v", errRegister)
+	}
+
+	stats := internalusage.NewRequestStatistics()
+	oldStatisticsEnabled := internalusage.StatisticsEnabled()
+	internalusage.SetStatisticsEnabled(true)
+	defer internalusage.SetStatisticsEnabled(oldStatisticsEnabled)
+	matchedAuthIndex := record.EnsureIndex()
+	stats.Record(context.Background(), coreusage.Record{
+		APIKey:      "test-key",
+		Model:       "test-model",
+		AuthIndex:   matchedAuthIndex,
+		RequestedAt: time.Date(2026, 7, 23, 12, 0, 0, 0, time.UTC),
+		Detail:      coreusage.Detail{TotalTokens: 10},
+	})
+	stats.Record(context.Background(), coreusage.Record{
+		APIKey:      "test-key",
+		Model:       "test-model",
+		AuthIndex:   "other-auth-index",
+		RequestedAt: time.Date(2026, 7, 23, 13, 0, 0, 0, time.UTC),
+		Detail:      coreusage.Detail{TotalTokens: 20},
+	})
+
+	h := NewHandlerWithoutConfigFilePath(&config.Config{AuthDir: authDir}, manager)
+	h.SetUsageStatistics(stats)
+	h.tokenStore = &memoryAuthStore{}
+
+	deleteRec := httptest.NewRecorder()
+	deleteCtx, _ := gin.CreateTestContext(deleteRec)
+	deleteCtx.Request = httptest.NewRequest(http.MethodDelete, "/v0/management/auth-files?name="+url.QueryEscape(fileName), nil)
+	h.DeleteAuthFile(deleteCtx)
+
+	if deleteRec.Code != http.StatusOK {
+		t.Fatalf("expected delete status %d, got %d with body %s", http.StatusOK, deleteRec.Code, deleteRec.Body.String())
+	}
+	snapshot := stats.Snapshot()
+	if snapshot.TotalRequests != 1 {
+		t.Fatalf("total requests = %d, want 1", snapshot.TotalRequests)
+	}
+	if snapshot.TotalTokens != 20 {
+		t.Fatalf("total tokens = %d, want 20", snapshot.TotalTokens)
+	}
+	if snapshot.RequestsByHour["13"] != 1 || snapshot.TokensByHour["13"] != 20 {
+		t.Fatalf("remaining hourly statistics = requests:%v tokens:%v", snapshot.RequestsByHour, snapshot.TokensByHour)
+	}
+	details := snapshot.APIs["test-key"].Models["test-model"].Details
+	if len(details) != 1 || details[0].AuthIndex != "other-auth-index" {
+		t.Fatalf("remaining usage details = %+v, want only other credential", details)
 	}
 }

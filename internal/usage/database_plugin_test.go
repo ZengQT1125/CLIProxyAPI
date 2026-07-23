@@ -26,6 +26,10 @@ func (s *fakeUsageStore) GetDetails(context.Context, int, int) ([]DetailRecord, 
 	return nil, nil
 }
 
+func (s *fakeUsageStore) DeleteAuthUsage(context.Context, []string) (int64, error) {
+	return 0, nil
+}
+
 func (s *fakeUsageStore) DeleteOldRecords(context.Context, int) (int64, error) {
 	return 0, nil
 }
@@ -121,6 +125,60 @@ func TestDatabasePluginBuffersCacheWriteTokens(t *testing.T) {
 	}
 	if plugin.buffer[0].CacheWriteTokens != 40 {
 		t.Fatalf("cache write tokens = %d, want 40", plugin.buffer[0].CacheWriteTokens)
+	}
+}
+
+func TestDatabasePluginDeleteAuthUsageRemovesPersistedAndPendingRecords(t *testing.T) {
+	ctx := context.Background()
+	authDir := t.TempDir()
+	CloseDatabasePlugin()
+	t.Cleanup(CloseDatabasePlugin)
+	if errInit := InitDatabasePlugin(ctx, "", "", authDir); errInit != nil {
+		t.Fatalf("InitDatabasePlugin failed: %v", errInit)
+	}
+	plugin := GetDatabasePlugin()
+	if plugin == nil {
+		t.Fatal("database plugin is nil")
+	}
+
+	_, _, errImport := plugin.ImportRecords(StatisticsSnapshot{
+		APIs: map[string]APISnapshot{
+			"api-key": {
+				Models: map[string]ModelSnapshot{
+					"model": {
+						Details: []RequestDetail{
+							{AuthIndex: "remove-me", Timestamp: time.Now(), Tokens: TokenStats{TotalTokens: 10}},
+							{AuthIndex: "keep-me", Timestamp: time.Now(), Tokens: TokenStats{TotalTokens: 20}},
+						},
+					},
+				},
+			},
+		},
+	})
+	if errImport != nil {
+		t.Fatalf("ImportRecords failed: %v", errImport)
+	}
+	plugin.HandleUsage(ctx, coreusage.Record{AuthIndex: "remove-me", RequestedAt: time.Now()})
+	plugin.HandleUsage(ctx, coreusage.Record{AuthIndex: "keep-me", RequestedAt: time.Now()})
+
+	if errDelete := plugin.DeleteAuthUsage(ctx, []string{"remove-me"}); errDelete != nil {
+		t.Fatalf("DeleteAuthUsage failed: %v", errDelete)
+	}
+	CloseDatabasePlugin()
+	if errInit := InitDatabasePlugin(ctx, "", "", authDir); errInit != nil {
+		t.Fatalf("reinitialize database plugin: %v", errInit)
+	}
+	details, errDetails := GetDatabasePlugin().GetDetails(ctx, 0, 10)
+	if errDetails != nil {
+		t.Fatalf("get usage details: %v", errDetails)
+	}
+	if len(details) != 2 {
+		t.Fatalf("persisted records count = %d, want 2", len(details))
+	}
+	for _, detail := range details {
+		if detail.AuthIndex != "keep-me" {
+			t.Fatalf("persisted records = %+v, want only keep-me", details)
+		}
 	}
 }
 
