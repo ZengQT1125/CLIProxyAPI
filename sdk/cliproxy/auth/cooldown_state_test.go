@@ -10,8 +10,9 @@ import (
 	"testing"
 	"time"
 
-	cliproxyexecutor "github.com/router-for-me/CLIProxyAPI/v7/sdk/cliproxy/executor"
 	internalconfig "github.com/router-for-me/CLIProxyAPI/v7/internal/config"
+	"github.com/router-for-me/CLIProxyAPI/v7/internal/registry"
+	cliproxyexecutor "github.com/router-for-me/CLIProxyAPI/v7/sdk/cliproxy/executor"
 )
 
 type recordingCooldownStateStore struct {
@@ -304,14 +305,23 @@ func TestFileCooldownStateStore_ConcurrentApply(t *testing.T) {
 }
 
 func TestManager_MarkResult_PersistsCooldownOnlyWhenStateChanges(t *testing.T) {
+	const failedModel = "claude-opus-4-6-thinking"
+
 	store := &recordingCooldownStateStore{}
 	manager := NewManager(nil, nil, nil)
 	manager.SetCooldownStateStore(store)
 
-	auth := &Auth{ID: "auth-1", Provider: "xai", Status: StatusActive}
+	auth := &Auth{ID: "auth-1", Provider: "antigravity", Status: StatusActive}
 	if _, errRegister := manager.Register(WithSkipPersist(context.Background()), auth); errRegister != nil {
 		t.Fatalf("Register() returned error: %v", errRegister)
 	}
+	registry.GetGlobalRegistry().RegisterClient(auth.ID, auth.Provider, []*registry.ModelInfo{
+		{ID: failedModel},
+		{ID: "gemini-3.6-flash-high"},
+	})
+	t.Cleanup(func() {
+		registry.GetGlobalRegistry().UnregisterClient(auth.ID)
+	})
 	if _, errRegister := manager.Register(WithSkipPersist(context.Background()), &Auth{ID: "auth-2", Provider: "xai", Status: StatusActive}); errRegister != nil {
 		t.Fatalf("Register(auth-2) returned error: %v", errRegister)
 	}
@@ -327,7 +337,7 @@ func TestManager_MarkResult_PersistsCooldownOnlyWhenStateChanges(t *testing.T) {
 	}
 	store.resetRecording()
 
-	manager.MarkResult(context.Background(), Result{AuthID: auth.ID, Provider: "xai", Model: "grok-4", Success: true})
+	manager.MarkResult(context.Background(), Result{AuthID: auth.ID, Provider: auth.Provider, Model: failedModel, Success: true})
 	if errFlush := manager.FlushCooldownStates(context.Background()); errFlush != nil {
 		t.Fatalf("FlushCooldownStates() returned error: %v", errFlush)
 	}
@@ -337,8 +347,8 @@ func TestManager_MarkResult_PersistsCooldownOnlyWhenStateChanges(t *testing.T) {
 
 	manager.MarkResult(context.Background(), Result{
 		AuthID:   auth.ID,
-		Provider: "xai",
-		Model:    "grok-4",
+		Provider: auth.Provider,
+		Model:    failedModel,
 		Success:  false,
 		Error:    &Error{Message: "upstream unavailable", HTTPStatus: 500},
 	})
@@ -348,12 +358,23 @@ func TestManager_MarkResult_PersistsCooldownOnlyWhenStateChanges(t *testing.T) {
 	if got := store.applyCount.Load(); got != 1 {
 		t.Fatalf("cooldown failure saved cooldown state %d times, want 1", got)
 	}
+	updated, ok := manager.GetByID(auth.ID)
+	if !ok {
+		t.Fatalf("auth %q missing after model failure", auth.ID)
+	}
+	if updated.Unavailable || updated.Status != StatusActive || updated.Quota.Exceeded {
+		t.Fatalf("auth state = status %q unavailable %t quota %+v, want healthy credential with model-scoped failure", updated.Status, updated.Unavailable, updated.Quota)
+	}
 	batches := store.recordedBatches()
-	if len(batches) != 1 || len(batches[0]) != 1 || batches[0][0].AuthID != auth.ID || len(batches[0][0].Records) == 0 {
+	if len(batches) != 1 || len(batches[0]) != 1 || batches[0][0].AuthID != auth.ID {
 		t.Fatalf("cooldown failure batches = %+v, want one auth-1 snapshot", batches)
 	}
+	records := batches[0][0].Records
+	if len(records) != 1 || records[0].Model != failedModel {
+		t.Fatalf("cooldown failure records = %+v, want only model %s", records, failedModel)
+	}
 
-	manager.MarkResult(context.Background(), Result{AuthID: auth.ID, Provider: "xai", Model: "grok-4", Success: true})
+	manager.MarkResult(context.Background(), Result{AuthID: auth.ID, Provider: auth.Provider, Model: failedModel, Success: true})
 	if errFlush := manager.FlushCooldownStates(context.Background()); errFlush != nil {
 		t.Fatalf("FlushCooldownStates() returned error: %v", errFlush)
 	}
@@ -365,7 +386,7 @@ func TestManager_MarkResult_PersistsCooldownOnlyWhenStateChanges(t *testing.T) {
 		t.Fatalf("cooldown clear batches = %+v, want empty auth-1 snapshot", batches)
 	}
 
-	manager.MarkResult(context.Background(), Result{AuthID: auth.ID, Provider: "xai", Model: "grok-4", Success: true})
+	manager.MarkResult(context.Background(), Result{AuthID: auth.ID, Provider: auth.Provider, Model: failedModel, Success: true})
 	if errFlush := manager.FlushCooldownStates(context.Background()); errFlush != nil {
 		t.Fatalf("FlushCooldownStates() returned error: %v", errFlush)
 	}
@@ -877,6 +898,31 @@ func TestManager_RestoreCooldownStatesAppliesAuthLevelAfterModels(t *testing.T) 
 	}
 	if state := auth.ModelStates["grok-4"]; state == nil || !state.NextRetryAfter.Equal(modelRetry) {
 		t.Fatalf("model-level cooldown = %+v, want retry %v", state, modelRetry)
+	}
+
+	registry.GetGlobalRegistry().RegisterClient(auth.ID, "xai", []*registry.ModelInfo{
+		{ID: "grok-4"},
+		{ID: "gemini-3.6-flash-high"},
+	})
+	t.Cleanup(func() {
+		registry.GetGlobalRegistry().UnregisterClient(auth.ID)
+	})
+	store.resetRecording()
+	manager.ReconcileRegistryModelStates(context.Background(), auth.ID)
+	if errFlush := manager.FlushCooldownStates(context.Background()); errFlush != nil {
+		t.Fatalf("FlushCooldownStates() error = %v", errFlush)
+	}
+
+	auth, ok = manager.GetByID("auth-1")
+	if !ok {
+		t.Fatal("reconciled auth was not found")
+	}
+	if auth.Unavailable || auth.Status != StatusActive || !auth.NextRetryAfter.IsZero() {
+		t.Fatalf("reconciled auth = status %q unavailable %t retry %v, want healthy credential", auth.Status, auth.Unavailable, auth.NextRetryAfter)
+	}
+	batches := store.recordedBatches()
+	if len(batches) != 1 || len(batches[0]) != 1 || len(batches[0][0].Records) != 1 || batches[0][0].Records[0].Model != "grok-4" {
+		t.Fatalf("reconciled cooldown batches = %+v, want only grok-4 model cooldown", batches)
 	}
 }
 

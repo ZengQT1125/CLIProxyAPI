@@ -231,22 +231,22 @@ func (NoopHook) OnResult(context.Context, Result) {}
 
 // Manager orchestrates auth lifecycle, selection, execution, and persistence.
 type Manager struct {
-	store                      Store
-	cooldownStore              CooldownStateStore
-	cooldownStoreVersion       uint64
-	cooldownRestoreVersion     uint64
-	pendingCooldownRestore     map[string][]CooldownStateRecord
-	cooldownRestoreIDs         map[string]struct{}
-	pendingCooldownStateStore  CooldownStateStore
-	cooldownPersister          *cooldownStatePersister
-	executors                  map[string]ProviderExecutor
-	selector                   Selector
-	hook                       Hook
-	mu                         sync.RWMutex
-	configCooldownMu           sync.Mutex
-	cooldownRestoreMu          sync.Mutex
-	auths                      map[string]*Auth
-	scheduler                  *authScheduler
+	store                     Store
+	cooldownStore             CooldownStateStore
+	cooldownStoreVersion      uint64
+	cooldownRestoreVersion    uint64
+	pendingCooldownRestore    map[string][]CooldownStateRecord
+	cooldownRestoreIDs        map[string]struct{}
+	pendingCooldownStateStore CooldownStateStore
+	cooldownPersister         *cooldownStatePersister
+	executors                 map[string]ProviderExecutor
+	selector                  Selector
+	hook                      Hook
+	mu                        sync.RWMutex
+	configCooldownMu          sync.Mutex
+	cooldownRestoreMu         sync.Mutex
+	auths                     map[string]*Auth
+	scheduler                 *authScheduler
 	// pluginScheduler runs outside m.mu before falling back to native selection.
 	pluginScheduler PluginScheduler
 	// homeRuntimeAuths retains legacy session auth lookups for non-execution callers.
@@ -509,10 +509,22 @@ func (m *Manager) ReconcileRegistryModelStates(ctx context.Context, authID strin
 
 	var snapshot *Auth
 	now := time.Now()
+	cooldownStateChanged := false
 
 	m.mu.Lock()
 	auth, ok := m.auths[authID]
 	if ok && auth != nil && len(auth.ModelStates) > 0 {
+		trackCooldownState := m.cooldownStore != nil
+		var cooldownRecordsBefore []CooldownStateRecord
+		if trackCooldownState {
+			cooldownRecordsBefore = m.cooldownStateRecordsForAuthLocked(auth, now)
+		}
+		statusBefore := auth.Status
+		statusMessageBefore := auth.StatusMessage
+		unavailableBefore := auth.Unavailable
+		nextRetryBefore := auth.NextRetryAfter
+		quotaBefore := auth.Quota
+		lastErrorBefore := cloneError(auth.LastError)
 		changed := false
 		for modelKey, state := range auth.ModelStates {
 			baseModel := canonicalModelKey(modelKey)
@@ -542,8 +554,16 @@ func (m *Manager) ReconcileRegistryModelStates(ctx context.Context, authID strin
 		if len(auth.ModelStates) == 0 {
 			auth.ModelStates = nil
 		}
+		updateAggregatedAvailability(auth, now)
+		if auth.Status != statusBefore ||
+			auth.StatusMessage != statusMessageBefore ||
+			auth.Unavailable != unavailableBefore ||
+			!auth.NextRetryAfter.Equal(nextRetryBefore) ||
+			!cooldownQuotaEqual(auth.Quota, quotaBefore) ||
+			!cooldownErrorEqual(auth.LastError, lastErrorBefore) {
+			changed = true
+		}
 		if changed {
-			updateAggregatedAvailability(auth, now)
 			if !hasModelError(auth, now) {
 				auth.LastError = nil
 				auth.StatusMessage = ""
@@ -554,12 +574,19 @@ func (m *Manager) ReconcileRegistryModelStates(ctx context.Context, authID strin
 				logEntryWithRequestID(ctx).WithField("auth_id", auth.ID).Warnf("failed to persist auth changes during model state reconciliation: %v", errPersist)
 			}
 			snapshot = auth.Clone()
+			if trackCooldownState {
+				cooldownRecordsAfter := m.cooldownStateRecordsForAuthLocked(auth, now)
+				cooldownStateChanged = !cooldownStateRecordsEqual(cooldownRecordsBefore, cooldownRecordsAfter)
+			}
 		}
 	}
 	m.mu.Unlock()
 
 	if m.scheduler != nil && snapshot != nil {
 		m.scheduler.upsertAuth(snapshot)
+	}
+	if snapshot != nil && cooldownStateChanged {
+		m.queueCooldownStatePersist(authID)
 	}
 }
 
@@ -4986,17 +5013,56 @@ func updateAggregatedAvailability(auth *Auth, now time.Time) {
 		clearAggregatedAvailability(auth)
 		return
 	}
+
+	statesByModel := make(map[string]*ModelState, len(auth.ModelStates))
+	for model, state := range auth.ModelStates {
+		modelKey := canonicalModelKey(model)
+		if modelKey == "" {
+			modelKey = strings.TrimSpace(model)
+		}
+		if modelKey != "" {
+			statesByModel[modelKey] = state
+		}
+	}
+
+	states := make([]*ModelState, 0, len(statesByModel))
+	supportedModels := registry.GetGlobalRegistry().GetModelsForClient(auth.ID)
+	seenModels := make(map[string]struct{}, len(supportedModels))
+	// Aggregate across the credential's complete model set. A supported model
+	// without runtime state is healthy and keeps the credential available.
+	for _, model := range supportedModels {
+		if model == nil {
+			continue
+		}
+		modelKey := canonicalModelKey(model.ID)
+		if modelKey == "" {
+			continue
+		}
+		if _, seen := seenModels[modelKey]; seen {
+			continue
+		}
+		seenModels[modelKey] = struct{}{}
+		states = append(states, statesByModel[modelKey])
+	}
+	if len(states) == 0 {
+		for _, state := range auth.ModelStates {
+			states = append(states, state)
+		}
+	}
+
 	allUnavailable := true
 	earliestRetry := time.Time{}
 	quotaExceeded := false
 	quotaRecover := time.Time{}
 	maxBackoffLevel := 0
 	hasState := false
-	for _, state := range auth.ModelStates {
+	var latestUnavailableState *ModelState
+	for _, state := range states {
+		hasState = true
 		if state == nil {
+			allUnavailable = false
 			continue
 		}
-		hasState = true
 		stateUnavailable := false
 		if state.Status == StatusDisabled {
 			stateUnavailable = true
@@ -5015,6 +5081,8 @@ func updateAggregatedAvailability(auth *Auth, now time.Time) {
 		}
 		if !stateUnavailable {
 			allUnavailable = false
+		} else if latestUnavailableState == nil || state.UpdatedAt.After(latestUnavailableState.UpdatedAt) {
+			latestUnavailableState = state
 		}
 		if state.Quota.Exceeded {
 			quotaExceeded = true
@@ -5033,10 +5101,22 @@ func updateAggregatedAvailability(auth *Auth, now time.Time) {
 	auth.Unavailable = allUnavailable
 	if allUnavailable {
 		auth.NextRetryAfter = earliestRetry
+		if !auth.Disabled && auth.Status != StatusDisabled {
+			auth.Status = StatusError
+			if latestUnavailableState != nil {
+				auth.StatusMessage = latestUnavailableState.StatusMessage
+				auth.LastError = cloneError(latestUnavailableState.LastError)
+			}
+		}
 	} else {
 		auth.NextRetryAfter = time.Time{}
+		if !auth.Disabled && auth.Status != StatusDisabled {
+			auth.Status = StatusActive
+			auth.StatusMessage = ""
+			auth.LastError = nil
+		}
 	}
-	if quotaExceeded {
+	if allUnavailable && quotaExceeded {
 		auth.Quota.Exceeded = true
 		auth.Quota.Reason = "quota"
 		auth.Quota.NextRecoverAt = quotaRecover

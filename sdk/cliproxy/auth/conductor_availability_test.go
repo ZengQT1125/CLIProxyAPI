@@ -14,7 +14,7 @@ func TestUpdateAggregatedAvailability_UnavailableWithoutNextRetryDoesNotBlockAut
 	now := time.Now()
 	model := "test-model"
 	auth := &Auth{
-		ID: "a",
+		ID: t.Name(),
 		ModelStates: map[string]*ModelState{
 			model: {
 				Status:      StatusError,
@@ -40,7 +40,7 @@ func TestUpdateAggregatedAvailability_FutureNextRetryBlocksAuth(t *testing.T) {
 	model := "test-model"
 	next := now.Add(5 * time.Minute)
 	auth := &Auth{
-		ID: "a",
+		ID: t.Name(),
 		ModelStates: map[string]*ModelState{
 			model: {
 				Status:         StatusError,
