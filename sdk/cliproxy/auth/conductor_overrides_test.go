@@ -67,6 +67,21 @@ func TestManager_ShouldRetryAfterError_RespectsAuthRequestRetryOverride(t *testi
 	}
 }
 
+func TestManager_ShouldRetryAfterError_SkipsWrappedHomeConcurrencyBusy(t *testing.T) {
+	m := NewManager(nil, nil, nil)
+	m.SetRetryConfig(1, 30*time.Second, 0)
+	if _, errRegister := m.Register(context.Background(), &Auth{ID: "retry-auth", Provider: "codex"}); errRegister != nil {
+		t.Fatalf("register auth: %v", errRegister)
+	}
+
+	_, _, maxWait := m.retrySettings()
+	errBusy := fmt.Errorf("outer retry: %w", NewHomeConcurrencyBusyError("busy", 20*time.Second))
+	wait, shouldRetry := m.shouldRetryAfterError(errBusy, 0, []string{"codex"}, "gpt", maxWait)
+	if shouldRetry || wait != 0 {
+		t.Fatalf("wrapped Home busy retry = (%v, %t), want (0, false)", wait, shouldRetry)
+	}
+}
+
 func TestManager_ShouldRetryAfterError_UsesOAuthModelAliasForCooldown(t *testing.T) {
 	m := NewManager(nil, nil, nil)
 	m.SetRetryConfig(3, 30*time.Second, 0)
@@ -478,7 +493,7 @@ func TestManager_WrapStreamResult_PreservesRetryAfterOnChunkError(t *testing.T) 
 	close(remaining)
 
 	before := time.Now()
-	result := m.wrapStreamResult(context.Background(), auth, "codex", model, nil, nil, remaining, OAuthModelAliasResult{})
+	result := m.wrapStreamResult(context.Background(), auth, "codex", model, nil, nil, remaining, OAuthModelAliasResult{}, false)
 	for range result.Chunks {
 	}
 

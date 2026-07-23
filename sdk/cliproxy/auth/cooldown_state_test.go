@@ -11,6 +11,7 @@ import (
 	"time"
 
 	cliproxyexecutor "github.com/router-for-me/CLIProxyAPI/v7/sdk/cliproxy/executor"
+	internalconfig "github.com/router-for-me/CLIProxyAPI/v7/internal/config"
 )
 
 type recordingCooldownStateStore struct {
@@ -477,6 +478,173 @@ func TestManager_FlushCooldownStates_PersistsChangeDuringApply(t *testing.T) {
 	lastBatch := batches[len(batches)-1]
 	if len(lastBatch) != 1 || lastBatch[0].AuthID != "auth-1" || len(lastBatch[0].Records) != 0 {
 		t.Fatalf("last batch = %+v, want empty auth-1 snapshot", lastBatch)
+	}
+}
+
+func TestManagerSetConfigSnapshotDefersCooldownPersistence(t *testing.T) {
+	store := &recordingCooldownStateStore{}
+	manager := NewManager(nil, nil, nil)
+	manager.SetCooldownStateStore(store)
+	auth := &Auth{ID: "auth-1", Provider: "xai", Status: StatusActive}
+	if _, errRegister := manager.Register(WithSkipPersist(context.Background()), auth); errRegister != nil {
+		t.Fatalf("Register() returned error: %v", errRegister)
+	}
+	manager.MarkResult(context.Background(), Result{
+		AuthID:   auth.ID,
+		Provider: auth.Provider,
+		Model:    "grok-4",
+		Success:  false,
+		Error:    &Error{Message: "rate limited", HTTPStatus: 429},
+	})
+	store.applyCount.Store(0)
+
+	if changed := manager.SetConfigSnapshot(&internalconfig.Config{DisableCooling: true}); !changed {
+		t.Fatal("SetConfigSnapshot() = false, want cleared cooldown state")
+	}
+	if got := store.applyCount.Load(); got != 0 {
+		t.Fatalf("SetConfigSnapshot() persisted cooldown state %d times, want 0", got)
+	}
+	manager.PersistCooldownStates(context.Background())
+	if got := store.applyCount.Load(); got != 1 {
+		t.Fatalf("PersistCooldownStates() saved cooldown state %d times, want 1", got)
+	}
+}
+
+func TestManagerSwapCooldownStateStorePersistsOldStoreBeforeSwap(t *testing.T) {
+	oldStore := &recordingCooldownStateStore{}
+	newStore := &recordingCooldownStateStore{}
+	manager := NewManager(nil, nil, nil)
+	manager.SetCooldownStateStore(oldStore)
+	auth := &Auth{ID: "auth-1", Provider: "xai", Status: StatusActive}
+	if _, errRegister := manager.Register(WithSkipPersist(context.Background()), auth); errRegister != nil {
+		t.Fatalf("Register() returned error: %v", errRegister)
+	}
+	manager.MarkResult(context.Background(), Result{
+		AuthID: auth.ID, Provider: auth.Provider, Model: "grok-4", Success: false,
+		Error: &Error{Message: "rate limited", HTTPStatus: 429},
+	})
+	oldStore.applyCount.Store(0)
+	if changed := manager.SetConfigSnapshot(&internalconfig.Config{DisableCooling: true}); !changed {
+		t.Fatal("SetConfigSnapshot() = false, want cleared cooldown state")
+	}
+
+	if swapped := manager.SwapCooldownStateStore(context.Background(), newStore, true); !swapped {
+		t.Fatal("SwapCooldownStateStore() = false, want true")
+	}
+	if got := oldStore.applyCount.Load(); got != 1 {
+		t.Fatalf("old store save count = %d, want 1", got)
+	}
+	if len(oldStore.snapshots) != 0 {
+		t.Fatalf("old store snapshots = %+v, want cleared cooldown state", oldStore.snapshots)
+	}
+	manager.mu.RLock()
+	currentStore := manager.cooldownStore
+	manager.mu.RUnlock()
+	if currentStore != newStore {
+		t.Fatal("cooldown store swapped before the old store was persisted")
+	}
+}
+
+func TestManagerApplyConfigWithCooldownStoreSerializesTransitions(t *testing.T) {
+	oldStore := &blockingCooldownStateStore{started: make(chan struct{}), release: make(chan struct{})}
+	firstStore := &recordingCooldownStateStore{}
+	secondStore := &recordingCooldownStateStore{}
+	manager := NewManager(nil, nil, nil)
+	auth := &Auth{ID: "auth-1", Provider: "xai", Status: StatusActive}
+	if _, errRegister := manager.Register(WithSkipPersist(context.Background()), auth); errRegister != nil {
+		t.Fatalf("Register() returned error: %v", errRegister)
+	}
+	manager.MarkResult(context.Background(), Result{
+		AuthID: auth.ID, Provider: auth.Provider, Model: "grok-4", Success: false,
+		Error: &Error{Message: "rate limited", HTTPStatus: 429},
+	})
+	manager.SetCooldownStateStore(oldStore)
+
+	firstDone := make(chan bool, 1)
+	go func() {
+		firstDone <- manager.ApplyConfigWithCooldownStateStore(context.Background(), &internalconfig.Config{DisableCooling: true}, firstStore)
+	}()
+	select {
+	case <-oldStore.started:
+	case <-time.After(time.Second):
+		t.Fatal("first old-store persistence did not start")
+	}
+
+	secondDone := make(chan bool, 1)
+	go func() {
+		secondDone <- manager.ApplyConfigWithCooldownStateStore(context.Background(), &internalconfig.Config{}, secondStore)
+	}()
+	select {
+	case <-secondDone:
+		t.Fatal("concurrent config transition completed while old-store persistence was blocked")
+	case <-time.After(100 * time.Millisecond):
+	}
+
+	close(oldStore.release)
+	if applied := waitForCooldownTransition(t, firstDone, "first config transition"); !applied {
+		t.Fatal("first config transition returned false")
+	}
+	if applied := waitForCooldownTransition(t, secondDone, "second config transition"); !applied {
+		t.Fatal("second config transition returned false")
+	}
+	manager.mu.RLock()
+	currentStore := manager.cooldownStore
+	manager.mu.RUnlock()
+	if currentStore != secondStore {
+		t.Fatal("concurrent config transitions did not leave the final resolved store installed")
+	}
+}
+
+func waitForCooldownTransition(t *testing.T, done <-chan bool, name string) bool {
+	t.Helper()
+	select {
+	case applied := <-done:
+		return applied
+	case <-time.After(time.Second):
+		t.Fatalf("timed out waiting for %s", name)
+		return false
+	}
+}
+
+func TestManagerSwapCooldownStateStoreKeepsOldStoreWhenCanceled(t *testing.T) {
+	oldStore := &blockingCooldownStateStore{started: make(chan struct{}), release: make(chan struct{})}
+	newStore := &recordingCooldownStateStore{}
+	manager := NewManager(nil, nil, nil)
+	manager.SetCooldownStateStore(oldStore)
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	done := make(chan bool, 1)
+	go func() { done <- manager.SwapCooldownStateStore(ctx, newStore, true) }()
+	select {
+	case <-oldStore.started:
+	case <-time.After(time.Second):
+		t.Fatal("old cooldown store persistence did not start")
+	}
+	manager.mu.RLock()
+	currentStore := manager.cooldownStore
+	manager.mu.RUnlock()
+	if currentStore != oldStore {
+		t.Fatal("cooldown store swapped while old store persistence was blocked")
+	}
+	cancel()
+	select {
+	case swapped := <-done:
+		if swapped {
+			t.Fatal("SwapCooldownStateStore() = true after cancellation")
+		}
+	case <-time.After(time.Second):
+		t.Fatal("SwapCooldownStateStore() did not honor cancellation")
+	}
+
+	close(oldStore.release)
+	if swapped := manager.SwapCooldownStateStore(context.Background(), newStore, false); !swapped {
+		t.Fatal("SwapCooldownStateStore() = false, want retry to persist the old store before swapping")
+	}
+	manager.mu.RLock()
+	currentStore = manager.cooldownStore
+	manager.mu.RUnlock()
+	if currentStore != newStore {
+		t.Fatal("cooldown store was not swapped after pending persistence completed")
 	}
 }
 
@@ -1133,5 +1301,47 @@ func TestManager_PickNextMixedWithoutExecutorYieldsAuthNotFound(t *testing.T) {
 	}
 	if picked == nil || picked.ID != authID || provider != "xai" {
 		t.Fatalf("picked=%+v provider=%q, want auth %s provider xai", picked, provider, authID)
+	}
+}
+
+func TestManagerResultSaveWaitsForCooldownStoreTransition(t *testing.T) {
+	// Fork uses an async cooldown persister with storeVersion guards.
+	// MarkResult does NOT block on store transitions — instead, the
+	// persister discards entries whose storeVersion is stale.
+	// This test verifies that after a swap, the new store receives
+	// the persisted state.
+	oldStore := &recordingCooldownStateStore{}
+	newStore := &recordingCooldownStateStore{}
+	manager := NewManager(nil, nil, nil)
+	auth := &Auth{ID: "auth-1", Provider: "xai", Status: StatusActive}
+	if _, errRegister := manager.Register(WithSkipPersist(context.Background()), auth); errRegister != nil {
+		t.Fatalf("Register() returned error: %v", errRegister)
+	}
+	manager.SetCooldownStateStore(oldStore)
+
+	manager.MarkResult(context.Background(), Result{
+		AuthID: auth.ID, Provider: auth.Provider, Model: "grok-4", Success: false,
+		Error: &Error{Message: "rate limited", HTTPStatus: 429},
+	})
+	if errFlush := manager.FlushCooldownStates(context.Background()); errFlush != nil {
+		t.Fatalf("FlushCooldownStates() returned error: %v", errFlush)
+	}
+	if got := oldStore.applyCount.Load(); got < 1 {
+		t.Fatalf("old store apply count = %d, want >= 1", got)
+	}
+
+	if swapped := manager.SwapCooldownStateStore(context.Background(), newStore, true); !swapped {
+		t.Fatal("SwapCooldownStateStore() = false")
+	}
+
+	manager.MarkResult(context.Background(), Result{
+		AuthID: auth.ID, Provider: auth.Provider, Model: "grok-4", Success: false,
+		Error: &Error{Message: "rate limited again", HTTPStatus: 429},
+	})
+	if errFlush := manager.FlushCooldownStates(context.Background()); errFlush != nil {
+		t.Fatalf("FlushCooldownStates() returned error: %v", errFlush)
+	}
+	if got := newStore.applyCount.Load(); got < 1 {
+		t.Fatalf("new store apply count = %d, want >= 1", got)
 	}
 }

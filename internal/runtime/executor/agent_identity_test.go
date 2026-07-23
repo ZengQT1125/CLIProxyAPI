@@ -267,7 +267,7 @@ func TestDialCodexWebsocketMintsFreshAssertionPerDial(t *testing.T) {
 	}
 
 	// First dial
-	conn1, _, err := executor.dialCodexWebsocket(context.Background(), auth, wsURL, baseHeaders)
+	conn1, _, _, err := executor.dialCodexWebsocket(context.Background(), auth, wsURL, baseHeaders)
 	if err != nil {
 		t.Fatalf("first dial error = %v", err)
 	}
@@ -276,7 +276,7 @@ func TestDialCodexWebsocketMintsFreshAssertionPerDial(t *testing.T) {
 	// Simulate queue delay and rotated task metadata before reconnect dial.
 	time.Sleep(1100 * time.Millisecond)
 	auth.Metadata["task_id"] = "task-rotated"
-	conn2, _, err := executor.dialCodexWebsocket(context.Background(), auth, wsURL, baseHeaders)
+	conn2, _, _, err := executor.dialCodexWebsocket(context.Background(), auth, wsURL, baseHeaders)
 	if err != nil {
 		t.Fatalf("second dial error = %v", err)
 	}
