@@ -1,11 +1,14 @@
 package auth
 
-import "strings"
+import (
+	"path/filepath"
+	"strings"
+)
 
 const (
-	AuthKindAPIKey         = "apikey"
-	AuthKindOAuth          = "oauth"
-	AuthKindAgentIdentity  = "agent_identity"
+	AuthKindAPIKey        = "apikey"
+	AuthKindOAuth         = "oauth"
+	AuthKindAgentIdentity = "agent_identity"
 
 	AuthSourceConfig      = "config"
 	AuthSourceFile        = "file"
@@ -79,6 +82,24 @@ func (a *Auth) AuthSourceKind() string {
 	return ""
 }
 
+// CredentialFileName returns the stable basename of the backing credential file.
+func (a *Auth) CredentialFileName() string {
+	if a == nil {
+		return ""
+	}
+	for _, raw := range []string{a.FileName, authAttribute(a, AttributePath)} {
+		raw = strings.TrimSpace(raw)
+		if raw == "" {
+			continue
+		}
+		name := filepath.Base(raw)
+		if name != "." && name != string(filepath.Separator) {
+			return name
+		}
+	}
+	return ""
+}
+
 func normalizeAuthKind(kind string) string {
 	switch strings.ToLower(strings.TrimSpace(kind)) {
 	case AuthKindAPIKey, "api_key", "api-key":
@@ -110,7 +131,6 @@ func normalizeAuthSourceKind(source string) string {
 		return ""
 	}
 }
-
 
 // IsAgentIdentityAuth reports whether the auth carries Codex Agent Identity material.
 // Detection prefers explicit auth_kind/type, then required signing fields.

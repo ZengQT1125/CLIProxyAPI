@@ -529,15 +529,15 @@ func TestGetMonitorKeyStats_RemapsDriftedAuthIndexViaSource(t *testing.T) {
 
 	now := time.Now()
 
-	email := "crappie.blocker@example.com"
+	fileName := "codex-crappie.blocker@example.com-plus.json"
 	currentIndex := "current-basename-index"
 	historicalIndex := "old-absolute-path-index"
 
 	// Historical usage rows written under a different auth_index seed.
 	// Keep them inside the rolling 200-minute window.
-	histOK := testUsageRecord(now.Add(-30*time.Minute), "api-1", "model-a", email, false)
+	histOK := testUsageRecord(now.Add(-30*time.Minute), "api-1", "model-a", fileName, false)
 	histOK.AuthIndex = historicalIndex
-	histFail := testUsageRecord(now.Add(-time.Second), "api-1", "model-a", email, true)
+	histFail := testUsageRecord(now.Add(-time.Second), "api-1", "model-a", fileName, true)
 	histFail.AuthIndex = historicalIndex
 	other := testUsageRecord(now.Add(-2*time.Second), "api-2", "model-b", "other@example.com", false)
 	other.AuthIndex = "other-index"
@@ -547,13 +547,7 @@ func TestGetMonitorKeyStats_RemapsDriftedAuthIndexViaSource(t *testing.T) {
 		ID:       "codex-file",
 		Provider: "codex",
 		Index:    currentIndex,
-		Metadata: map[string]any{
-			"type":  "codex",
-			"email": email,
-		},
-		Attributes: map[string]string{
-			"path": "/Users/example/auths/codex-" + email + "-plus.json",
-		},
+		FileName: fileName,
 	}
 	if _, err := manager.Register(context.Background(), auth); err != nil {
 		t.Fatalf("register auth: %v", err)
@@ -588,11 +582,65 @@ func TestGetMonitorKeyStats_RemapsDriftedAuthIndexViaSource(t *testing.T) {
 	if _, exists := resp.ByAuthIndex[historicalIndex]; exists {
 		t.Fatalf("historical auth_index should be remapped away: %#v", resp.ByAuthIndex)
 	}
-	if got := resp.BySource[email]; got.Success != 1 || got.Failure != 1 {
+	if got := resp.BySource[fileName]; got.Success != 1 || got.Failure != 1 {
 		t.Fatalf("unexpected source stats: %+v", got)
 	}
 	if _, exists := resp.ByAuthIndex["other-index"]; exists {
 		t.Fatalf("unrelated auth should be filtered out: %#v", resp.ByAuthIndex)
+	}
+}
+
+func TestGetMonitorKeyStats_DoesNotRemapSharedEmailAcrossAuthFiles(t *testing.T) {
+	gin.SetMode(gin.TestMode)
+
+	now := time.Now()
+	email := "shared@example.com"
+	antigravityIndex := "antigravity-index"
+	codexIndex := "codex-index"
+
+	antigravityRecord := testUsageRecord(now.Add(-time.Minute), "api-1", "model-a", email, false)
+	antigravityRecord.AuthIndex = antigravityIndex
+
+	manager := coreauth.NewManager(nil, nil, nil)
+	for _, auth := range []*coreauth.Auth{
+		{
+			ID:       "antigravity-file",
+			Provider: "antigravity",
+			Index:    antigravityIndex,
+			FileName: "antigravity-" + email + ".json",
+			Metadata: map[string]any{"type": "antigravity", "email": email},
+		},
+		{
+			ID:       "codex-file",
+			Provider: "codex",
+			Index:    codexIndex,
+			FileName: "codex-" + email + "-free.json",
+			Metadata: map[string]any{"type": "codex", "email": email},
+		},
+	} {
+		if _, err := manager.Register(context.Background(), auth); err != nil {
+			t.Fatalf("register auth: %v", err)
+		}
+	}
+
+	h := newMonitorTestHandler(antigravityRecord)
+	h.authManager = manager
+	rr := executeMonitorRequest(h.GetMonitorKeyStats, "/monitor/key-stats?auth_index="+codexIndex)
+	if rr.Code != http.StatusOK {
+		t.Fatalf("unexpected status: %d, body=%s", rr.Code, rr.Body.String())
+	}
+
+	var resp struct {
+		ByAuthIndex map[string]struct {
+			Success int64 `json:"success"`
+			Failure int64 `json:"failure"`
+		} `json:"by_auth_index"`
+	}
+	if err := json.Unmarshal(rr.Body.Bytes(), &resp); err != nil {
+		t.Fatalf("decode response failed: %v", err)
+	}
+	if _, exists := resp.ByAuthIndex[codexIndex]; exists {
+		t.Fatalf("shared email stats were incorrectly attributed to codex: %#v", resp.ByAuthIndex)
 	}
 }
 

@@ -8,6 +8,7 @@ import (
 	"testing"
 	"time"
 
+	cliproxyauth "github.com/router-for-me/CLIProxyAPI/v7/sdk/cliproxy/auth"
 	"github.com/router-for-me/CLIProxyAPI/v7/sdk/cliproxy/usage"
 )
 
@@ -389,6 +390,22 @@ func TestUsageReporterBuildRecordIncludesLatency(t *testing.T) {
 	}
 	if record.Latency > 3*time.Second {
 		t.Fatalf("latency = %v, want <= 3s", record.Latency)
+	}
+}
+
+func TestNewUsageReporterUsesFileNameAsSourceForFileAuth(t *testing.T) {
+	auth := &cliproxyauth.Auth{
+		Provider: "codex",
+		FileName: "/var/lib/cli-proxy/auths/codex-user@example.com-free.json",
+		Metadata: map[string]any{
+			"email": "user@example.com",
+		},
+	}
+
+	reporter := NewUsageReporter(context.Background(), "codex", "gpt-5.4", auth)
+	record := reporter.buildRecord(usage.Detail{TotalTokens: 3}, false)
+	if record.Source != "codex-user@example.com-free.json" {
+		t.Fatalf("record source = %q, want credential file name", record.Source)
 	}
 }
 

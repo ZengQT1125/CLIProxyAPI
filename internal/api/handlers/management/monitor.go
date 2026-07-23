@@ -3,7 +3,6 @@ package management
 import (
 	"math"
 	"net/http"
-	"path/filepath"
 	"sort"
 	"strconv"
 	"strings"
@@ -2679,7 +2678,7 @@ func (h *Handler) GetMonitorServiceHealth(c *gin.Context) {
 //
 // Historical usage rows may carry drifted auth_index values when file-based OAuth
 // seeds previously embedded absolute paths. When filtering by auth_index, also
-// match via source aliases (email/filename) from the live auth manager and remap
+// match via the credential filename from the live auth manager and remap
 // aggregates onto the requested indexes.
 func (h *Handler) GetMonitorKeyStats(c *gin.Context) {
 	const (
@@ -2877,62 +2876,15 @@ buildKeyStatsResponse:
 	c.JSON(http.StatusOK, response)
 }
 
-// keyStatsSourceCandidates returns usage-record Source values that may identify
-// the same credential as the live auth entry (email, project, api key, filename).
+// keyStatsSourceCandidates returns the stable source name for a file-backed credential.
 func keyStatsSourceCandidates(auth *coreauth.Auth) []string {
 	if auth == nil {
 		return nil
 	}
-	seen := make(map[string]struct{}, 8)
-	out := make([]string, 0, 8)
-	add := func(raw string) {
-		value := strings.TrimSpace(raw)
-		if value == "" {
-			return
-		}
-		if _, exists := seen[value]; exists {
-			return
-		}
-		seen[value] = struct{}{}
-		out = append(out, value)
+	if fileName := auth.CredentialFileName(); fileName != "" {
+		return []string{fileName}
 	}
-
-	if _, value := auth.AccountInfo(); value != "" {
-		add(value)
-	}
-	if auth.Metadata != nil {
-		if email, ok := auth.Metadata["email"].(string); ok {
-			add(email)
-		}
-		if projectID, ok := auth.Metadata["project_id"].(string); ok {
-			add(projectID)
-		}
-		if project, ok := auth.Metadata["project"].(string); ok {
-			add(project)
-		}
-	}
-	if auth.Attributes != nil {
-		add(auth.Attributes["api_key"])
-		path := strings.TrimSpace(auth.Attributes["path"])
-		if path == "" {
-			path = strings.TrimSpace(auth.Attributes["source"])
-		}
-		if path != "" {
-			base := filepath.Base(path)
-			add(base)
-			if ext := filepath.Ext(base); ext != "" {
-				add(strings.TrimSuffix(base, ext))
-			}
-		}
-	}
-	if name := strings.TrimSpace(auth.FileName); name != "" {
-		base := filepath.Base(name)
-		add(base)
-		if ext := filepath.Ext(base); ext != "" {
-			add(strings.TrimSuffix(base, ext))
-		}
-	}
-	return out
+	return nil
 }
 
 // GetMonitorRequestDetails returns request-level details with method/path from the database.
