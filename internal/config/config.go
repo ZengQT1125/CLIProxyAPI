@@ -311,6 +311,8 @@ type CodexConfig struct {
 	// StripIntermediaryUpdates removes Codex Desktop local progress-update instructions
 	// from upstream Codex request instructions when explicitly enabled.
 	StripIntermediaryUpdates bool `yaml:"strip-intermediary-updates" json:"strip-intermediary-updates"`
+	// OptimizeMultiAgentV2 optimizes official Codex multi-agent requests.
+	OptimizeMultiAgentV2 bool `yaml:"optimize-multi-agent-v2" json:"optimize-multi-agent-v2"`
 }
 
 // TLSConfig holds HTTPS server settings.

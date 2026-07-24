@@ -346,13 +346,13 @@ func newAntigravityHTTPClient(ctx context.Context, cfg *config.Config, auth *cli
 	return client
 }
 
-func translateAntigravityRequestPair(from, to sdktranslator.Format, model string, originalPayload, payload []byte, stream bool) ([]byte, []byte) {
+func translateAntigravityRequestPair(ctx context.Context, headers http.Header, cfg *config.Config, from, to sdktranslator.Format, model string, originalPayload, payload []byte, stream bool) ([]byte, []byte) {
 	if bytes.Equal(originalPayload, payload) {
-		body := sdktranslator.TranslateRequest(from, to, model, payload, stream)
+		body := helps.TranslateRequestWithCodexMultiAgentV2(ctx, headers, cfg, from, to, model, payload, stream)
 		return body, body
 	}
-	originalTranslated := sdktranslator.TranslateRequest(from, to, model, originalPayload, stream)
-	body := sdktranslator.TranslateRequest(from, to, model, payload, stream)
+	originalTranslated := helps.TranslateRequestWithCodexMultiAgentV2(ctx, headers, cfg, from, to, model, originalPayload, stream)
+	body := helps.TranslateRequestWithCodexMultiAgentV2(ctx, headers, cfg, from, to, model, payload, stream)
 	return originalTranslated, body
 }
 
@@ -712,7 +712,7 @@ func (e *AntigravityExecutor) Execute(ctx context.Context, auth *cliproxyauth.Au
 	if updatedAuth != nil {
 		auth = updatedAuth
 	}
-	originalTranslated, translated := translateAntigravityRequestPair(from, to, baseModel, originalPayload, req.Payload, false)
+	originalTranslated, translated := translateAntigravityRequestPair(ctx, opts.Headers, e.cfg, from, to, baseModel, originalPayload, req.Payload, false)
 
 	translated, err = thinking.ApplyThinking(translated, req.Model, from.String(), to.String(), e.Identifier())
 	if err != nil {
@@ -936,7 +936,7 @@ func (e *AntigravityExecutor) executeClaudeNonStream(ctx context.Context, auth *
 	if updatedAuth != nil {
 		auth = updatedAuth
 	}
-	originalTranslated, translated := translateAntigravityRequestPair(from, to, baseModel, originalPayload, req.Payload, true)
+	originalTranslated, translated := translateAntigravityRequestPair(ctx, opts.Headers, e.cfg, from, to, baseModel, originalPayload, req.Payload, true)
 
 	translated, err = thinking.ApplyThinking(translated, req.Model, from.String(), to.String(), e.Identifier())
 	if err != nil {
@@ -1412,7 +1412,7 @@ func (e *AntigravityExecutor) ExecuteStream(ctx context.Context, auth *cliproxya
 		auth = updatedAuth
 	}
 
-	originalTranslated, translated := translateAntigravityRequestPair(from, to, baseModel, originalPayload, req.Payload, true)
+	originalTranslated, translated := translateAntigravityRequestPair(ctx, opts.Headers, e.cfg, from, to, baseModel, originalPayload, req.Payload, true)
 
 	translated, err = thinking.ApplyThinking(translated, req.Model, from.String(), to.String(), e.Identifier())
 	if err != nil {
@@ -1754,7 +1754,7 @@ func (e *AntigravityExecutor) CountTokens(ctx context.Context, auth *cliproxyaut
 	}
 
 	// Prepare payload once (doesn't depend on baseURL)
-	payload := sdktranslator.TranslateRequest(from, to, baseModel, req.Payload, false)
+	payload := helps.TranslateRequestWithCodexMultiAgentV2(ctx, opts.Headers, e.cfg, from, to, baseModel, req.Payload, false)
 
 	payload, err := thinking.ApplyThinking(payload, req.Model, from.String(), to.String(), e.Identifier())
 	if err != nil {
