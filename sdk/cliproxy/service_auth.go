@@ -6,7 +6,6 @@ import (
 	"time"
 
 	"github.com/router-for-me/CLIProxyAPI/v7/internal/runtime/executor"
-	"github.com/router-for-me/CLIProxyAPI/v7/internal/store"
 	"github.com/router-for-me/CLIProxyAPI/v7/internal/util"
 	"github.com/router-for-me/CLIProxyAPI/v7/internal/watcher"
 	"github.com/router-for-me/CLIProxyAPI/v7/internal/wsrelay"
@@ -426,25 +425,27 @@ func (s *Service) resolveCooldownStateStore(cfg *config.Config) coreauth.Cooldow
 	if cfg == nil || !cfg.SaveCooldownStatus || cfg.Home.Enabled {
 		return nil
 	}
-	authDir := ""
-	if _, isPG := sdkAuth.GetTokenStore().(*store.PostgresStore); !isPG {
-		var errResolve error
-		authDir, errResolve = resolveCooldownStateAuthDir(cfg)
-		if errResolve != nil {
-			log.Warnf("failed to resolve cooldown state directory: %v", errResolve)
-			return nil
-		}
+	// A backend that owns cooldown persistence (e.g. PostgreSQL) declares it via
+	// CooldownStateStoreProvider at Build time; prefer it over the file store.
+	if s != nil && s.cooldownStateStore != nil {
+		return s.cooldownStateStore
+	}
+	authDir, errResolve := resolveCooldownStateAuthDir(cfg)
+	if errResolve != nil {
+		log.Warnf("failed to resolve cooldown state directory: %v", errResolve)
+		return nil
 	}
 	return cooldownStateStoreForTokenStore(sdkAuth.GetTokenStore(), authDir)
 }
 
-// cooldownStateStoreForTokenStore returns the appropriate CooldownStateStore:
-//   - *store.PostgresStore → PostgresCooldownStateStore (ignores authDir)
-//   - anything else with a non-empty authDir → FileCooldownStateStore
-//   - anything else with empty authDir → nil
+// cooldownStateStoreForTokenStore returns a file-backed CooldownStateStore when
+// the token store does not provide one itself. Backend-owned stores are resolved
+// through CooldownStateStoreProvider before this is reached.
 func cooldownStateStoreForTokenStore(tokenStore coreauth.Store, authDir string) coreauth.CooldownStateStore {
-	if pg, ok := tokenStore.(*store.PostgresStore); ok && pg != nil {
-		return store.NewPostgresCooldownStateStore(pg)
+	if provider, ok := tokenStore.(coreauth.CooldownStateStoreProvider); ok {
+		if provided := provider.CooldownStateStore(); provided != nil {
+			return provided
+		}
 	}
 	if strings.TrimSpace(authDir) == "" {
 		return nil

@@ -15,6 +15,7 @@ import (
 )
 
 var _ cliproxyauth.CooldownStateStore = (*PostgresCooldownStateStore)(nil)
+var _ cliproxyauth.CooldownStateStoreProvider = (*PostgresStore)(nil)
 
 // PostgresCooldownStateStore persists runtime cooldown state to PostgreSQL,
 // independently from PostgresStore's auth token storage (which owns Save

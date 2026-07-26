@@ -4,7 +4,6 @@ import (
 	"context"
 	"testing"
 
-	"github.com/router-for-me/CLIProxyAPI/v7/internal/store"
 	sdkAuth "github.com/router-for-me/CLIProxyAPI/v7/sdk/auth"
 	coreauth "github.com/router-for-me/CLIProxyAPI/v7/sdk/cliproxy/auth"
 	"github.com/router-for-me/CLIProxyAPI/v7/sdk/config"
@@ -18,6 +17,29 @@ func (stubTokenStore) Save(_ context.Context, _ *coreauth.Auth) (string, error) 
 	return "", nil
 }
 func (stubTokenStore) Delete(_ context.Context, _ string) error { return nil }
+
+// stubCooldownStateStore is an inert coreauth.CooldownStateStore used to assert
+// which store the resolver picks.
+type stubCooldownStateStore struct{}
+
+func (*stubCooldownStateStore) Load(_ context.Context) ([]coreauth.CooldownStateSnapshot, error) {
+	return nil, nil
+}
+
+func (*stubCooldownStateStore) Apply(_ context.Context, _ []coreauth.CooldownStateSnapshot) error {
+	return nil
+}
+
+// providerTokenStore is a token store that advertises its own cooldown backend,
+// mirroring what *store.PostgresStore does.
+type providerTokenStore struct {
+	stubTokenStore
+	backend coreauth.CooldownStateStore
+}
+
+func (p providerTokenStore) CooldownStateStore() coreauth.CooldownStateStore {
+	return p.backend
+}
 
 // TestCooldownStateStoreForTokenStore_FileStore verifies that a non-Postgres
 // token store with a valid authDir returns a *FileCooldownStateStore.
@@ -38,27 +60,43 @@ func TestCooldownStateStoreForTokenStore_EmptyAuthDir(t *testing.T) {
 	}
 }
 
-// TestCooldownStateStoreForTokenStore_NilPostgres verifies that a nil
-// PostgresStore pointer (wrapped as interface) falls through to nil because
-// NewPostgresCooldownStateStore(nil) returns a true nil, and authDir is "".
-func TestCooldownStateStoreForTokenStore_NilPostgres(t *testing.T) {
-	var pg *store.PostgresStore = nil
-	got := cooldownStateStoreForTokenStore(pg, "")
-	if got != nil {
-		t.Fatalf("nil PostgresStore with empty authDir: got %T, want nil", got)
+// TestCooldownStateStoreForTokenStore_BackendProvider verifies that a token
+// store advertising CooldownStateStoreProvider wins over the file store, even
+// when authDir is usable.
+func TestCooldownStateStoreForTokenStore_BackendProvider(t *testing.T) {
+	backend := &stubCooldownStateStore{}
+	got := cooldownStateStoreForTokenStore(providerTokenStore{backend: backend}, t.TempDir())
+	if got != coreauth.CooldownStateStore(backend) {
+		t.Fatalf("got %T, want the backend-provided store", got)
 	}
 }
 
-// TestCooldownStateStoreForTokenStore_NilPostgresFallsBackToFile verifies
-// that a nil *PostgresStore with a valid authDir still returns a file store.
-func TestCooldownStateStoreForTokenStore_NilPostgresFallsBackToFile(t *testing.T) {
-	var pg *store.PostgresStore = nil
-	dir := t.TempDir()
-	got := cooldownStateStoreForTokenStore(pg, dir)
-	// nil *PostgresStore triggers the file-store path because
-	// NewPostgresCooldownStateStore(nil) returns a true nil.
+// TestCooldownStateStoreForTokenStore_ProviderReturningNil verifies that a
+// provider yielding nil falls back to the file store instead of installing a
+// dead store.
+func TestCooldownStateStoreForTokenStore_ProviderReturningNil(t *testing.T) {
+	got := cooldownStateStoreForTokenStore(providerTokenStore{}, t.TempDir())
 	if _, ok := got.(*coreauth.FileCooldownStateStore); !ok {
 		t.Fatalf("got %T, want *coreauth.FileCooldownStateStore", got)
+	}
+}
+
+// TestResolveCooldownStateStore_PrefersCapturedBackend verifies that the store
+// captured at Build time (from a CooldownStateStoreProvider token store) takes
+// precedence over the authDir-derived file store.
+func TestResolveCooldownStateStore_PrefersCapturedBackend(t *testing.T) {
+	prev := sdkAuth.GetTokenStore()
+	sdkAuth.RegisterTokenStore(stubTokenStore{})
+	t.Cleanup(func() { sdkAuth.RegisterTokenStore(prev) })
+
+	backend := &stubCooldownStateStore{}
+	svc := &Service{cooldownStateStore: backend}
+	got := svc.resolveCooldownStateStore(&config.Config{
+		SaveCooldownStatus: true,
+		AuthDir:            t.TempDir(),
+	})
+	if got != coreauth.CooldownStateStore(backend) {
+		t.Fatalf("got %T, want the captured backend store", got)
 	}
 }
 

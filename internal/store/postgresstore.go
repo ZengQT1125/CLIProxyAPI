@@ -39,12 +39,13 @@ type PostgresStoreConfig struct {
 // PostgresStore persists configuration and authentication metadata using PostgreSQL as backend
 // while mirroring data to a local workspace so existing file-based workflows continue to operate.
 type PostgresStore struct {
-	db         *sql.DB
-	cfg        PostgresStoreConfig
-	spoolRoot  string
-	configPath string
-	authDir    string
-	mu         sync.Mutex
+	db            *sql.DB
+	cfg           PostgresStoreConfig
+	spoolRoot     string
+	configPath    string
+	authDir       string
+	cooldownStore *PostgresCooldownStateStore
+	mu            sync.Mutex
 }
 
 // NewPostgresStore establishes a connection to PostgreSQL and prepares the local workspace.
@@ -101,7 +102,18 @@ func NewPostgresStore(ctx context.Context, cfg PostgresStoreConfig) (*PostgresSt
 		configPath: filepath.Join(configDir, "config.yaml"),
 		authDir:    authDir,
 	}
+	store.cooldownStore = &PostgresCooldownStateStore{s: store}
 	return store, nil
+}
+
+// CooldownStateStore returns the PostgreSQL-backed runtime cooldown store.
+// It satisfies cliproxyauth.CooldownStateStoreProvider so the service resolves
+// cooldown persistence from the token store instead of type-asserting on it.
+func (s *PostgresStore) CooldownStateStore() cliproxyauth.CooldownStateStore {
+	if s == nil || s.cooldownStore == nil {
+		return nil
+	}
+	return s.cooldownStore
 }
 
 // Close releases the underlying database connection.
