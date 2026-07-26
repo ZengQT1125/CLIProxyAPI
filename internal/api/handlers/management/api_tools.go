@@ -4,6 +4,7 @@ import (
 	"context"
 	"crypto/sha256"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"net/http"
@@ -149,7 +150,8 @@ func (h *Handler) APICall(c *gin.Context) {
 				return
 			}
 			// Some credentials do not have a bearer token. Their provider executor injects
-			// the native authentication scheme immediately before sending the request.
+			// the native authentication scheme immediately before sending the request, and
+			// rejects the request with 401 when it has no usable credential either.
 			delete(reqHeaders, key)
 			continue
 		}
@@ -196,6 +198,14 @@ func (h *Handler) APICall(c *gin.Context) {
 	}
 	if errDo != nil {
 		log.WithError(errDo).Debug("management APICall request failed")
+		// A credential that cannot authenticate must not look like a transport
+		// failure: surface the executor's own status so callers can tell an
+		// unusable credential apart from an unreachable upstream.
+		var statusAware interface{ StatusCode() int }
+		if errors.As(errDo, &statusAware) && statusAware.StatusCode() == http.StatusUnauthorized {
+			c.JSON(http.StatusUnauthorized, gin.H{"error": errDo.Error()})
+			return
+		}
 		c.JSON(http.StatusBadGateway, gin.H{"error": "request failed"})
 		return
 	}

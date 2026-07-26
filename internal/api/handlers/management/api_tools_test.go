@@ -46,6 +46,54 @@ func TestAPICallTransportDirectBypassesGlobalProxy(t *testing.T) {
 	}
 }
 
+// TestAPICallRejectsCredentialWithoutToken pins the failure mode behind the
+// misleading upstream error "x-api-key header is required": when a credential
+// holds no access token, the $TOKEN$ header is dropped and the request used to
+// reach the upstream with no authentication at all. It must fail here instead.
+func TestAPICallRejectsCredentialWithoutToken(t *testing.T) {
+	var upstreamCalls atomic.Int32
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		upstreamCalls.Add(1)
+		w.WriteHeader(http.StatusNoContent)
+	}))
+	defer upstream.Close()
+
+	manager := coreauth.NewManager(nil, nil, nil)
+	manager.RegisterExecutor(runtimeexecutor.NewClaudeExecutor(&config.Config{}))
+	auth := &coreauth.Auth{
+		ID:       "claude-oauth",
+		Index:    "claude-auth-index",
+		Provider: "claude",
+		Status:   coreauth.StatusActive,
+		Metadata: map[string]any{
+			"type":          "claude",
+			"email":         "user@example.com",
+			"refresh_token": "sk-ant-ort01-refresh",
+		},
+	}
+	if _, errRegister := manager.Register(context.Background(), auth); errRegister != nil {
+		t.Fatalf("register auth: %v", errRegister)
+	}
+
+	h := NewHandlerWithoutConfigFilePath(&config.Config{}, manager)
+
+	payload := fmt.Sprintf(`{"authIndex":"claude-auth-index","method":"POST","url":%q,"header":{"Authorization":"Bearer $TOKEN$"},"data":"{}"}`, upstream.URL)
+	gin.SetMode(gin.TestMode)
+	recorder := httptest.NewRecorder()
+	c, _ := gin.CreateTestContext(recorder)
+	c.Request = httptest.NewRequest(http.MethodPost, "/v0/management/api-call", strings.NewReader(payload))
+	c.Request.Header.Set("Content-Type", "application/json")
+
+	h.APICall(c)
+
+	if got := upstreamCalls.Load(); got != 0 {
+		t.Errorf("upstream calls = %d, want 0: unauthenticated request must not be forwarded", got)
+	}
+	if recorder.Code != http.StatusUnauthorized {
+		t.Fatalf("APICall status = %d, want %d; body=%s", recorder.Code, http.StatusUnauthorized, recorder.Body.String())
+	}
+}
+
 func TestAPICallUsesProviderAuthenticationForAgentIdentity(t *testing.T) {
 	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		if got := r.Header.Get("Authorization"); !strings.HasPrefix(got, "AgentAssertion ") {

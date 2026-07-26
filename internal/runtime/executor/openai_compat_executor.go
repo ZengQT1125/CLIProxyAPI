@@ -55,9 +55,10 @@ func (e *OpenAICompatExecutor) PrepareRequest(req *http.Request, auth *cliproxya
 		return nil
 	}
 	_, apiKey := e.resolveCredentials(auth)
-	if strings.TrimSpace(apiKey) != "" {
-		req.Header.Set("Authorization", "Bearer "+apiKey)
+	if strings.TrimSpace(apiKey) == "" {
+		return statusErr{code: http.StatusUnauthorized, msg: "missing access token"}
 	}
+	req.Header.Set("Authorization", "Bearer "+apiKey)
 	var attrs map[string]string
 	if auth != nil {
 		attrs = auth.Attributes

@@ -54,9 +54,10 @@ func (e *KimiExecutor) PrepareRequest(req *http.Request, auth *cliproxyauth.Auth
 		return nil
 	}
 	token := kimiCreds(auth)
-	if strings.TrimSpace(token) != "" {
-		req.Header.Set("Authorization", "Bearer "+token)
+	if strings.TrimSpace(token) == "" {
+		return statusErr{code: http.StatusUnauthorized, msg: "missing access token"}
 	}
+	req.Header.Set("Authorization", "Bearer "+token)
 	var attrs map[string]string
 	if auth != nil {
 		attrs = auth.Attributes

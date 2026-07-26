@@ -212,7 +212,7 @@ func (e *ClaudeExecutor) PrepareRequest(req *http.Request, auth *cliproxyauth.Au
 	}
 	apiKey, _ := claudeCreds(auth)
 	if strings.TrimSpace(apiKey) == "" {
-		return nil
+		return statusErr{code: http.StatusUnauthorized, msg: "missing access token"}
 	}
 	useAPIKey := auth != nil && auth.Attributes != nil && strings.TrimSpace(auth.Attributes["api_key"]) != ""
 	isAnthropicBase := req.URL != nil && strings.EqualFold(req.URL.Scheme, "https") && strings.EqualFold(req.URL.Host, "api.anthropic.com")
