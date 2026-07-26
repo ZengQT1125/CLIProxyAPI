@@ -90,6 +90,61 @@ func TestManager_RefreshAuthUnauthorizedFailureStopsAutoRefreshRetry(t *testing.
 	}
 }
 
+type blankingRefreshTestExecutor struct {
+	schedulerProviderTestExecutor
+}
+
+// Refresh mimics an executor that trusted an upstream 200 carrying no token and
+// wrote the empty value back onto the credential.
+func (e blankingRefreshTestExecutor) Refresh(ctx context.Context, auth *Auth) (*Auth, error) {
+	if auth.Metadata == nil {
+		auth.Metadata = make(map[string]any)
+	}
+	auth.Metadata["access_token"] = ""
+	return auth, nil
+}
+
+func TestManager_RefreshAuth_RejectsRefreshThatBlanksAccessToken(t *testing.T) {
+	ctx := context.Background()
+	manager := NewManager(nil, &RoundRobinSelector{}, nil)
+	manager.RegisterExecutor(blankingRefreshTestExecutor{
+		schedulerProviderTestExecutor: schedulerProviderTestExecutor{provider: "claude"},
+	})
+
+	auth := &Auth{
+		ID:       "blanked-refresh",
+		Provider: "claude",
+		Metadata: map[string]any{
+			"access_token":  "working-access-token",
+			"refresh_token": "some-refresh-token",
+		},
+	}
+	if _, errRegister := manager.Register(ctx, auth); errRegister != nil {
+		t.Fatalf("register auth: %v", errRegister)
+	}
+
+	manager.refreshAuth(ctx, auth.ID)
+
+	updated, ok := manager.GetByID(auth.ID)
+	if !ok {
+		t.Fatalf("expected auth %q after refresh", auth.ID)
+	}
+	if got := authAccessToken(updated); got != "working-access-token" {
+		t.Fatalf("access_token = %q, want the previous working token to survive", got)
+	}
+	if updated.LastError == nil {
+		t.Fatal("expected a refresh that yields no token to be recorded as an error")
+	}
+	// The previous token may still be valid, so the credential stays usable and
+	// the refresh is retried after a backoff rather than being marked terminal.
+	if updated.NextRefreshAfter.IsZero() {
+		t.Fatal("expected a backoff to be scheduled so the refresh is retried")
+	}
+	if !updated.LastRefreshedAt.IsZero() {
+		t.Fatal("expected a refresh yielding no token to not count as a successful refresh")
+	}
+}
+
 func TestManager_RefreshSchedulerEntry_RebuildsSupportedModelSetAfterModelRegistration(t *testing.T) {
 	ctx := context.Background()
 

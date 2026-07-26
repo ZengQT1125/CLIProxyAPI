@@ -451,6 +451,23 @@ func (m *Manager) refreshAuthWithPolicy(ctx context.Context, id, failedAccessTok
 
 	cloned := auth.Clone()
 	updated, err := exec.Refresh(ctx, cloned)
+	if err == nil {
+		// A refresh that hands back no access token is not a success. Accepting it
+		// would overwrite a credential that still works with an empty string, then
+		// persist that and report the auth as healthy. Keep the previous token and
+		// let the normal failure path schedule a retry.
+		refreshed := updated
+		if refreshed == nil {
+			refreshed = cloned
+		}
+		if authAccessToken(auth) != "" && authAccessToken(refreshed) == "" {
+			err = &Error{
+				Code:      "refresh_missing_access_token",
+				Message:   "refresh returned no access token; keeping the previous credential",
+				Retryable: true,
+			}
+		}
+	}
 	if err != nil && errors.Is(err, context.Canceled) {
 		log.Debugf("refresh canceled for %s, %s", auth.Provider, auth.ID)
 		return nil, err

@@ -265,6 +265,14 @@ func (o *CodexAuth) refreshTokensSingleFlight(ctx context.Context, refreshToken,
 		return nil, fmt.Errorf("failed to parse refresh response: %w", errUnmarshal)
 	}
 
+	// A 200 carrying no access_token is not a refresh: json.Unmarshal accepts any
+	// valid object (`{}`, `null`, an error envelope, a captive-portal page) and
+	// leaves AccessToken empty with a nil error. Reporting that as success would
+	// overwrite a working credential with an empty string.
+	if strings.TrimSpace(tokenResp.AccessToken) == "" {
+		return nil, fmt.Errorf("refresh response missing access_token")
+	}
+
 	// Extract account ID from ID token
 	claims, errParseJWT := ParseJWTToken(tokenResp.IDToken)
 	if errParseJWT != nil {

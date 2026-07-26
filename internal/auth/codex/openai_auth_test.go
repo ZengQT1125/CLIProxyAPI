@@ -86,6 +86,54 @@ func TestRefreshTokensWithClientID_UsesProvidedClientID(t *testing.T) {
 	}
 }
 
+func TestRefreshTokens_RejectsResponseWithoutAccessToken(t *testing.T) {
+	cases := []struct {
+		name string
+		body string
+	}{
+		{name: "empty object", body: `{}`},
+		{name: "json null", body: `null`},
+		{name: "error envelope served as 200", body: `{"error":"invalid_grant"}`},
+		{name: "blank access token", body: `{"access_token":"   ","refresh_token":"new-refresh","expires_in":3600}`},
+	}
+
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			resetCodexRefreshGroupForTest()
+			t.Cleanup(resetCodexRefreshGroupForTest)
+
+			var calls int32
+			auth := &CodexAuth{
+				httpClient: &http.Client{
+					Transport: roundTripFunc(func(req *http.Request) (*http.Response, error) {
+						atomic.AddInt32(&calls, 1)
+						return &http.Response{
+							StatusCode: http.StatusOK,
+							Body:       io.NopCloser(strings.NewReader(tc.body)),
+							Header:     make(http.Header),
+							Request:    req,
+						}, nil
+					}),
+				},
+			}
+
+			td, err := auth.RefreshTokens(context.Background(), "dummy_refresh_token")
+			if err == nil {
+				t.Fatalf("expected refresh error for response without access_token, got token %#v", td)
+			}
+			if td != nil {
+				t.Fatalf("expected nil token data on failed refresh, got %#v", td)
+			}
+			if !strings.Contains(err.Error(), "access_token") {
+				t.Fatalf("expected error to mention access_token, got %v", err)
+			}
+			if got := atomic.LoadInt32(&calls); got != 1 {
+				t.Fatalf("expected 1 upstream refresh call, got %d", got)
+			}
+		})
+	}
+}
+
 func TestRefreshTokensWithClientID_DoesNotMergeDifferentClients(t *testing.T) {
 	resetCodexRefreshGroupForTest()
 	t.Cleanup(resetCodexRefreshGroupForTest)
