@@ -912,7 +912,7 @@ attemptLoop:
 				}
 			}
 
-			httpReq, errReq := e.buildRequest(ctx, auth, token, baseModel, requestPayload, false, opts.Alt, baseURL)
+			httpReq, errReq := e.buildRequest(ctx, auth, token, baseModel, requestPayload, false, opts.Alt, baseURL, helps.DerivedAntigravitySessionID(opts.Metadata, req.Metadata))
 			if errReq != nil {
 				err = errReq
 				return resp, err
@@ -1137,7 +1137,7 @@ attemptLoop:
 					return resp, err
 				}
 			}
-			httpReq, errReq := e.buildRequest(ctx, auth, token, baseModel, requestPayload, true, opts.Alt, baseURL)
+			httpReq, errReq := e.buildRequest(ctx, auth, token, baseModel, requestPayload, true, opts.Alt, baseURL, helps.DerivedAntigravitySessionID(opts.Metadata, req.Metadata))
 			if errReq != nil {
 				err = errReq
 				return resp, err
@@ -1635,7 +1635,7 @@ attemptLoop:
 					return nil, err
 				}
 			}
-			httpReq, errReq := e.buildRequest(ctx, auth, token, baseModel, requestPayload, true, opts.Alt, baseURL)
+			httpReq, errReq := e.buildRequest(ctx, auth, token, baseModel, requestPayload, true, opts.Alt, baseURL, helps.DerivedAntigravitySessionID(opts.Metadata, req.Metadata))
 			if errReq != nil {
 				err = errReq
 				return nil, err
@@ -2482,7 +2482,7 @@ func (e *AntigravityExecutor) updateAntigravityCreditsBalance(ctx context.Contex
 	}
 }
 
-func (e *AntigravityExecutor) buildRequest(ctx context.Context, auth *cliproxyauth.Auth, token, modelName string, payload []byte, stream bool, alt, baseURL string) (*http.Request, error) {
+func (e *AntigravityExecutor) buildRequest(ctx context.Context, auth *cliproxyauth.Auth, token, modelName string, payload []byte, stream bool, alt, baseURL string, derivedSessionIDs ...string) (*http.Request, error) {
 	if token == "" {
 		return nil, statusErr{code: http.StatusUnauthorized, msg: "missing access token"}
 	}
@@ -2514,7 +2514,7 @@ func (e *AntigravityExecutor) buildRequest(ctx context.Context, auth *cliproxyau
 	if errProject != nil {
 		return nil, errProject
 	}
-	payload = geminiToAntigravity(modelName, payload, projectID)
+	payload = geminiToAntigravity(modelName, payload, projectID, derivedSessionIDs...)
 	resolvedModel := strings.TrimSpace(gjson.GetBytes(payload, "model").String())
 	if resolvedModel == "" {
 		resolvedModel = modelName
@@ -2537,18 +2537,7 @@ func (e *AntigravityExecutor) buildRequest(ctx context.Context, auth *cliproxyau
 		payloadLog []byte
 	)
 	if antigravityRequestNeedsSchemaSanitization(payload) {
-		payloadStr := string(payload)
-		paths := make([]string, 0)
-		util.Walk(gjson.Parse(payloadStr), "", "parametersJsonSchema", &paths)
-		for _, p := range paths {
-			payloadStr, _ = util.RenameKey(payloadStr, p, p[:len(p)-len("parametersJsonSchema")]+"parameters")
-		}
-
-		if useAntigravitySchema {
-			payloadStr = util.CleanJSONSchemaForAntigravity(payloadStr)
-		} else {
-			payloadStr = util.CleanJSONSchemaForGemini(payloadStr)
-		}
+		payloadStr := sanitizeAntigravityRequestSchemas(string(payload), useAntigravitySchema)
 
 		if strings.Contains(modelName, "claude") {
 			updated, _ := sjson.SetBytes([]byte(payloadStr), "request.toolConfig.functionCallingConfig.mode", "VALIDATED")
@@ -2626,15 +2615,142 @@ func (e *AntigravityExecutor) buildRequest(ctx context.Context, auth *cliproxyau
 	return httpReq, nil
 }
 
+// sanitizeAntigravityRequestSchemas cleans the JSON schemas carried by an Antigravity request.
+//
+// Cleaning is applied only to the payload locations that actually hold a JSON schema. The schema
+// cleaner rewrites keys such as "title", "format", "default" and "const", which are also ordinary
+// data keys inside functionCall arguments replayed from conversation history. Running it over the
+// whole document silently mutated that history, so tools lost required argument fields and the
+// model imitated the corrupted examples on later turns.
+func sanitizeAntigravityRequestSchemas(payloadStr string, useAntigravitySchema bool) string {
+	for _, base := range antigravityFunctionDeclarationPaths(payloadStr) {
+		oldPath := base + ".parametersJsonSchema"
+		if !gjson.Get(payloadStr, oldPath).Exists() {
+			continue
+		}
+		renamed, errRename := util.RenameKey(payloadStr, oldPath, base+".parameters")
+		if errRename != nil {
+			log.Debugf("antigravity: failed to rename %s: %v", oldPath, errRename)
+			continue
+		}
+		payloadStr = renamed
+	}
+
+	clean := util.CleanJSONSchemaForGemini
+	if useAntigravitySchema {
+		clean = util.CleanJSONSchemaForAntigravity
+	}
+
+	for _, schemaPath := range antigravitySchemaPaths(payloadStr) {
+		schema := gjson.Get(payloadStr, schemaPath)
+		if !schema.Exists() {
+			continue
+		}
+		updated, errSet := sjson.SetRawBytes([]byte(payloadStr), schemaPath, []byte(cleanNestedSchema(clean, schema.Raw)))
+		if errSet != nil {
+			log.Debugf("antigravity: failed to write cleaned schema at %s: %v", schemaPath, errSet)
+			continue
+		}
+		payloadStr = string(updated)
+	}
+
+	return payloadStr
+}
+
+// antigravitySchemaWrapperKey nests a schema during cleaning. It is never sent upstream.
+const antigravitySchemaWrapperKey = "schema"
+
+// cleanNestedSchema cleans a schema with it nested one level down, then unwraps it.
+//
+// The cleaner deliberately skips placeholder insertion for a top-level schema, but Claude's
+// VALIDATED mode needs every tool schema to declare at least one required property. Whole-payload
+// cleaning always saw tool schemas nested inside the request, so nesting is reproduced here to keep
+// the emitted schema byte-identical to the previous behaviour.
+func cleanNestedSchema(clean func(string) string, schemaRaw string) string {
+	wrapped, errWrap := sjson.SetRaw("{}", antigravitySchemaWrapperKey, schemaRaw)
+	if errWrap != nil {
+		return clean(schemaRaw)
+	}
+	if unwrapped := gjson.Get(clean(wrapped), antigravitySchemaWrapperKey); unwrapped.Exists() {
+		return unwrapped.Raw
+	}
+	return clean(schemaRaw)
+}
+
+// antigravityFunctionDeclarationPaths returns the path of every function declaration in the request.
+// Both the camelCase and snake_case spellings are accepted because callers reach this executor
+// through different translators.
+func antigravityFunctionDeclarationPaths(payloadStr string) []string {
+	tools := gjson.Get(payloadStr, "request.tools")
+	if !tools.IsArray() {
+		return nil
+	}
+	paths := make([]string, 0, len(tools.Array()))
+	for i, tool := range tools.Array() {
+		for _, declKey := range []string{"functionDeclarations", "function_declarations"} {
+			decls := tool.Get(declKey)
+			if !decls.IsArray() {
+				continue
+			}
+			for j := range decls.Array() {
+				paths = append(paths, fmt.Sprintf("request.tools.%d.%s.%d", i, declKey, j))
+			}
+		}
+	}
+	return paths
+}
+
+// antigravitySchemaPaths returns every payload path that holds a JSON schema document.
+// A function declaration may carry a schema for its parameters and for its result, so all of
+// them must be cleaned; anything omitted here reaches the upstream API uncleaned.
+func antigravitySchemaPaths(payloadStr string) []string {
+	paths := make([]string, 0, 12)
+	for _, base := range antigravityFunctionDeclarationPaths(payloadStr) {
+		for _, key := range antigravityDeclarationSchemaKeys {
+			if gjson.Get(payloadStr, base+"."+key).IsObject() {
+				paths = append(paths, base+"."+key)
+			}
+		}
+	}
+	for _, container := range antigravityGenerationConfigContainers {
+		for _, key := range antigravityGenerationSchemaKeys {
+			p := container + "." + key
+			if gjson.Get(payloadStr, p).IsObject() {
+				paths = append(paths, p)
+			}
+		}
+	}
+	return paths
+}
+
+// The upstream API is proto-JSON and accepts either spelling, and the Gemini translator forwards
+// whichever one the client sent. Both are therefore cleaned where they sit rather than renamed:
+// renaming would alter the body the client asked for, and only the unsupported keywords inside a
+// schema cause upstream errors. The one exception is parametersJsonSchema, renamed onto parameters
+// above because whole-payload cleaning did the same.
+var (
+	antigravityDeclarationSchemaKeys = []string{
+		"parameters", "parametersJsonSchema", "parameters_json_schema",
+		"response", "responseJsonSchema", "response_json_schema",
+	}
+	antigravityGenerationConfigContainers = []string{
+		"request.generationConfig", "request.generation_config",
+	}
+	antigravityGenerationSchemaKeys = []string{
+		"responseSchema", "responseJsonSchema", "response_schema", "response_json_schema",
+	}
+)
+
 func antigravityRequestNeedsSchemaSanitization(payload []byte) bool {
 	if gjson.GetBytes(payload, "request.tools.0").Exists() {
 		return true
 	}
-	if gjson.GetBytes(payload, "request.generationConfig.responseJsonSchema").Exists() {
-		return true
-	}
-	if gjson.GetBytes(payload, "request.generationConfig.responseSchema").Exists() {
-		return true
+	for _, container := range antigravityGenerationConfigContainers {
+		for _, key := range antigravityGenerationSchemaKeys {
+			if gjson.GetBytes(payload, container+"."+key).Exists() {
+				return true
+			}
+		}
 	}
 	return false
 }
@@ -3047,7 +3163,7 @@ func resolveCustomAntigravityBaseURL(auth *cliproxyauth.Auth) string {
 	return ""
 }
 
-func geminiToAntigravity(modelName string, payload []byte, projectID string) []byte {
+func geminiToAntigravity(modelName string, payload []byte, projectID string, derivedSessionIDs ...string) []byte {
 	template := payload
 	template = helps.SetStringIfDifferent(template, "model", modelName)
 	template = helps.SetStringIfDifferent(template, "userAgent", "antigravity")
@@ -3073,7 +3189,14 @@ func geminiToAntigravity(modelName string, payload []byte, projectID string) []b
 		template, _ = sjson.SetBytes(template, "requestId", generateImageGenRequestID())
 	} else if reqType != "web_search" {
 		template, _ = sjson.SetBytes(template, "requestId", generateRequestID())
-		template, _ = sjson.SetBytes(template, "request.sessionId", generateStableSessionID(payload))
+		sessionID := strings.TrimSpace(gjson.GetBytes(template, "request.sessionId").String())
+		if sessionID == "" && len(derivedSessionIDs) > 0 {
+			sessionID = strings.TrimSpace(derivedSessionIDs[0])
+		}
+		if sessionID == "" {
+			sessionID = generateStableSessionID(payload)
+		}
+		template, _ = sjson.SetBytes(template, "request.sessionId", sessionID)
 	}
 
 	template, _ = sjson.DeleteBytes(template, "request.safetySettings")
