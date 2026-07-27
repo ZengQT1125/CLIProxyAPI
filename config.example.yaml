@@ -142,6 +142,9 @@ proxy-url: ""
 # Set CODEX_BASE_URL in the process environment or .env file to override the
 # default Codex backend for credentials without a per-entry base-url.
 # Example .env: CODEX_BASE_URL=https://example.com/codex
+# Set XAI_CLI_CHAT_PROXY_BASE_URL as the highest-priority Grok CLI chat-proxy
+# base URL for xAI OAuth chat and credential billing checks.
+# Example .env: XAI_CLI_CHAT_PROXY_BASE_URL=https://example.com/xai/v1
 # uTLS-protected hosts automatically fall back from uTLS HTTP/2 to uTLS HTTP/1.1
 # and then standard HTTP/1.1 when transport errors occur before an HTTP response.
 

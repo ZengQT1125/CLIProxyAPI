@@ -21,6 +21,22 @@ func resetXAIRefreshGroupForTest() {
 	xaiRefreshGroup = singleflight.Group{}
 }
 
+func TestCLIChatProxyBaseURLFromEnv(t *testing.T) {
+	t.Run("default", func(t *testing.T) {
+		t.Setenv(CLIChatProxyBaseURLEnv, "")
+		if got := CLIChatProxyBaseURLFromEnv(); got != CLIChatProxyBaseURL {
+			t.Fatalf("CLIChatProxyBaseURLFromEnv() = %q, want %q", got, CLIChatProxyBaseURL)
+		}
+	})
+
+	t.Run("environment override", func(t *testing.T) {
+		t.Setenv(CLIChatProxyBaseURLEnv, " https://proxy.example.com/xai/v1/ ")
+		if got := CLIChatProxyBaseURLFromEnv(); got != "https://proxy.example.com/xai/v1/" {
+			t.Fatalf("CLIChatProxyBaseURLFromEnv() = %q, want environment override", got)
+		}
+	})
+}
+
 func TestValidateOAuthEndpointRejectsNonXAIOrigin(t *testing.T) {
 	if _, err := ValidateOAuthEndpoint("https://auth.x.ai/oauth2/token", "token_endpoint"); err != nil {
 		t.Fatalf("ValidateOAuthEndpoint(xai) error = %v", err)

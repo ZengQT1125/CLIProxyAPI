@@ -137,6 +137,7 @@ func TestXAIExecutorExecuteInjectsNativeWebSearchOnlyForCLIChatProxy(t *testing.
 	tests := []struct {
 		name            string
 		auth            *cliproxyauth.Auth
+		envBaseURL      string
 		payload         []byte
 		wantBaseURL     string
 		wantNativeTools int
@@ -154,6 +155,23 @@ func TestXAIExecutorExecuteInjectsNativeWebSearchOnlyForCLIChatProxy(t *testing.
 			},
 			payload:         []byte(`{"model":"grok-4.5","input":[{"role":"user","content":"hello"}],"tools":[{"type":"function","name":"lookup","parameters":{"type":"object"}}]}`),
 			wantBaseURL:     xaiauth.CLIChatProxyBaseURL,
+			wantNativeTools: 1,
+			wantLookup:      true,
+		},
+		{
+			name: "environment override takes priority over credential base url",
+			auth: &cliproxyauth.Auth{
+				Provider: "xai",
+				Attributes: map[string]string{
+					"auth_kind":     "oauth",
+					"base_url":      "https://credential-proxy.example.test/xai/v1",
+					xaiUsingAPIAttr: "true",
+				},
+				Metadata: map[string]any{"access_token": "xai-token"},
+			},
+			envBaseURL:      "https://proxy.example.test/xai/v1",
+			payload:         []byte(`{"model":"grok-4.5","input":[{"role":"user","content":"hello"}],"tools":[{"type":"function","name":"lookup","parameters":{"type":"object"}}]}`),
+			wantBaseURL:     "https://proxy.example.test/xai/v1",
 			wantNativeTools: 1,
 			wantLookup:      true,
 		},
@@ -236,6 +254,7 @@ func TestXAIExecutorExecuteInjectsNativeWebSearchOnlyForCLIChatProxy(t *testing.
 
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
+			t.Setenv(xaiauth.CLIChatProxyBaseURLEnv, tt.envBaseURL)
 			gotBaseURL, gotBody := captureXAIResponsesRequest(t, tt.auth, tt.payload, sdktranslator.FormatOpenAIResponse, false)
 			if gotBaseURL != tt.wantBaseURL {
 				t.Fatalf("base URL = %q, want %q", gotBaseURL, tt.wantBaseURL)
@@ -5128,9 +5147,10 @@ func TestXAIChatBaseURL(t *testing.T) {
 
 func TestXAICompactBaseURL(t *testing.T) {
 	tests := []struct {
-		name string
-		auth *cliproxyauth.Auth
-		want string
+		name       string
+		auth       *cliproxyauth.Auth
+		envBaseURL string
+		want       string
 	}{
 		{
 			name: "empty base url defaults to official api",
@@ -5187,6 +5207,16 @@ func TestXAICompactBaseURL(t *testing.T) {
 			want: xaiauth.DefaultAPIBaseURL,
 		},
 		{
+			name: "configured CLI chat proxy is rewritten to official api for compact",
+			auth: &cliproxyauth.Auth{
+				Attributes: map[string]string{
+					"base_url": "https://configured-cli-proxy.example/v1",
+				},
+			},
+			envBaseURL: "https://configured-cli-proxy.example/v1",
+			want:       xaiauth.DefaultAPIBaseURL,
+		},
+		{
 			name: "custom gateway is honored for compact",
 			auth: &cliproxyauth.Auth{
 				Attributes: map[string]string{
@@ -5200,6 +5230,7 @@ func TestXAICompactBaseURL(t *testing.T) {
 
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
+			t.Setenv(xaiauth.CLIChatProxyBaseURLEnv, tt.envBaseURL)
 			got := xaiCompactBaseURL(tt.auth)
 			if got != tt.want {
 				t.Fatalf("xaiCompactBaseURL() = %q, want %q", got, tt.want)
@@ -5262,6 +5293,25 @@ func TestApplyXAIChatHeaders(t *testing.T) {
 		}
 		if got := req.Header.Get("User-Agent"); got != "xai-grok-workspace/"+xaiauth.CLIClientVersion {
 			t.Fatalf("User-Agent = %q, want xai-grok-workspace/%s", got, xaiauth.CLIClientVersion)
+		}
+	})
+
+	t.Run("environment override uses cli headers despite credential using_api", func(t *testing.T) {
+		t.Setenv(xaiauth.CLIChatProxyBaseURLEnv, "https://configured-cli-proxy.example/v1")
+		req := httptest.NewRequest(http.MethodPost, "https://configured-cli-proxy.example/v1/responses", nil)
+		auth := &cliproxyauth.Auth{
+			Attributes: map[string]string{
+				"base_url":      "https://credential-proxy.example/v1",
+				xaiUsingAPIAttr: "true",
+			},
+		}
+		applyXAIChatHeaders(req, auth, "xai-token", true, "")
+
+		if got := req.Header.Get(xaiauth.CLITokenAuthHeader); got != xaiauth.CLITokenAuthValue {
+			t.Fatalf("%s = %q, want %q", xaiauth.CLITokenAuthHeader, got, xaiauth.CLITokenAuthValue)
+		}
+		if got := req.Header.Get(xaiauth.CLIClientVersionHeader); got != xaiauth.CLIClientVersion {
+			t.Fatalf("%s = %q, want %q", xaiauth.CLIClientVersionHeader, got, xaiauth.CLIClientVersion)
 		}
 	})
 

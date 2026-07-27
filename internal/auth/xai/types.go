@@ -1,7 +1,11 @@
 // Package xai provides OAuth2 authentication helpers for xAI Grok.
 package xai
 
-import "time"
+import (
+	"time"
+
+	"github.com/router-for-me/CLIProxyAPI/v7/internal/util"
+)
 
 const (
 	// DefaultAPIBaseURL is the default official xAI API base URL.
@@ -11,6 +15,8 @@ const (
 	// CLIChatProxyBaseURL is the Grok CLI chat-proxy base URL for non-image/video
 	// HTTP chat when auth using_api is false, including the OAuth default.
 	CLIChatProxyBaseURL = "https://cli-chat-proxy.grok.com/v1"
+	// CLIChatProxyBaseURLEnv overrides CLIChatProxyBaseURL.
+	CLIChatProxyBaseURLEnv = "XAI_CLI_CHAT_PROXY_BASE_URL"
 	// CLIBillingPath is the Grok CLI billing endpoint used for quota checks.
 	CLIBillingPath = "/billing"
 	// CLITokenAuthHeader identifies the Grok CLI token-auth scheme.
@@ -42,6 +48,19 @@ const (
 )
 
 var refreshLead = 5 * time.Minute
+
+// CLIChatProxyBaseURLFromEnv returns the configured Grok CLI chat-proxy base URL.
+func CLIChatProxyBaseURLFromEnv() string {
+	if baseURL := CLIChatProxyBaseURLOverride(); baseURL != "" {
+		return baseURL
+	}
+	return CLIChatProxyBaseURL
+}
+
+// CLIChatProxyBaseURLOverride returns the explicit environment override, if any.
+func CLIChatProxyBaseURLOverride() string {
+	return util.GetEnvTrimmed(CLIChatProxyBaseURLEnv, "xai_cli_chat_proxy_base_url")
+}
 
 // RefreshLead returns the refresh lead time for xAI OAuth credentials.
 func RefreshLead() time.Duration {

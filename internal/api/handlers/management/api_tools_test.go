@@ -551,7 +551,8 @@ func TestCleanupXAIAuthDeletesUnauthorizedOnly(t *testing.T) {
 	}
 }
 
-func TestCleanupXAIAuthUsesCLIBillingForDefaultOAuthBaseURL(t *testing.T) {
+func TestCleanupXAIAuthUsesConfiguredCLIBillingBaseURL(t *testing.T) {
+	t.Setenv(xaiauth.CLIChatProxyBaseURLEnv, "https://configured-cli-proxy.example/v1")
 	authDir := t.TempDir()
 	fileName := "xai-default-base.json"
 	filePath := filepath.Join(authDir, fileName)
@@ -562,8 +563,8 @@ func TestCleanupXAIAuthUsesCLIBillingForDefaultOAuthBaseURL(t *testing.T) {
 	var verifyRequests atomic.Int32
 	verifyServer := httptest.NewTLSServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		verifyRequests.Add(1)
-		if got := r.Host; got != "cli-chat-proxy.grok.com" {
-			t.Errorf("verify host = %q, want cli-chat-proxy.grok.com", got)
+		if got := r.Host; got != "configured-cli-proxy.example" {
+			t.Errorf("verify host = %q, want configured-cli-proxy.example", got)
 		}
 		if got := r.URL.Path; got != "/v1/billing" {
 			t.Errorf("verify path = %q, want /v1/billing", got)
@@ -593,7 +594,7 @@ func TestCleanupXAIAuthUsesCLIBillingForDefaultOAuthBaseURL(t *testing.T) {
 		Status:   coreauth.StatusActive,
 		Attributes: map[string]string{
 			"path":      filePath,
-			"base_url":  xaiauth.DefaultAPIBaseURL,
+			"base_url":  "https://credential-cli-proxy.example/v1",
 			"auth_kind": "oauth",
 		},
 		Metadata: map[string]any{

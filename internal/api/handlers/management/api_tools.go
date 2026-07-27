@@ -1049,6 +1049,9 @@ func (h *Handler) verifyXAIToken(ctx context.Context, auth *coreauth.Auth, token
 }
 
 func xaiCleanupBaseURL(auth *coreauth.Auth) string {
+	if baseURLOverride := xaiauth.CLIChatProxyBaseURLOverride(); baseURLOverride != "" {
+		return strings.TrimRight(baseURLOverride, "/")
+	}
 	baseURL := strings.TrimSpace(authAttribute(auth, "base_url"))
 	if baseURL == "" && auth != nil && auth.Metadata != nil {
 		if raw, ok := auth.Metadata["base_url"].(string); ok {
