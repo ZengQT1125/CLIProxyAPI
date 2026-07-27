@@ -14,13 +14,18 @@ import (
 
 func TestGetManagementPanelLatestVersion(t *testing.T) {
 	previous := getLatestManagementPanelRelease
-	getLatestManagementPanelRelease = func(context.Context, string) (managementasset.LatestRelease, error) {
+	getLatestManagementPanelRelease = func(_ context.Context, _ string, repositoryURL string) (managementasset.LatestRelease, error) {
+		if repositoryURL != "https://github.com/acme/panel" {
+			t.Fatalf("repository URL = %q", repositoryURL)
+		}
 		return managementasset.LatestRelease{Version: "v3.2.1"}, nil
 	}
 	t.Cleanup(func() { getLatestManagementPanelRelease = previous })
 
 	h := &Handler{
-		cfg:            &config.Config{},
+		cfg: &config.Config{RemoteManagement: config.RemoteManagement{
+			PanelGitHubRepository: "https://github.com/acme/panel",
+		}},
 		configFilePath: writeTestConfigFile(t),
 	}
 
@@ -46,16 +51,21 @@ func TestUpdateManagementPanelReportsInstalledRelease(t *testing.T) {
 	staticDir := t.TempDir()
 	t.Setenv("MANAGEMENT_STATIC_PATH", staticDir)
 	previous := updateLatestManagementPanelHTML
-	updateLatestManagementPanelHTML = func(_ context.Context, gotStaticDir string, _ string) (managementasset.UpdateResult, error) {
+	updateLatestManagementPanelHTML = func(_ context.Context, gotStaticDir string, _ string, repositoryURL string) (managementasset.UpdateResult, error) {
 		if gotStaticDir != staticDir {
 			t.Fatalf("static directory = %q, want %q", gotStaticDir, staticDir)
+		}
+		if repositoryURL != "https://github.com/acme/panel" {
+			t.Fatalf("repository URL = %q", repositoryURL)
 		}
 		return managementasset.UpdateResult{Updated: true, Version: "v3.2.1", SHA256: "test-hash"}, nil
 	}
 	t.Cleanup(func() { updateLatestManagementPanelHTML = previous })
 
 	h := &Handler{
-		cfg:            &config.Config{},
+		cfg: &config.Config{RemoteManagement: config.RemoteManagement{
+			PanelGitHubRepository: "https://github.com/acme/panel",
+		}},
 		configFilePath: writeTestConfigFile(t),
 	}
 

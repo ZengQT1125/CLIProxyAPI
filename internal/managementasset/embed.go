@@ -18,6 +18,7 @@ import (
 const (
 	PanelSourceEmbedded       = "embedded"
 	PanelSourceDisk           = "disk"
+	PanelSourceCustom         = "custom"
 	PanelSourceDevelopment    = "development"
 	managementPanelDevPathEnv = "MANAGEMENT_PANEL_DEV_PATH"
 )
@@ -41,12 +42,17 @@ type Panel struct {
 	Source   string
 }
 
-// LoadManagementPanel selects an explicit development override, a verified newer disk panel, or the embedded baseline.
+// LoadManagementPanel selects an explicit development override, a configured custom panel, a verified disk panel, or the embedded baseline.
 func LoadManagementPanel(configFilePath string) (Panel, error) {
 	if path := developmentPanelPath(); path != "" {
 		return loadDevelopmentManagementPanel(path)
 	}
-	return loadManagementPanel(StaticDir(configFilePath), buildinfo.Version)
+
+	staticDir := StaticDir(configFilePath)
+	if cfg := currentConfigPtr.Load(); cfg != nil && !isDefaultManagementRepository(cfg.RemoteManagement.PanelGitHubRepository) {
+		return loadCustomManagementPanel(staticDir)
+	}
+	return loadManagementPanel(staticDir, buildinfo.Version)
 }
 
 func developmentPanelPath() string {
@@ -67,6 +73,33 @@ func loadDevelopmentManagementPanel(path string) (Panel, error) {
 			Asset:   managementAssetName,
 		},
 		Source: PanelSourceDevelopment,
+	}, nil
+}
+
+func loadCustomManagementPanel(staticDir string) (Panel, error) {
+	baseline, err := loadEmbeddedManagementPanel()
+	if err != nil {
+		return Panel{}, err
+	}
+	if staticDir == "" {
+		return baseline, nil
+	}
+
+	data, err := readFileLimited(filepath.Join(staticDir, customManagementAssetFileName), maxAssetDownloadSize)
+	if err != nil {
+		if !os.IsNotExist(err) {
+			log.WithError(err).Warn("ignoring invalid custom management panel on disk")
+		}
+		return baseline, nil
+	}
+	return Panel{
+		HTML: data,
+		Manifest: Manifest{
+			Version: "custom",
+			SHA256:  sha256Hex(data),
+			Asset:   managementAssetName,
+		},
+		Source: PanelSourceCustom,
 	}, nil
 }
 

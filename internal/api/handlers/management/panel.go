@@ -23,6 +23,7 @@ func (h *Handler) GetManagementPanelLatestVersion(c *gin.Context) {
 	release, err := getLatestManagementPanelRelease(
 		c.Request.Context(),
 		h.cfg.ProxyURL,
+		h.cfg.RemoteManagement.PanelGitHubRepository,
 	)
 	if err != nil {
 		c.JSON(http.StatusBadGateway, gin.H{"error": "request_failed", "message": err.Error()})
@@ -53,6 +54,7 @@ func (h *Handler) UpdateManagementPanel(c *gin.Context) {
 		c.Request.Context(),
 		staticDir,
 		h.cfg.ProxyURL,
+		h.cfg.RemoteManagement.PanelGitHubRepository,
 	)
 	if err != nil {
 		c.JSON(http.StatusBadGateway, gin.H{"error": "update_failed", "message": err.Error()})

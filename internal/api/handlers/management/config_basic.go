@@ -115,7 +115,7 @@ func (h *Handler) PutConfigYAML(c *gin.Context) {
 		c.JSON(http.StatusBadRequest, gin.H{"error": "invalid_yaml", "message": "cannot read request body"})
 		return
 	}
-	body, err = config.RemoveUnsupportedPanelRepository(body)
+	body, err = config.RemoveLegacyPanelRepository(body)
 	if err != nil {
 		c.JSON(http.StatusBadRequest, gin.H{"error": "invalid_yaml", "message": err.Error()})
 		return
@@ -168,7 +168,7 @@ func (h *Handler) PutConfigYAML(c *gin.Context) {
 	c.JSON(http.StatusOK, gin.H{"ok": true, "changed": []string{"config"}})
 }
 
-// GetConfigYAML returns config.yaml without unsupported panel repository overrides.
+// GetConfigYAML returns config.yaml without the obsolete panel-repo setting.
 // Invalid YAML is returned unchanged so operators can repair it in the source editor.
 func (h *Handler) GetConfigYAML(c *gin.Context) {
 	data, err := os.ReadFile(h.configFilePath)
@@ -180,7 +180,7 @@ func (h *Handler) GetConfigYAML(c *gin.Context) {
 		c.JSON(http.StatusInternalServerError, gin.H{"error": "read_failed", "message": err.Error()})
 		return
 	}
-	if sanitized, errSanitize := config.RemoveUnsupportedPanelRepository(data); errSanitize == nil {
+	if sanitized, errSanitize := config.RemoveLegacyPanelRepository(data); errSanitize == nil {
 		data = sanitized
 	}
 	c.Header("Content-Type", "application/yaml; charset=utf-8")

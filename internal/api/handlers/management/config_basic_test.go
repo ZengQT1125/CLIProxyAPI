@@ -51,7 +51,7 @@ func TestPutRoutingStrategyAcceptsSequentialFillAlias(t *testing.T) {
 	}
 }
 
-func TestConfigYAMLRemovesUnsupportedPanelRepository(t *testing.T) {
+func TestConfigYAMLPreservesPanelRepository(t *testing.T) {
 	t.Setenv("MANAGEMENT_PASSWORD", "")
 	gin.SetMode(gin.TestMode)
 
@@ -73,8 +73,11 @@ func TestConfigYAMLRemovesUnsupportedPanelRepository(t *testing.T) {
 	if getRecorder.Code != http.StatusOK {
 		t.Fatalf("GetConfigYAML status = %d, want %d with body %s", getRecorder.Code, http.StatusOK, getRecorder.Body.String())
 	}
-	if strings.Contains(getRecorder.Body.String(), "panel-github-repository") || strings.Contains(getRecorder.Body.String(), "panel-repo") {
-		t.Fatalf("GetConfigYAML still exposes a panel repository setting:\n%s", getRecorder.Body.String())
+	if !strings.Contains(getRecorder.Body.String(), "panel-github-repository: https://github.com/acme/incompatible-panel") {
+		t.Fatalf("GetConfigYAML lost the supported panel repository:\n%s", getRecorder.Body.String())
+	}
+	if strings.Contains(getRecorder.Body.String(), "panel-repo:") {
+		t.Fatalf("GetConfigYAML retained the legacy panel repository key:\n%s", getRecorder.Body.String())
 	}
 
 	putRecorder := httptest.NewRecorder()
@@ -88,10 +91,16 @@ func TestConfigYAMLRemovesUnsupportedPanelRepository(t *testing.T) {
 	if errRead != nil {
 		t.Fatalf("failed to read persisted config: %v", errRead)
 	}
-	if strings.Contains(string(persisted), "panel-github-repository") || strings.Contains(string(persisted), "panel-repo") {
-		t.Fatalf("PutConfigYAML persisted a panel repository setting:\n%s", persisted)
+	if !strings.Contains(string(persisted), "panel-github-repository: https://github.com/acme/incompatible-panel") {
+		t.Fatalf("PutConfigYAML lost the supported panel repository:\n%s", persisted)
+	}
+	if strings.Contains(string(persisted), "panel-repo:") {
+		t.Fatalf("PutConfigYAML persisted the legacy panel repository key:\n%s", persisted)
 	}
 	if !strings.Contains(string(persisted), "allow-remote: true") {
 		t.Fatalf("PutConfigYAML lost supported remote management settings:\n%s", persisted)
+	}
+	if got := h.cfg.RemoteManagement.PanelGitHubRepository; got != "https://github.com/acme/incompatible-panel" {
+		t.Fatalf("handler panel repository = %q", got)
 	}
 }

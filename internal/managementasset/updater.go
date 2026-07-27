@@ -85,7 +85,7 @@ func runAutoUpdater(ctx context.Context, configFilePath string) {
 			log.Debugf("management asset auto-updater skipped: %s", reason)
 			return
 		}
-		EnsureLatestManagementHTML(ctx, StaticDir(configFilePath), cfg.ProxyURL)
+		EnsureLatestManagementHTML(ctx, StaticDir(configFilePath), cfg.ProxyURL, cfg.RemoteManagement.PanelGitHubRepository)
 	}
 
 	runOnce()
@@ -130,20 +130,34 @@ func normalizeManagementRepositoryURL(repositoryURL string) string {
 	if repositoryURL == "" {
 		return defaultManagementRepositoryURL
 	}
+	if len(repositoryURL) >= len(".git") && strings.EqualFold(repositoryURL[len(repositoryURL)-len(".git"):], ".git") {
+		repositoryURL = repositoryURL[:len(repositoryURL)-len(".git")]
+	}
 	return repositoryURL
+}
+
+func isDefaultManagementRepository(repositoryURL string) bool {
+	return strings.EqualFold(normalizeManagementRepositoryURL(repositoryURL), defaultManagementRepositoryURL)
 }
 
 func managementLatestManifestURL(repositoryURL string) string {
 	return normalizeManagementRepositoryURL(repositoryURL) + "/releases/latest/download/" + panelManifestFileName
 }
 
+func managementLatestAssetURL(repositoryURL string) string {
+	return normalizeManagementRepositoryURL(repositoryURL) + "/releases/latest/download/" + managementAssetName
+}
+
 func managementReleaseAssetURL(repositoryURL, version, asset string) string {
 	return normalizeManagementRepositoryURL(repositoryURL) + "/releases/download/" + url.PathEscape(strings.TrimSpace(version)) + "/" + url.PathEscape(strings.TrimSpace(asset))
 }
 
-// GetLatestRelease returns metadata from the latest small panel manifest without downloading HTML.
-func GetLatestRelease(ctx context.Context, proxyURL string) (LatestRelease, error) {
-	return getLatestRelease(ctx, newHTTPClient(proxyURL), defaultManagementRepositoryURL)
+// GetLatestRelease returns the configured panel release metadata.
+func GetLatestRelease(ctx context.Context, proxyURL, repositoryURL string) (LatestRelease, error) {
+	if !isDefaultManagementRepository(repositoryURL) {
+		return LatestRelease{Version: "custom"}, nil
+	}
+	return getLatestRelease(ctx, newHTTPClient(proxyURL), repositoryURL)
 }
 
 func getLatestRelease(ctx context.Context, client *http.Client, repositoryURL string) (LatestRelease, error) {
@@ -154,9 +168,13 @@ func getLatestRelease(ctx context.Context, client *http.Client, repositoryURL st
 	return LatestRelease{Version: manifest.Version}, nil
 }
 
-// UpdateLatestManagementHTML checks and installs a newer compatible verified panel release.
-func UpdateLatestManagementHTML(ctx context.Context, staticDir string, proxyURL string) (UpdateResult, error) {
-	return updateLatestManagementHTML(ctx, staticDir, newHTTPClient(proxyURL), defaultManagementRepositoryURL, buildinfo.Version)
+// UpdateLatestManagementHTML updates the configured management panel release.
+func UpdateLatestManagementHTML(ctx context.Context, staticDir, proxyURL, repositoryURL string) (UpdateResult, error) {
+	client := newHTTPClient(proxyURL)
+	if !isDefaultManagementRepository(repositoryURL) {
+		return updateCustomManagementHTML(ctx, staticDir, client, repositoryURL)
+	}
+	return updateLatestManagementHTML(ctx, staticDir, client, repositoryURL, buildinfo.Version)
 }
 
 func updateLatestManagementHTML(ctx context.Context, staticDir string, client *http.Client, repositoryURL, cliVersion string) (UpdateResult, error) {
@@ -208,8 +226,30 @@ func updateLatestManagementHTML(ctx context.Context, staticDir string, client *h
 	return result, nil
 }
 
+func updateCustomManagementHTML(ctx context.Context, staticDir string, client *http.Client, repositoryURL string) (UpdateResult, error) {
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	staticDir = strings.TrimSpace(staticDir)
+	if staticDir == "" {
+		return UpdateResult{}, fmt.Errorf("empty static directory")
+	}
+
+	data, downloadedHash, err := downloadAsset(ctx, client, managementLatestAssetURL(repositoryURL))
+	if err != nil {
+		return UpdateResult{}, err
+	}
+	if err = installCustomManagementPanel(staticDir, data); err != nil {
+		return UpdateResult{}, err
+	}
+
+	result := UpdateResult{Updated: true, Version: "custom", SHA256: downloadedHash}
+	log.Infof("custom management panel updated (sha256=%s)", downloadedHash)
+	return result, nil
+}
+
 // EnsureLatestManagementHTML coalesces and throttles automatic update checks.
-func EnsureLatestManagementHTML(ctx context.Context, staticDir string, proxyURL string) {
+func EnsureLatestManagementHTML(ctx context.Context, staticDir, proxyURL, repositoryURL string) {
 	staticDir = strings.TrimSpace(staticDir)
 	if staticDir == "" {
 		log.Debug("management asset sync skipped: empty static directory")
@@ -227,7 +267,7 @@ func EnsureLatestManagementHTML(ctx context.Context, staticDir string, proxyURL 
 		lastUpdateCheckTime = now
 		lastUpdateCheckMu.Unlock()
 
-		return UpdateLatestManagementHTML(ctx, staticDir, proxyURL)
+		return UpdateLatestManagementHTML(ctx, staticDir, proxyURL, repositoryURL)
 	})
 	if err != nil {
 		log.WithError(err).Warn("management panel update check failed; keeping verified active panel")
@@ -295,6 +335,16 @@ func installDiskManagementPanel(staticDir string, manifest Manifest, data []byte
 		return fmt.Errorf("activate management panel manifest: %w", err)
 	}
 	cleanupOldPanelAssets(staticDir, filepath.Base(assetPath))
+	return nil
+}
+
+func installCustomManagementPanel(staticDir string, data []byte) error {
+	if err := os.MkdirAll(staticDir, 0o755); err != nil {
+		return fmt.Errorf("prepare custom management panel directory: %w", err)
+	}
+	if err := atomicWriteFile(filepath.Join(staticDir, customManagementAssetFileName), data); err != nil {
+		return fmt.Errorf("write custom management panel asset: %w", err)
+	}
 	return nil
 }
 

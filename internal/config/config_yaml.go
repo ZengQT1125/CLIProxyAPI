@@ -81,9 +81,8 @@ func SaveConfigPreserveComments(configFile string, cfg *Config) error {
 	return err
 }
 
-// RemoveUnsupportedPanelRepository removes panel repository overrides from a YAML payload.
-// This fork only supports its bundled management panel source.
-func RemoveUnsupportedPanelRepository(data []byte) ([]byte, error) {
+// RemoveLegacyPanelRepository removes the obsolete panel-repo key from a YAML payload.
+func RemoveLegacyPanelRepository(data []byte) ([]byte, error) {
 	var root yaml.Node
 	if err := yaml.Unmarshal(data, &root); err != nil {
 		return nil, err
@@ -91,7 +90,7 @@ func RemoveUnsupportedPanelRepository(data []byte) ([]byte, error) {
 	if root.Kind != yaml.DocumentNode || len(root.Content) == 0 || root.Content[0] == nil {
 		return data, nil
 	}
-	if !removeUnsupportedPanelRepositoryKeys(root.Content[0]) {
+	if !removeLegacyPanelRepositoryKey(root.Content[0]) {
 		return data, nil
 	}
 
@@ -823,10 +822,10 @@ func removeRemovedIntegrationKeys(root *yaml.Node) {
 	removeMapKey(root, "amp-upstream-api-key")
 	removeMapKey(root, "amp-restrict-management-to-localhost")
 	removeMapKey(root, "amp-model-mappings")
-	removeUnsupportedPanelRepositoryKeys(root)
+	removeLegacyPanelRepositoryKey(root)
 }
 
-func removeUnsupportedPanelRepositoryKeys(root *yaml.Node) bool {
+func removeLegacyPanelRepositoryKey(root *yaml.Node) bool {
 	if root == nil || root.Kind != yaml.MappingNode {
 		return false
 	}
@@ -838,8 +837,7 @@ func removeUnsupportedPanelRepositoryKeys(root *yaml.Node) bool {
 	if remoteManagement == nil || remoteManagement.Kind != yaml.MappingNode {
 		return false
 	}
-	removed := findMapKeyIndex(remoteManagement, "panel-github-repository") >= 0 || findMapKeyIndex(remoteManagement, "panel-repo") >= 0
-	removeMapKey(remoteManagement, "panel-github-repository")
+	removed := findMapKeyIndex(remoteManagement, "panel-repo") >= 0
 	removeMapKey(remoteManagement, "panel-repo")
 	return removed
 }

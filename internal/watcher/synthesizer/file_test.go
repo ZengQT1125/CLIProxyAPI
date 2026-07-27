@@ -791,4 +791,3 @@ func TestSynthesizeAuthFileAgentIdentityAuthKind(t *testing.T) {
 		t.Fatalf("AuthKind() = %q, want %q", got, coreauth.AuthKindAgentIdentity)
 	}
 }
-

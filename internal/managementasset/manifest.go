@@ -11,8 +11,9 @@ import (
 )
 
 const (
-	managementAssetName   = "management.html"
-	panelManifestFileName = "panel-manifest.json"
+	managementAssetName           = "management.html"
+	customManagementAssetFileName = "management.custom.html"
+	panelManifestFileName         = "panel-manifest.json"
 )
 
 // ManagementFileName exposes the control panel release asset filename.

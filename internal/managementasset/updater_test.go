@@ -11,6 +11,7 @@ import (
 	"path/filepath"
 	"sync/atomic"
 	"testing"
+	"time"
 
 	"github.com/router-for-me/CLIProxyAPI/v7/internal/config"
 )
@@ -62,6 +63,62 @@ func TestDefaultManagementRepositoryTargetsForkManifest(t *testing.T) {
 	}
 	if got := managementReleaseAssetURL(defaultManagementRepositoryURL, "v1.58.0", ManagementFileName); got != wantAssetURL {
 		t.Fatalf("asset URL = %q, want %q", got, wantAssetURL)
+	}
+}
+
+func TestEnsureLatestManagementHTMLDownloadsCustomPanelWithoutManifest(t *testing.T) {
+	staticDir := t.TempDir()
+	t.Setenv("MANAGEMENT_STATIC_PATH", staticDir)
+	t.Setenv("MANAGEMENT_PANEL_DEV_PATH", "")
+
+	previousConfig := currentConfigPtr.Load()
+	t.Cleanup(func() { SetCurrentConfig(previousConfig) })
+	lastUpdateCheckMu.Lock()
+	previousCheckTime := lastUpdateCheckTime
+	lastUpdateCheckTime = time.Time{}
+	lastUpdateCheckMu.Unlock()
+	t.Cleanup(func() {
+		lastUpdateCheckMu.Lock()
+		lastUpdateCheckTime = previousCheckTime
+		lastUpdateCheckMu.Unlock()
+	})
+
+	var assetRequests atomic.Int32
+	var manifestRequests atomic.Int32
+	releaseServer := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch r.URL.Path {
+		case "/acme/panel/releases/latest/download/management.html":
+			assetRequests.Add(1)
+			_, _ = w.Write([]byte("<!doctype html><title>custom panel</title>"))
+		case "/acme/panel/releases/latest/download/panel-manifest.json":
+			manifestRequests.Add(1)
+			http.Error(w, "custom panels do not use manifests", http.StatusNotFound)
+		default:
+			http.NotFound(w, r)
+		}
+	}))
+	defer releaseServer.Close()
+
+	repositoryURL := releaseServer.URL + "/acme/panel"
+	SetCurrentConfig(&config.Config{RemoteManagement: config.RemoteManagement{PanelGitHubRepository: repositoryURL}})
+	EnsureLatestManagementHTML(context.Background(), staticDir, "", repositoryURL)
+
+	if got := assetRequests.Load(); got != 1 {
+		t.Fatalf("custom repository asset requests = %d, want 1", got)
+	}
+	if got := manifestRequests.Load(); got != 0 {
+		t.Fatalf("custom repository manifest requests = %d, want 0", got)
+	}
+	if _, err := os.Stat(filepath.Join(staticDir, panelManifestFileName)); !os.IsNotExist(err) {
+		t.Fatalf("custom panel manifest exists: %v", err)
+	}
+
+	panel, err := LoadManagementPanel(filepath.Join(t.TempDir(), "config.yaml"))
+	if err != nil {
+		t.Fatalf("LoadManagementPanel() error = %v", err)
+	}
+	if panel.Source != "custom" || string(panel.HTML) != "<!doctype html><title>custom panel</title>" {
+		t.Fatalf("custom panel = source %q, HTML %q", panel.Source, panel.HTML)
 	}
 }
 

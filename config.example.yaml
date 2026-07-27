@@ -26,8 +26,12 @@ remote-management:
   disable-control-panel: false
 
   # Disable automatic periodic background updates of the management panel from GitHub (default: false).
-  # When enabled, the panel is only downloaded on first access if missing, and never auto-updated afterward.
+  # When enabled, newer panels can only be installed through a manual management API update.
   # disable-auto-update-panel: false
+
+  # GitHub repository used for management panel updates.
+  # Custom repositories download releases/latest/download/management.html without a manifest.
+  # panel-github-repository: "https://github.com/caidaoli/Cli-Proxy-API-Management-Center"
 
 # Authentication directory (supports ~ for home directory)
 auth-dir: "~/.cli-proxy-api"

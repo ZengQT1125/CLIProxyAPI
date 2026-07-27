@@ -181,8 +181,11 @@ type RemoteManagement struct {
 	// DisableControlPanel skips serving and syncing the bundled management UI when true.
 	DisableControlPanel bool `yaml:"disable-control-panel"`
 	// DisableAutoUpdatePanel disables automatic periodic background updates of the management panel asset from GitHub.
-	// When false (the default), the background updater remains enabled; when true, the panel is only downloaded on first access if missing.
+	// When true, newer panels can only be installed through a manual management API update.
 	DisableAutoUpdatePanel bool `yaml:"disable-auto-update-panel"`
+	// PanelGitHubRepository selects the repository used by management panel update operations.
+	// Custom repositories download their latest management.html release asset without a manifest.
+	PanelGitHubRepository string `yaml:"panel-github-repository,omitempty"`
 }
 
 // QuotaExceeded defines the behavior when API quota limits are exceeded.
