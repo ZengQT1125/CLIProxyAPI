@@ -77,6 +77,9 @@ type Auth struct {
 	Quota QuotaState `json:"quota"`
 	// LastError stores the last failure encountered while executing or refreshing.
 	LastError *Error `json:"last_error,omitempty"`
+	// LastRequestError stores the latest execution failure for observability only.
+	// It does not participate in credential availability or cooldown decisions.
+	LastRequestError *RequestErrorSnapshot `json:"-"`
 	// CreatedAt is the creation timestamp in UTC.
 	CreatedAt time.Time `json:"created_at"`
 	// UpdatedAt is the last modification timestamp in UTC.
@@ -98,6 +101,14 @@ type Auth struct {
 
 	recentRequests recentRequestRing `json:"-"`
 	indexAssigned  bool              `json:"-"`
+}
+
+// RequestErrorSnapshot is an observational snapshot of the latest failed execution.
+type RequestErrorSnapshot struct {
+	Message    string    `json:"message"`
+	Code       string    `json:"code,omitempty"`
+	HTTPStatus int       `json:"status_code,omitempty"`
+	Timestamp  time.Time `json:"timestamp"`
 }
 
 const (
@@ -281,6 +292,10 @@ func (a *Auth) Clone() *Auth {
 		for key, state := range a.ModelStates {
 			copyAuth.ModelStates[key] = state.Clone()
 		}
+	}
+	if a.LastRequestError != nil {
+		lastRequestError := *a.LastRequestError
+		copyAuth.LastRequestError = &lastRequestError
 	}
 	copyAuth.Runtime = a.Runtime
 	return &copyAuth

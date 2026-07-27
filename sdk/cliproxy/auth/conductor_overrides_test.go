@@ -1585,6 +1585,15 @@ func TestManager_MarkResult_RequestScopedNotFoundDoesNotCooldownAuth(t *testing.
 	if state := updated.ModelStates[model]; state != nil {
 		t.Fatalf("expected request-scoped 404 to avoid model cooldown state, got %#v", state)
 	}
+	if updated.LastRequestError == nil {
+		t.Fatal("expected request-scoped 404 to retain the latest request error")
+	}
+	if got := updated.LastRequestError.Message; got != requestScopedNotFoundMessage {
+		t.Fatalf("last request error = %q, want %q", got, requestScopedNotFoundMessage)
+	}
+	if got := updated.LastRequestError.HTTPStatus; got != http.StatusNotFound {
+		t.Fatalf("last request error status = %d, want %d", got, http.StatusNotFound)
+	}
 }
 
 func TestManager_ExecuteCount_GenericRouteNotFoundDoesNotSuspendModel(t *testing.T) {

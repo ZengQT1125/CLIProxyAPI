@@ -419,6 +419,9 @@ func (h *Handler) buildAuthFileEntryLocked(auth *coreauth.Auth) gin.H {
 	}
 	entry["success"] = auth.Success
 	entry["failed"] = auth.Failed
+	if auth.LastRequestError != nil {
+		entry["last_request_error"] = auth.LastRequestError
+	}
 	if email := authEmail(auth); email != "" {
 		entry["email"] = email
 	}

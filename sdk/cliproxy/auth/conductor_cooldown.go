@@ -930,6 +930,7 @@ func (m *Manager) MarkResult(ctx context.Context, result Result) {
 			auth.Success++
 		} else {
 			auth.Failed++
+			auth.LastRequestError = newRequestErrorSnapshot(result.Error, now)
 		}
 
 		if deleteUnauthorized {
@@ -1451,6 +1452,22 @@ func cloneError(err *Error) *Error {
 		Retryable:  err.Retryable,
 		HTTPStatus: err.HTTPStatus,
 	}
+}
+
+func newRequestErrorSnapshot(err *Error, timestamp time.Time) *RequestErrorSnapshot {
+	snapshot := &RequestErrorSnapshot{
+		Message:   "request failed",
+		Timestamp: timestamp,
+	}
+	if err == nil {
+		return snapshot
+	}
+	if message := strings.TrimSpace(err.Message); message != "" {
+		snapshot.Message = message
+	}
+	snapshot.Code = strings.TrimSpace(err.Code)
+	snapshot.HTTPStatus = err.HTTPStatus
+	return snapshot
 }
 
 func errorString(err error) string {
