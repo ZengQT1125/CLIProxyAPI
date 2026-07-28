@@ -9,7 +9,6 @@ import (
 	"syscall"
 
 	log "github.com/sirupsen/logrus"
-	"gopkg.in/yaml.v3"
 )
 
 // LoadConfig reads a YAML configuration file from the given path,
@@ -28,7 +27,8 @@ func LoadConfig(configFile string) (*Config, error) {
 
 // LoadConfigOptional reads YAML from configFile.
 // If optional is true and the file is missing, it returns an empty Config.
-// If optional is true and the file is empty or invalid, it returns an empty Config.
+// If optional is true and the file is empty or structurally invalid, it returns an empty Config.
+// Field type mismatches are always logged and skipped while valid values are retained.
 func LoadConfigOptional(configFile string, optional bool) (*Config, error) {
 	// Read the entire configuration file into memory.
 	data, err := os.ReadFile(configFile)
@@ -81,9 +81,9 @@ func LoadConfigOptional(configFile string, optional bool) (*Config, error) {
 	cfg.Pprof.Addr = DefaultPprofAddr
 	cfg.AuthLoadWorkers = DefaultAuthLoadWorkers
 	cfg.CredentialInFlight = DefaultCredentialInFlightConfig()
-	if err = yaml.Unmarshal(data, &cfg); err != nil {
+	if err = unmarshalConfigYAML(data, &cfg); err != nil {
 		if optional {
-			// In cloud deploy mode, if YAML parsing fails, return empty config instead of error.
+			// In cloud deploy mode, if YAML syntax or structure parsing fails, return empty config instead of error.
 			cfgOptional := &Config{CredentialInFlight: DefaultCredentialInFlightConfig()}
 			cfgOptional.normalizeAuthLoadWorkers()
 			cfgOptional.NormalizePluginsConfig()

@@ -6,7 +6,6 @@ import (
 
 	log "github.com/sirupsen/logrus"
 	"golang.org/x/crypto/bcrypt"
-	"gopkg.in/yaml.v3"
 )
 
 // ParseConfigBytes parses a YAML configuration payload into Config and applies the same
@@ -38,7 +37,7 @@ func ParseConfigBytes(data []byte) (*Config, error) {
 	cfg.AuthLoadWorkers = DefaultAuthLoadWorkers
 	cfg.CredentialInFlight = DefaultCredentialInFlightConfig()
 
-	if err := yaml.Unmarshal(data, &cfg); err != nil {
+	if err := unmarshalConfigYAML(data, &cfg); err != nil {
 		return nil, fmt.Errorf("parse config payload: %w", err)
 	}
 
