@@ -8,6 +8,7 @@ import (
 	"os"
 	"path/filepath"
 	"regexp"
+	"sort"
 	"strconv"
 	"strings"
 	"sync"
@@ -23,6 +24,13 @@ import (
 )
 
 var lastRefreshKeys = []string{"last_refresh", "lastRefresh", "last_refreshed_at", "lastRefreshedAt"}
+
+type authFileCooldown struct {
+	Model          string    `json:"model,omitempty"`
+	Status         string    `json:"status"`
+	Reason         string    `json:"reason,omitempty"`
+	NextRetryAfter time.Time `json:"next_retry_after"`
+}
 
 var (
 	callbackForwardersMu  sync.Mutex
@@ -449,6 +457,7 @@ func (h *Handler) buildAuthFileEntryLocked(auth *coreauth.Auth) gin.H {
 	if !auth.NextRetryAfter.IsZero() {
 		entry["next_retry_after"] = auth.NextRetryAfter
 	}
+	entry["cooldowns"] = activeAuthFileCooldowns(auth, time.Now())
 	if path != "" {
 		entry["path"] = path
 		entry["source"] = "file"
@@ -474,6 +483,48 @@ func (h *Handler) buildAuthFileEntryLocked(auth *coreauth.Auth) gin.H {
 		entry["websockets"] = websockets
 	}
 	return entry
+}
+
+func activeAuthFileCooldowns(auth *coreauth.Auth, now time.Time) []authFileCooldown {
+	if auth == nil {
+		return nil
+	}
+	cooldowns := make([]authFileCooldown, 0, len(auth.ModelStates))
+	for model, state := range auth.ModelStates {
+		if state == nil || state.Status == coreauth.StatusDisabled || !state.Unavailable || !state.NextRetryAfter.After(now) {
+			continue
+		}
+		cooldowns = append(cooldowns, authFileCooldown{
+			Model:          strings.TrimSpace(model),
+			Status:         "cooling",
+			Reason:         authFileCooldownReason(state.Quota, state.LastError),
+			NextRetryAfter: state.NextRetryAfter,
+		})
+	}
+	if len(cooldowns) == 0 && auth.Status != coreauth.StatusDisabled && auth.Unavailable && auth.NextRetryAfter.After(now) {
+		cooldowns = append(cooldowns, authFileCooldown{
+			Status:         "cooling",
+			Reason:         authFileCooldownReason(auth.Quota, auth.LastError),
+			NextRetryAfter: auth.NextRetryAfter,
+		})
+	}
+	sort.Slice(cooldowns, func(i, j int) bool {
+		if cooldowns[i].NextRetryAfter.Equal(cooldowns[j].NextRetryAfter) {
+			return cooldowns[i].Model < cooldowns[j].Model
+		}
+		return cooldowns[i].NextRetryAfter.Before(cooldowns[j].NextRetryAfter)
+	})
+	return cooldowns
+}
+
+func authFileCooldownReason(quota coreauth.QuotaState, lastErr *coreauth.Error) string {
+	if reason := strings.TrimSpace(quota.Reason); reason != "" {
+		return reason
+	}
+	if lastErr != nil {
+		return strings.TrimSpace(lastErr.Code)
+	}
+	return ""
 }
 
 func authWebsocketsValue(auth *coreauth.Auth) (bool, bool) {

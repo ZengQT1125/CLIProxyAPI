@@ -265,6 +265,100 @@ func TestListAuthFiles_Paginated(t *testing.T) {
 	}
 }
 
+func TestListAuthFiles_ReportsActiveCooldowns(t *testing.T) {
+	manager := coreauth.NewManager(nil, nil, nil)
+	authDir := t.TempDir()
+	now := time.Now()
+	auth := &coreauth.Auth{
+		ID:       "cooling.json",
+		FileName: "cooling.json",
+		Provider: "codex",
+		Attributes: map[string]string{
+			"path": filepath.Join(authDir, "cooling.json"),
+		},
+		ModelStates: map[string]*coreauth.ModelState{
+			"gpt-active": {
+				Status:         coreauth.StatusError,
+				StatusMessage:  "quota exhausted",
+				Unavailable:    true,
+				NextRetryAfter: now.Add(time.Hour),
+				Quota:          coreauth.QuotaState{Exceeded: true, Reason: "quota", NextRecoverAt: now.Add(time.Hour)},
+			},
+			"gpt-expired": {
+				Status:         coreauth.StatusError,
+				Unavailable:    true,
+				NextRetryAfter: now.Add(-time.Hour),
+			},
+			"gpt-ready": {
+				Status:      coreauth.StatusActive,
+				Unavailable: false,
+			},
+		},
+	}
+	if _, errRegister := manager.Register(context.Background(), auth); errRegister != nil {
+		t.Fatal(errRegister)
+	}
+	readyAuth := &coreauth.Auth{
+		ID:       "ready.json",
+		FileName: "ready.json",
+		Provider: "codex",
+		Attributes: map[string]string{
+			"path": filepath.Join(authDir, "ready.json"),
+		},
+	}
+	if _, errRegister := manager.Register(context.Background(), readyAuth); errRegister != nil {
+		t.Fatal(errRegister)
+	}
+
+	h := NewHandlerWithoutConfigFilePath(&config.Config{AuthDir: authDir}, manager)
+	recorder := httptest.NewRecorder()
+	ginCtx, _ := gin.CreateTestContext(recorder)
+	ginCtx.Request = httptest.NewRequest(http.MethodGet, "/v0/management/auth-files?page=1&page_size=12", nil)
+	h.ListAuthFiles(ginCtx)
+
+	if recorder.Code != http.StatusOK {
+		t.Fatalf("status = %d, body = %s", recorder.Code, recorder.Body.String())
+	}
+	var response struct {
+		Files []struct {
+			Name      string `json:"name"`
+			Cooldowns []struct {
+				Model          string    `json:"model"`
+				Status         string    `json:"status"`
+				Reason         string    `json:"reason"`
+				NextRetryAfter time.Time `json:"next_retry_after"`
+			} `json:"cooldowns"`
+		} `json:"files"`
+	}
+	if errDecode := json.Unmarshal(recorder.Body.Bytes(), &response); errDecode != nil {
+		t.Fatal(errDecode)
+	}
+	if len(response.Files) != 2 {
+		t.Fatalf("unexpected cooldown response: %s", recorder.Body.String())
+	}
+	filesByName := make(map[string]int, len(response.Files))
+	for i := range response.Files {
+		filesByName[response.Files[i].Name] = i
+	}
+	coolingIndex, okCooling := filesByName["cooling.json"]
+	readyIndex, okReady := filesByName["ready.json"]
+	if !okCooling || !okReady {
+		t.Fatalf("missing auth file entry: %s", recorder.Body.String())
+	}
+	cooling := response.Files[coolingIndex]
+	ready := response.Files[readyIndex]
+	if len(cooling.Cooldowns) != 1 || ready.Cooldowns == nil || len(ready.Cooldowns) != 0 {
+		t.Fatalf("unexpected cooldown response: %s", recorder.Body.String())
+	}
+	cooldown := cooling.Cooldowns[0]
+	if cooldown.Model != "gpt-active" || cooldown.Status != "cooling" || cooldown.Reason != "quota" {
+		t.Fatalf("cooldown = %#v", cooldown)
+	}
+	if !cooldown.NextRetryAfter.After(now) {
+		t.Fatalf("next retry = %v, want after %v", cooldown.NextRetryAfter, now)
+	}
+}
+
 func TestListAuthFiles_PaginatedMaxIntPage(t *testing.T) {
 	maxInt := int(^uint(0) >> 1)
 	manager := coreauth.NewManager(nil, nil, nil)
