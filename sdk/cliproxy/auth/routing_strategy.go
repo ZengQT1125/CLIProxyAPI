@@ -5,6 +5,8 @@ import "strings"
 const (
 	// RoutingStrategyRoundRobin rotates across ready credentials.
 	RoutingStrategyRoundRobin = "round-robin"
+	// RoutingStrategyWeightedRoundRobin rotates credentials according to their configured weights.
+	RoutingStrategyWeightedRoundRobin = "weighted-round-robin"
 	// RoutingStrategyFillFirst burns the first ready credential before moving on.
 	RoutingStrategyFillFirst = "fill-first"
 	// RoutingStrategySequentialFill sticks to the current credential until it becomes unavailable.
@@ -16,6 +18,8 @@ func NormalizeRoutingStrategy(strategy string) (string, bool) {
 	switch strings.ToLower(strings.TrimSpace(strategy)) {
 	case "", RoutingStrategyRoundRobin, "roundrobin", "rr":
 		return RoutingStrategyRoundRobin, true
+	case RoutingStrategyWeightedRoundRobin, "weightedroundrobin", "wrr":
+		return RoutingStrategyWeightedRoundRobin, true
 	case RoutingStrategyFillFirst, "fillfirst", "ff":
 		return RoutingStrategyFillFirst, true
 	case RoutingStrategySequentialFill, "sequentialfill", "sf":
@@ -33,6 +37,8 @@ func SelectorForRoutingStrategy(strategy string) Selector {
 		normalized = RoutingStrategyRoundRobin
 	}
 	switch normalized {
+	case RoutingStrategyWeightedRoundRobin:
+		return &WeightedRoundRobinSelector{}
 	case RoutingStrategyFillFirst:
 		return &FillFirstSelector{}
 	case RoutingStrategySequentialFill:

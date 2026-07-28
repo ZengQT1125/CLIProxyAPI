@@ -42,8 +42,7 @@ func normalizedRoutingRuntimeState(cfg *config.Config) routingRuntimeState {
 	}
 
 	// Reuse the shared normalizer so aliases (rr/ff/sf) stay in lockstep with
-	// SelectorForRoutingStrategy and the management API — do not re-handroll
-	// a partial switch here (that previously dropped sequential-fill entirely).
+	// SelectorForRoutingStrategy and the management API.
 	if normalized, ok := coreauth.NormalizeRoutingStrategy(cfg.Routing.Strategy); ok {
 		state.strategy = normalized
 	}
@@ -91,6 +90,10 @@ func (s *Service) commitConfigUpdate(newCfg *config.Config) configCommit {
 		s.cfgMu.RUnlock()
 	}
 	if newCfg == nil {
+		return configCommit{}
+	}
+	if errValidate := newCfg.ValidateCredentialWeights(); errValidate != nil {
+		log.WithError(errValidate).Warn("rejected config update with invalid credential weights")
 		return configCommit{}
 	}
 

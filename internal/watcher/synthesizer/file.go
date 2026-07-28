@@ -14,6 +14,7 @@ import (
 	"github.com/router-for-me/CLIProxyAPI/v7/internal/config"
 	coreauth "github.com/router-for-me/CLIProxyAPI/v7/sdk/cliproxy/auth"
 	"github.com/router-for-me/CLIProxyAPI/v7/sdk/pluginapi"
+	log "github.com/sirupsen/logrus"
 )
 
 // FileSynthesizer generates Auth entries from OAuth JSON files.
@@ -51,7 +52,11 @@ func (s *FileSynthesizer) Synthesize(ctx *SynthesisContext) ([]*coreauth.Auth, e
 		if errRead != nil || len(data) == 0 {
 			continue
 		}
-		auths := SynthesizeAuthFile(ctx, full, data)
+		auths, errSynthesize := SynthesizeAuthFile(ctx, full, data)
+		if errSynthesize != nil {
+			log.WithError(errSynthesize).Warnf("skipping auth file %s", name)
+			continue
+		}
 		if len(auths) == 0 {
 			continue
 		}
@@ -68,15 +73,16 @@ type NativeAuthFileResult struct {
 
 // SynthesizeAuthFile generates Auth entries for one auth JSON file payload.
 // It shares exactly the same mapping behavior as FileSynthesizer.Synthesize.
-func SynthesizeAuthFile(ctx *SynthesisContext, fullPath string, data []byte) []*coreauth.Auth {
-	if auths, handled, errPlugin := SynthesizePluginAuthFile(ctx, fullPath, data); errPlugin == nil && handled {
-		return auths
+func SynthesizeAuthFile(ctx *SynthesisContext, fullPath string, data []byte) ([]*coreauth.Auth, error) {
+	auths, handled, errPlugin := SynthesizePluginAuthFile(ctx, fullPath, data)
+	if errPlugin == nil && handled {
+		return auths, nil
 	}
 	result, errNative := SynthesizeNativeAuthFile(ctx, fullPath, data)
 	if errNative != nil {
-		return nil
+		return nil, errNative
 	}
-	return result.Auths
+	return result.Auths, nil
 }
 
 // resolveFileAuthKind decides the shared auth_kind for a synthesized file credential.
@@ -111,12 +117,18 @@ func SynthesizeNativeAuthFile(ctx *SynthesisContext, fullPath string, data []byt
 	if errUnmarshal := json.Unmarshal(data, &metadata); errUnmarshal != nil {
 		return NativeAuthFileResult{}, fmt.Errorf("parse auth file: %w", errUnmarshal)
 	}
+	if errWeight := coreauth.ValidateAuthWeight(&coreauth.Auth{Metadata: metadata}); errWeight != nil {
+		return NativeAuthFileResult{}, fmt.Errorf("invalid weight in %s: %w", filepath.Base(fullPath), errWeight)
+	}
 	t, _ := metadata["type"].(string)
 	provider := strings.ToLower(strings.TrimSpace(t))
 	if provider == "gemini" {
 		provider = "gemini-cli"
 	}
-	auths := synthesizeNativeFileAuths(ctx, fullPath, metadata, provider)
+	auths, errSynthesize := synthesizeNativeFileAuths(ctx, fullPath, metadata, provider)
+	if errSynthesize != nil {
+		return NativeAuthFileResult{}, errSynthesize
+	}
 	return NativeAuthFileResult{Provider: provider, Auths: auths}, nil
 }
 
@@ -128,6 +140,9 @@ func SynthesizePluginAuthFile(ctx *SynthesisContext, fullPath string, data []byt
 	var metadata map[string]any
 	if errUnmarshal := json.Unmarshal(data, &metadata); errUnmarshal != nil {
 		return nil, false, fmt.Errorf("parse plugin auth file: %w", errUnmarshal)
+	}
+	if errWeight := coreauth.ValidateAuthWeight(&coreauth.Auth{Metadata: metadata}); errWeight != nil {
+		return nil, false, fmt.Errorf("invalid weight in %s: %w", filepath.Base(fullPath), errWeight)
 	}
 	t, _ := metadata["type"].(string)
 	provider := strings.ToLower(strings.TrimSpace(t))
@@ -143,12 +158,16 @@ func SynthesizePluginAuthFile(ctx *SynthesisContext, fullPath string, data []byt
 	if errParse != nil || !handled {
 		return nil, handled, errParse
 	}
-	return decoratePluginFileAuths(ctx, fullPath, metadata, compactPluginAuths(auths)), true, nil
+	decorated, errDecorate := decoratePluginFileAuths(ctx, fullPath, metadata, compactPluginAuths(auths))
+	if errDecorate != nil {
+		return nil, true, errDecorate
+	}
+	return decorated, true, nil
 }
 
-func decoratePluginFileAuths(ctx *SynthesisContext, fullPath string, metadata map[string]any, auths []*coreauth.Auth) []*coreauth.Auth {
+func decoratePluginFileAuths(ctx *SynthesisContext, fullPath string, metadata map[string]any, auths []*coreauth.Auth) ([]*coreauth.Auth, error) {
 	if len(auths) == 0 {
-		return nil
+		return nil, nil
 	}
 	perAccountExcluded := extractExcludedModelsFromMetadata(metadata)
 	perAccountModelAliases := extractOAuthModelAliasesFromMetadata(metadata)
@@ -173,16 +192,19 @@ func decoratePluginFileAuths(ctx *SynthesisContext, fullPath string, metadata ma
 			}
 			auth.Metadata["disabled"] = true
 		}
+		if errWeight := coreauth.ApplyAuthWeightMetadata(auth, metadata); errWeight != nil {
+			return nil, fmt.Errorf("invalid plugin auth weight in %s: %w", filepath.Base(fullPath), errWeight)
+		}
 		coreauth.SetOAuthModelAliasesAttribute(auth, perAccountModelAliases)
 		ApplyAuthExcludedModelsMeta(auth, ctx.Config, perAccountExcluded, "oauth")
 		coreauth.ApplyCustomHeadersFromMetadata(auth)
 	}
-	return auths
+	return auths, nil
 }
 
-func synthesizeNativeFileAuths(ctx *SynthesisContext, fullPath string, metadata map[string]any, provider string) []*coreauth.Auth {
+func synthesizeNativeFileAuths(ctx *SynthesisContext, fullPath string, metadata map[string]any, provider string) ([]*coreauth.Auth, error) {
 	if provider == "" || provider == "gemini-cli" {
-		return nil
+		return nil, nil
 	}
 	now := ctx.Now
 	cfg := ctx.Config
@@ -254,6 +276,9 @@ func synthesizeNativeFileAuths(ctx *SynthesisContext, fullPath string, metadata 
 			}
 		}
 	}
+	if errWeight := coreauth.ApplyAuthWeightMetadata(a, metadata); errWeight != nil {
+		return nil, fmt.Errorf("invalid auth weight in %s: %w", filepath.Base(fullPath), errWeight)
+	}
 	// Read note from auth file.
 	if rawNote, ok := metadata["note"]; ok {
 		if note, isStr := rawNote.(string); isStr {
@@ -289,7 +314,7 @@ func synthesizeNativeFileAuths(ctx *SynthesisContext, fullPath string, metadata 
 			a.Attributes["plan_type"] = planType
 		}
 	}
-	return []*coreauth.Auth{a}
+	return []*coreauth.Auth{a}, nil
 }
 
 func parsePluginFileAuths(parser PluginAuthParser, req pluginapi.AuthParseRequest) ([]*coreauth.Auth, bool, error) {
@@ -313,6 +338,9 @@ func compactPluginAuths(auths []*coreauth.Auth) []*coreauth.Auth {
 	out := auths[:0]
 	for _, auth := range auths {
 		if auth == nil {
+			continue
+		}
+		if errWeight := coreauth.ValidateAuthWeight(auth); errWeight != nil {
 			continue
 		}
 		out = append(out, auth)

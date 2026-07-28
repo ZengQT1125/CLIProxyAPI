@@ -187,7 +187,10 @@ func (w *Watcher) addOrUpdateClientLocked(path string) {
 		IDGenerator:      synthesizer.NewStableIDGenerator(),
 		PluginAuthParser: parser,
 	}
-	generated := synthesizer.SynthesizeAuthFile(sctx, path, data)
+	generated, errSynthesize := synthesizer.SynthesizeAuthFile(sctx, path, data)
+	if errSynthesize != nil {
+		log.WithError(errSynthesize).Warnf("skipping auth file %s", filepath.Base(path))
+	}
 	newByID := authSliceToMap(generated)
 	w.clientsMutex.Lock()
 	if len(newByID) > 0 {
@@ -198,7 +201,9 @@ func (w *Watcher) addOrUpdateClientLocked(path string) {
 	updates := w.computePerPathUpdatesLocked(oldByID, newByID)
 	w.clientsMutex.Unlock()
 
-	w.persistAuthAsync(fmt.Sprintf("Sync auth %s", filepath.Base(path)), path)
+	if errSynthesize == nil {
+		w.persistAuthAsync(fmt.Sprintf("Sync auth %s", filepath.Base(path)), path)
+	}
 	w.dispatchAuthUpdates(updates)
 	redisqueue.NotifyUsageRefresh()
 }
