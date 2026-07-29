@@ -131,6 +131,8 @@ func (m *Manager) SetConfigSnapshot(cfg *internalconfig.Config) bool {
 func (m *Manager) setConfigSnapshotLocked(cfg *internalconfig.Config) bool {
 	if cfg == nil {
 		cfg = &internalconfig.Config{}
+	} else {
+		cfg = cfg.CloneForRuntime()
 	}
 	m.mu.RLock()
 	oldCooldownStore := m.cooldownStore

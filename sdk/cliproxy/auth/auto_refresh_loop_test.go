@@ -89,7 +89,6 @@ func TestNextRefreshCheckAt_AgentIdentityUnschedule(t *testing.T) {
 	}
 }
 
-
 func TestNextRefreshCheckAt_NextRefreshAfterGate(t *testing.T) {
 	now := time.Date(2026, 4, 12, 0, 0, 0, 0, time.UTC)
 	nextAfter := now.Add(30 * time.Minute)

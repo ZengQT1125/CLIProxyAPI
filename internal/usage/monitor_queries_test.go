@@ -288,7 +288,6 @@ func TestSQLiteUsageStoreQueryMonitorKeyStatsBlocksAuthIndexFilter(t *testing.T)
 	}
 }
 
-
 func TestSQLiteUsageStoreQueryMonitorKeyStatsBlocksSourceFilter(t *testing.T) {
 	ctx := context.Background()
 	store := newTestSQLiteUsageStore(t)

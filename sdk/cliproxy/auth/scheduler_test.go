@@ -1162,8 +1162,8 @@ func TestManagerSelectAuthByKindExcludesAgentIdentity(t *testing.T) {
 	manager.executors["codex"] = schedulerTestExecutor{}
 	for _, candidate := range []*Auth{
 		{
-			ID:       "codex-agent",
-			Provider: "codex",
+			ID:         "codex-agent",
+			Provider:   "codex",
 			Attributes: map[string]string{AttributeAuthKind: AuthKindAgentIdentity},
 			Metadata: map[string]any{
 				"auth_kind":         AuthKindAgentIdentity,
