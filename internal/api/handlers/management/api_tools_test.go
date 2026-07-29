@@ -1,6 +1,7 @@
 package management
 
 import (
+	"bytes"
 	"context"
 	"crypto/ed25519"
 	"crypto/rand"
@@ -154,6 +155,115 @@ func TestAPICallUsesProviderAuthenticationForAgentIdentity(t *testing.T) {
 	}
 	if response.StatusCode != http.StatusNoContent {
 		t.Fatalf("upstream status = %d, want %d", response.StatusCode, http.StatusNoContent)
+	}
+}
+
+func TestAPICallBatchReturnsOrderedPartialResults(t *testing.T) {
+	var upstreamCalls atomic.Int32
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		upstreamCalls.Add(1)
+		w.Header().Set("X-Test-Path", r.URL.Path)
+		if r.URL.Path == "/denied" {
+			w.WriteHeader(http.StatusForbidden)
+			_, _ = w.Write([]byte(`{"error":"denied"}`))
+			return
+		}
+		w.WriteHeader(http.StatusOK)
+		_, _ = w.Write([]byte(`{"ok":true}`))
+	}))
+	defer upstream.Close()
+
+	h := NewHandlerWithoutConfigFilePath(&config.Config{}, nil)
+	payload := fmt.Sprintf(`{"requests":[
+		{"id":"ok","method":"GET","url":%q},
+		{"id":"invalid","method":"GET","url":"not-a-url"},
+		{"id":"denied","method":"GET","url":%q}
+	]}`, upstream.URL+"/ok", upstream.URL+"/denied")
+
+	gin.SetMode(gin.TestMode)
+	recorder := httptest.NewRecorder()
+	c, _ := gin.CreateTestContext(recorder)
+	c.Request = httptest.NewRequest(http.MethodPost, "/v0/management/custom/api-call/batch", strings.NewReader(payload))
+	c.Request.Header.Set("Content-Type", "application/json")
+
+	h.APICallBatch(c)
+
+	if recorder.Code != http.StatusOK {
+		t.Fatalf("APICallBatch status = %d, want %d; body=%s", recorder.Code, http.StatusOK, recorder.Body.String())
+	}
+	if got := upstreamCalls.Load(); got != 2 {
+		t.Fatalf("upstream calls = %d, want 2", got)
+	}
+
+	var response apiCallBatchResponse
+	if errDecode := json.Unmarshal(recorder.Body.Bytes(), &response); errDecode != nil {
+		t.Fatalf("decode APICallBatch response: %v", errDecode)
+	}
+	if len(response.Results) != 3 {
+		t.Fatalf("results length = %d, want 3", len(response.Results))
+	}
+	if got := response.Results[0]; got.ID != "ok" || got.StatusCode != http.StatusOK || got.Error != "" {
+		t.Errorf("first result = %+v, want successful ok result", got)
+	}
+	if got := response.Results[1]; got.ID != "invalid" || got.ErrorStatus != http.StatusBadRequest || got.Error != "invalid url" {
+		t.Errorf("second result = %+v, want invalid-url item error", got)
+	}
+	if got := response.Results[2]; got.ID != "denied" || got.StatusCode != http.StatusForbidden || got.Error != "" {
+		t.Errorf("third result = %+v, want upstream forbidden response", got)
+	}
+}
+
+func TestAPICallBatchRejectsAmbiguousRequestSet(t *testing.T) {
+	tests := []struct {
+		name    string
+		payload string
+	}{
+		{name: "empty", payload: `{"requests":[]}`},
+		{name: "missing id", payload: `{"requests":[{"method":"GET","url":"https://example.com"}]}`},
+		{name: "duplicate id", payload: `{"requests":[{"id":"same","method":"GET","url":"https://example.com"},{"id":"same","method":"GET","url":"https://example.com"}]}`},
+	}
+
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			h := NewHandlerWithoutConfigFilePath(&config.Config{}, nil)
+			recorder := httptest.NewRecorder()
+			c, _ := gin.CreateTestContext(recorder)
+			c.Request = httptest.NewRequest(http.MethodPost, "/v0/management/custom/api-call/batch", strings.NewReader(tc.payload))
+			c.Request.Header.Set("Content-Type", "application/json")
+
+			h.APICallBatch(c)
+
+			if recorder.Code != http.StatusBadRequest {
+				t.Fatalf("status = %d, want %d; body=%s", recorder.Code, http.StatusBadRequest, recorder.Body.String())
+			}
+		})
+	}
+}
+
+func TestAPICallBatchRejectsTooManyRequests(t *testing.T) {
+	requests := make([]apiCallRequest, maxAPICallBatchSize+1)
+	for i := range requests {
+		requests[i] = apiCallRequest{
+			ID:     fmt.Sprintf("request-%d", i),
+			Method: http.MethodGet,
+			URL:    "https://example.com",
+		}
+	}
+	payload, errMarshal := json.Marshal(apiCallBatchRequest{Requests: requests})
+	if errMarshal != nil {
+		t.Fatalf("marshal request: %v", errMarshal)
+	}
+
+	h := NewHandlerWithoutConfigFilePath(&config.Config{}, nil)
+	recorder := httptest.NewRecorder()
+	c, _ := gin.CreateTestContext(recorder)
+	c.Request = httptest.NewRequest(http.MethodPost, "/v0/management/custom/api-call/batch", bytes.NewReader(payload))
+	c.Request.Header.Set("Content-Type", "application/json")
+
+	h.APICallBatch(c)
+
+	if recorder.Code != http.StatusRequestEntityTooLarge {
+		t.Fatalf("status = %d, want %d; body=%s", recorder.Code, http.StatusRequestEntityTooLarge, recorder.Body.String())
 	}
 }
 

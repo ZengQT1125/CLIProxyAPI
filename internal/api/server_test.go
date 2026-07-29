@@ -1128,6 +1128,25 @@ func TestManagementAuthFileLoadStatusRoute(t *testing.T) {
 	}
 }
 
+func TestManagementAPICallBatchUsesCustomRoute(t *testing.T) {
+	t.Setenv("MANAGEMENT_PASSWORD", "test-management-key")
+	server := newTestServer(t)
+
+	req := httptest.NewRequest(
+		http.MethodPost,
+		"/v0/management/custom/api-call/batch",
+		strings.NewReader(`{"requests":[]}`),
+	)
+	req.Header.Set("Authorization", "Bearer test-management-key")
+	req.Header.Set("Content-Type", "application/json")
+	rr := httptest.NewRecorder()
+	server.engine.ServeHTTP(rr, req)
+
+	if rr.Code != http.StatusBadRequest {
+		t.Fatalf("status = %d, want %d body=%s", rr.Code, http.StatusBadRequest, rr.Body.String())
+	}
+}
+
 func TestServerListening(t *testing.T) {
 	server := newTestServer(t)
 	server.server.Addr = "127.0.0.1:0"

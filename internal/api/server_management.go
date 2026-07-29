@@ -83,6 +83,7 @@ func (s *Server) registerManagementRoutes() {
 		mgmt.DELETE("/proxy-url", s.mgmt.DeleteProxyURL)
 
 		mgmt.POST("/api-call", s.mgmt.APICall)
+		mgmt.POST("/custom/api-call/batch", s.mgmt.APICallBatch)
 		mgmt.POST("/custom/codex-cleanup", s.mgmt.CleanupCodexAuth)
 		mgmt.POST("/custom/codex-agent-identity/import", s.mgmt.ImportCodexAgentIdentity)
 

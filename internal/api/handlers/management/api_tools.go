@@ -25,7 +25,11 @@ import (
 	log "github.com/sirupsen/logrus"
 )
 
-const defaultAPICallTimeout = 60 * time.Second
+const (
+	defaultAPICallTimeout = 60 * time.Second
+	maxAPICallBatchSize   = 256
+	apiCallBatchWorkers   = 8
+)
 
 const (
 	antigravityOAuthClientID     = "1071006060591-tmhssin2h21lcre235vtolojh4g403ep.apps.googleusercontent.com"
@@ -35,6 +39,7 @@ const (
 var antigravityOAuthTokenURL = "https://oauth2.googleapis.com/token"
 
 type apiCallRequest struct {
+	ID              string            `json:"id,omitempty"`
 	AuthIndexSnake  *string           `json:"auth_index"`
 	AuthIndexCamel  *string           `json:"authIndex"`
 	AuthIndexPascal *string           `json:"AuthIndex"`
@@ -45,9 +50,25 @@ type apiCallRequest struct {
 }
 
 type apiCallResponse struct {
-	StatusCode int                 `json:"status_code"`
-	Header     map[string][]string `json:"header"`
-	Body       string              `json:"body"`
+	ID          string              `json:"id,omitempty"`
+	StatusCode  int                 `json:"status_code"`
+	Header      map[string][]string `json:"header"`
+	Body        string              `json:"body"`
+	Error       string              `json:"error,omitempty"`
+	ErrorStatus int                 `json:"error_status,omitempty"`
+}
+
+type apiCallBatchRequest struct {
+	Requests []apiCallRequest `json:"requests"`
+}
+
+type apiCallBatchResponse struct {
+	Results []apiCallResponse `json:"results"`
+}
+
+type apiCallExecutionError struct {
+	status  int
+	message string
 }
 
 // APICall makes a generic HTTP request on behalf of the management API caller.
@@ -107,29 +128,102 @@ func (h *Handler) APICall(c *gin.Context) {
 		return
 	}
 
+	response, callErr := h.executeAPICall(c.Request.Context(), body)
+	if callErr != nil {
+		c.JSON(callErr.status, gin.H{"error": callErr.message})
+		return
+	}
+
+	c.JSON(http.StatusOK, response)
+}
+
+// APICallBatch executes independent management proxy calls with bounded concurrency.
+// Every item keeps its own status so one bad credential does not discard the rest.
+func (h *Handler) APICallBatch(c *gin.Context) {
+	var body apiCallBatchRequest
+	if errBindJSON := c.ShouldBindJSON(&body); errBindJSON != nil {
+		c.JSON(http.StatusBadRequest, gin.H{"error": "invalid body"})
+		return
+	}
+	if len(body.Requests) == 0 {
+		c.JSON(http.StatusBadRequest, gin.H{"error": "requests must not be empty"})
+		return
+	}
+	if len(body.Requests) > maxAPICallBatchSize {
+		c.JSON(http.StatusRequestEntityTooLarge, gin.H{"error": "too many requests"})
+		return
+	}
+
+	seenIDs := make(map[string]struct{}, len(body.Requests))
+	for i := range body.Requests {
+		id := strings.TrimSpace(body.Requests[i].ID)
+		if id == "" {
+			c.JSON(http.StatusBadRequest, gin.H{"error": "missing request id"})
+			return
+		}
+		if _, exists := seenIDs[id]; exists {
+			c.JSON(http.StatusBadRequest, gin.H{"error": "duplicate request id"})
+			return
+		}
+		seenIDs[id] = struct{}{}
+		body.Requests[i].ID = id
+	}
+
+	results := make([]apiCallResponse, len(body.Requests))
+	requestContext := c.Request.Context()
+	workerCount := min(apiCallBatchWorkers, len(body.Requests))
+	jobs := make(chan int)
+	var workers sync.WaitGroup
+	workers.Add(workerCount)
+	for range workerCount {
+		go func() {
+			defer workers.Done()
+			for index := range jobs {
+				request := body.Requests[index]
+				response, callErr := h.executeAPICall(requestContext, request)
+				response.ID = request.ID
+				if callErr != nil {
+					response.Error = callErr.message
+					response.ErrorStatus = callErr.status
+				}
+				results[index] = response
+			}
+		}()
+	}
+	for index := range body.Requests {
+		jobs <- index
+	}
+	close(jobs)
+	workers.Wait()
+
+	c.JSON(http.StatusOK, apiCallBatchResponse{Results: results})
+}
+
+func (h *Handler) executeAPICall(ctx context.Context, body apiCallRequest) (apiCallResponse, *apiCallExecutionError) {
+	fail := func(status int, message string) (apiCallResponse, *apiCallExecutionError) {
+		return apiCallResponse{}, &apiCallExecutionError{status: status, message: message}
+	}
+
 	method := strings.ToUpper(strings.TrimSpace(body.Method))
 	if method == "" {
-		c.JSON(http.StatusBadRequest, gin.H{"error": "missing method"})
-		return
+		return fail(http.StatusBadRequest, "missing method")
 	}
 
 	urlStr := strings.TrimSpace(body.URL)
 	if urlStr == "" {
-		c.JSON(http.StatusBadRequest, gin.H{"error": "missing url"})
-		return
+		return fail(http.StatusBadRequest, "missing url")
 	}
 	parsedURL, errParseURL := url.Parse(urlStr)
 	if errParseURL != nil || parsedURL.Scheme == "" || parsedURL.Host == "" {
-		c.JSON(http.StatusBadRequest, gin.H{"error": "invalid url"})
-		return
+		return fail(http.StatusBadRequest, "invalid url")
 	}
 
 	authIndex := firstNonEmptyString(body.AuthIndexSnake, body.AuthIndexCamel, body.AuthIndexPascal)
 	auth := h.authByIndex(authIndex)
 
-	reqHeaders := body.Header
-	if reqHeaders == nil {
-		reqHeaders = map[string]string{}
+	reqHeaders := make(map[string]string, len(body.Header))
+	for key, value := range body.Header {
+		reqHeaders[key] = value
 	}
 
 	var hostOverride string
@@ -141,13 +235,12 @@ func (h *Handler) APICall(c *gin.Context) {
 			continue
 		}
 		if !tokenResolved {
-			token, tokenErr = h.resolveTokenForAuth(c.Request.Context(), auth)
+			token, tokenErr = h.resolveTokenForAuth(ctx, auth)
 			tokenResolved = true
 		}
 		if auth != nil && token == "" {
 			if tokenErr != nil {
-				c.JSON(http.StatusBadRequest, gin.H{"error": "auth token refresh failed"})
-				return
+				return fail(http.StatusBadRequest, "auth token refresh failed")
 			}
 			// Some credentials do not have a bearer token. Their provider executor injects
 			// the native authentication scheme immediately before sending the request, and
@@ -166,10 +259,9 @@ func (h *Handler) APICall(c *gin.Context) {
 		requestBody = strings.NewReader(body.Data)
 	}
 
-	req, errNewRequest := http.NewRequestWithContext(c.Request.Context(), method, urlStr, requestBody)
+	req, errNewRequest := http.NewRequestWithContext(ctx, method, urlStr, requestBody)
 	if errNewRequest != nil {
-		c.JSON(http.StatusBadRequest, gin.H{"error": "failed to build request"})
-		return
+		return fail(http.StatusBadRequest, "failed to build request")
 	}
 
 	for key, value := range reqHeaders {
@@ -186,7 +278,7 @@ func (h *Handler) APICall(c *gin.Context) {
 	var resp *http.Response
 	var errDo error
 	if auth != nil && h != nil && h.authManager != nil {
-		requestContext, cancelRequest := context.WithTimeout(c.Request.Context(), defaultAPICallTimeout)
+		requestContext, cancelRequest := context.WithTimeout(ctx, defaultAPICallTimeout)
 		defer cancelRequest()
 		resp, errDo = h.authManager.HttpRequest(requestContext, auth, req.WithContext(requestContext))
 	} else {
@@ -203,11 +295,9 @@ func (h *Handler) APICall(c *gin.Context) {
 		// unusable credential apart from an unreachable upstream.
 		var statusAware interface{ StatusCode() int }
 		if errors.As(errDo, &statusAware) && statusAware.StatusCode() == http.StatusUnauthorized {
-			c.JSON(http.StatusUnauthorized, gin.H{"error": errDo.Error()})
-			return
+			return fail(http.StatusUnauthorized, errDo.Error())
 		}
-		c.JSON(http.StatusBadGateway, gin.H{"error": "request failed"})
-		return
+		return fail(http.StatusBadGateway, "request failed")
 	}
 	defer func() {
 		if errClose := resp.Body.Close(); errClose != nil {
@@ -217,15 +307,14 @@ func (h *Handler) APICall(c *gin.Context) {
 
 	respBody, errReadAll := io.ReadAll(resp.Body)
 	if errReadAll != nil {
-		c.JSON(http.StatusBadGateway, gin.H{"error": "failed to read response"})
-		return
+		return fail(http.StatusBadGateway, "failed to read response")
 	}
 
-	c.JSON(http.StatusOK, apiCallResponse{
+	return apiCallResponse{
 		StatusCode: resp.StatusCode,
 		Header:     resp.Header,
 		Body:       string(respBody),
-	})
+	}, nil
 }
 
 func firstNonEmptyString(values ...*string) string {
