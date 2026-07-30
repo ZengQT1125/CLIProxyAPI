@@ -13,6 +13,7 @@ import (
 	internalconfig "github.com/router-for-me/CLIProxyAPI/v7/internal/config"
 	"github.com/router-for-me/CLIProxyAPI/v7/internal/home"
 	"github.com/router-for-me/CLIProxyAPI/v7/internal/logging"
+	sdkaccess "github.com/router-for-me/CLIProxyAPI/v7/sdk/access"
 	"github.com/router-for-me/CLIProxyAPI/v7/sdk/cliproxy/executionregistry"
 	cliproxyexecutor "github.com/router-for-me/CLIProxyAPI/v7/sdk/cliproxy/executor"
 	log "github.com/sirupsen/logrus"
@@ -193,7 +194,7 @@ func setHomeUserAPIKeyOnGinContext(ctx context.Context, apiKey string) {
 	if !ok || ginCtx == nil {
 		return
 	}
-	ginCtx.Set("userApiKey", apiKey)
+	ginCtx.Set(sdkaccess.UserAPIKeyContextKey, apiKey)
 }
 
 func homeDispatchHeaders(ctx context.Context, headers http.Header) http.Header {
@@ -236,7 +237,7 @@ func homeQueryCredentialFromContext(ctx context.Context) (string, bool) {
 	if source != "query-key" && source != "query-auth-token" {
 		return "", false
 	}
-	rawAPIKey, ok := ginCtx.Get("userApiKey")
+	rawAPIKey, ok := ginCtx.Get(sdkaccess.UserAPIKeyContextKey)
 	if !ok {
 		return "", false
 	}

@@ -25,6 +25,9 @@ type AccessProvider struct {
 }
 
 const (
+	// UserAPIKeyContextKey is the canonical Gin context key for an authenticated downstream principal.
+	UserAPIKeyContextKey = "userApiKey"
+
 	// AccessProviderTypeConfigAPIKey is the built-in provider validating inline API keys.
 	AccessProviderTypeConfigAPIKey = "config-api-key"
 

@@ -26,6 +26,7 @@ import (
 	"github.com/router-for-me/CLIProxyAPI/v7/internal/pluginhost"
 	"github.com/router-for-me/CLIProxyAPI/v7/internal/redisqueue"
 	"github.com/router-for-me/CLIProxyAPI/v7/internal/registry"
+	executorhelps "github.com/router-for-me/CLIProxyAPI/v7/internal/runtime/executor/helps"
 	"github.com/router-for-me/CLIProxyAPI/v7/internal/watcher"
 	sdkaccess "github.com/router-for-me/CLIProxyAPI/v7/sdk/access"
 	"github.com/router-for-me/CLIProxyAPI/v7/sdk/cliproxy/auth"
@@ -42,6 +43,16 @@ type codexSearchCaptureExecutor struct {
 	prepareErr   error
 	httpErr      error
 	responseBody io.ReadCloser
+}
+
+type staticAccessProvider struct {
+	principal string
+}
+
+func (p staticAccessProvider) Identifier() string { return "test-access" }
+
+func (p staticAccessProvider) Authenticate(context.Context, *http.Request) (*sdkaccess.Result, *sdkaccess.AuthError) {
+	return &sdkaccess.Result{Provider: p.Identifier(), Principal: p.principal}, nil
 }
 
 func (e *codexSearchCaptureExecutor) Identifier() string { return "codex" }
@@ -395,6 +406,34 @@ func newTestServerWithOptions(t *testing.T, opts ...ServerOption) *Server {
 
 	configPath := filepath.Join(tmpDir, "config.yaml")
 	return NewServer(cfg, authManager, accessManager, configPath, opts...)
+}
+
+func TestAuthMiddlewarePropagatesPrincipalToUsageContext(t *testing.T) {
+	gin.SetMode(gin.TestMode)
+
+	const principal = "downstream-request-key"
+	accessManager := sdkaccess.NewManager()
+	accessManager.SetProviders([]sdkaccess.Provider{staticAccessProvider{principal: principal}})
+
+	var captured string
+	engine := gin.New()
+	engine.Use(AuthMiddleware(accessManager))
+	engine.GET("/v1/test", func(c *gin.Context) {
+		ctx := context.WithValue(c.Request.Context(), "gin", c)
+		captured = executorhelps.APIKeyFromContext(ctx)
+		c.Status(http.StatusNoContent)
+	})
+
+	req := httptest.NewRequest(http.MethodGet, "/v1/test", nil)
+	rr := httptest.NewRecorder()
+	engine.ServeHTTP(rr, req)
+
+	if rr.Code != http.StatusNoContent {
+		t.Fatalf("status = %d, want %d", rr.Code, http.StatusNoContent)
+	}
+	if captured != principal {
+		t.Fatalf("usage context principal = %q, want %q", captured, principal)
+	}
 }
 
 func TestHealthz(t *testing.T) {
