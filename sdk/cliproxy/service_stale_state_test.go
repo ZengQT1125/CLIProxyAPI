@@ -14,6 +14,21 @@ import (
 	"github.com/router-for-me/CLIProxyAPI/v7/sdk/config"
 )
 
+type staleStateRawJSONStorage struct {
+	data []byte
+}
+
+func (s *staleStateRawJSONStorage) RawJSON() []byte {
+	if s == nil {
+		return nil
+	}
+	return append([]byte(nil), s.data...)
+}
+
+func (*staleStateRawJSONStorage) SaveTokenToFile(string) error {
+	return nil
+}
+
 func TestServiceApplyCoreAuthAddOrUpdate_DeleteReAddDoesNotInheritStaleRuntimeState(t *testing.T) {
 	service := &Service{
 		cfg:         &config.Config{},
@@ -93,6 +108,7 @@ func TestHandleAuthUpdate_ReplaceMaterialClearsRuntimeErrorState(t *testing.T) {
 		ID:       authID,
 		Provider: "codex",
 		Status:   coreauth.StatusActive,
+		Metadata: map[string]any{"access_token": "invalid-token"},
 	}); errRegister != nil {
 		t.Fatalf("register auth: %v", errRegister)
 	}
@@ -118,9 +134,14 @@ func TestHandleAuthUpdate_ReplaceMaterialClearsRuntimeErrorState(t *testing.T) {
 	}
 
 	service.handleAuthUpdate(ctx, watcher.AuthUpdate{
-		Action:          watcher.AuthUpdateActionModify,
-		ID:              authID,
-		Auth:            &coreauth.Auth{ID: authID, Provider: "codex", Status: coreauth.StatusActive},
+		Action: watcher.AuthUpdateActionModify,
+		ID:     authID,
+		Auth: &coreauth.Auth{
+			ID:       authID,
+			Provider: "codex",
+			Status:   coreauth.StatusActive,
+			Metadata: map[string]any{"access_token": "replacement-token"},
+		},
 		ReplaceMaterial: true,
 	})
 
@@ -137,6 +158,197 @@ func TestHandleAuthUpdate_ReplaceMaterialClearsRuntimeErrorState(t *testing.T) {
 	}
 	if len(updated.ModelStates) != 0 {
 		t.Fatalf("model states survived replacement: %+v", updated.ModelStates)
+	}
+}
+
+func TestHandleAuthUpdate_ReplacePluginStorageClearsRuntimeErrorState(t *testing.T) {
+	service := &Service{
+		cfg:         &config.Config{},
+		coreManager: coreauth.NewManager(nil, nil, nil),
+	}
+
+	ctx := context.Background()
+	authID := "plugin-storage.json"
+	modelID := "plugin-model"
+	metadata := map[string]any{"type": "plugin-provider"}
+
+	t.Cleanup(func() {
+		GlobalModelRegistry().UnregisterClient(authID)
+	})
+
+	if _, errRegister := service.coreManager.Register(ctx, &coreauth.Auth{
+		ID:       authID,
+		Provider: "plugin-provider",
+		Status:   coreauth.StatusActive,
+		Metadata: metadata,
+		Storage:  &staleStateRawJSONStorage{data: []byte(`{"type":"plugin-provider","token":"invalid-token"}`)},
+	}); errRegister != nil {
+		t.Fatalf("register auth: %v", errRegister)
+	}
+
+	service.coreManager.MarkResult(ctx, coreauth.Result{
+		AuthID:   authID,
+		Provider: "plugin-provider",
+		Model:    modelID,
+		Success:  false,
+		Error: &coreauth.Error{
+			Code:       "unauthorized",
+			Message:    "401 plugin token invalidated",
+			HTTPStatus: http.StatusUnauthorized,
+		},
+	})
+
+	service.handleAuthUpdate(ctx, watcher.AuthUpdate{
+		Action: watcher.AuthUpdateActionModify,
+		ID:     authID,
+		Auth: &coreauth.Auth{
+			ID:       authID,
+			Provider: "plugin-provider",
+			Status:   coreauth.StatusActive,
+			Metadata: metadata,
+			Storage:  &staleStateRawJSONStorage{data: []byte(`{"token":"replacement-token","type":"plugin-provider"}`)},
+		},
+		ReplaceMaterial: true,
+	})
+
+	updated, ok := service.coreManager.GetByID(authID)
+	if !ok || updated == nil {
+		t.Fatalf("expected updated auth %q to exist", authID)
+	}
+	if updated.LastError != nil || updated.Unavailable || len(updated.ModelStates) != 0 {
+		t.Fatalf("runtime error state survived plugin storage replacement: %+v", updated)
+	}
+}
+
+func TestHandleAuthUpdate_RefreshFileEchoPreservesQuotaCooldown(t *testing.T) {
+	tests := []struct {
+		name             string
+		persistCooldowns bool
+	}{
+		{name: "in_memory"},
+		{name: "persisted", persistCooldowns: true},
+	}
+
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			manager := coreauth.NewManager(nil, nil, nil)
+			var cooldownStore *coreauth.FileCooldownStateStore
+			if tc.persistCooldowns {
+				cooldownStore = coreauth.NewFileCooldownStateStore(t.TempDir())
+				manager.SetCooldownStateStore(cooldownStore)
+			}
+			service := &Service{
+				cfg:         &config.Config{},
+				coreManager: manager,
+			}
+
+			ctx := context.Background()
+			authID := "codex-quota-" + tc.name + ".json"
+			modelID := "gpt-5.6-sol"
+			retryAfter := 6 * time.Hour
+
+			t.Cleanup(func() {
+				GlobalModelRegistry().UnregisterClient(authID)
+			})
+
+			if _, errRegister := manager.Register(ctx, &coreauth.Auth{
+				ID:       authID,
+				Provider: "codex",
+				Status:   coreauth.StatusActive,
+				Metadata: map[string]any{"access_token": "initial-token", "email": "quota@example.com"},
+				Storage:  &staleStateRawJSONStorage{data: []byte(`{"type":"codex","token":"initial-token"}`)},
+			}); errRegister != nil {
+				t.Fatalf("register auth: %v", errRegister)
+			}
+
+			manager.MarkResult(ctx, coreauth.Result{
+				AuthID:     authID,
+				Provider:   "codex",
+				Model:      modelID,
+				Success:    false,
+				RetryAfter: &retryAfter,
+				Error: &coreauth.Error{
+					Code:       "usage_limit_reached",
+					Message:    "usage limit reached",
+					HTTPStatus: http.StatusTooManyRequests,
+				},
+			})
+			if cooldownStore != nil {
+				if errFlush := manager.FlushCooldownStates(ctx); errFlush != nil {
+					t.Fatalf("flush cooldown before replacement: %v", errFlush)
+				}
+			}
+
+			failedAuth, ok := manager.GetByID(authID)
+			if !ok || failedAuth == nil {
+				t.Fatalf("expected auth %q to exist", authID)
+			}
+			failedState := failedAuth.ModelStates[modelID]
+			if failedState == nil || !failedState.Unavailable || !failedState.Quota.Exceeded {
+				t.Fatalf("expected quota cooldown before replacement, got %+v", failedState)
+			}
+
+			refreshedAuth := failedAuth.Clone()
+			refreshedAuth.Metadata["access_token"] = "refreshed-token"
+			refreshedAuth.Metadata["expires_in"] = int64(3600)
+			refreshedAuth.Metadata["limits"] = map[string]any{"requests": int64(2)}
+			refreshedAuth.Storage = &staleStateRawJSONStorage{data: []byte(`{"type":"codex","token":"refreshed-token","limits":{"requests":2}}`)}
+			if _, errUpdate := manager.Update(ctx, refreshedAuth); errUpdate != nil {
+				t.Fatalf("apply refreshed credential: %v", errUpdate)
+			}
+			refreshed, ok := manager.GetByID(authID)
+			if !ok || refreshed.ModelStates[modelID] == nil || !refreshed.ModelStates[modelID].Quota.Exceeded {
+				t.Fatalf("internal refresh cleared quota cooldown before file echo: %+v", refreshed)
+			}
+
+			service.handleAuthUpdate(ctx, watcher.AuthUpdate{
+				Action: watcher.AuthUpdateActionModify,
+				ID:     authID,
+				Auth: &coreauth.Auth{
+					ID:       authID,
+					Provider: "codex",
+					Status:   coreauth.StatusActive,
+					Metadata: map[string]any{
+						"access_token": "refreshed-token",
+						"disabled":     false,
+						"email":        "quota@example.com",
+						"expires_in":   float64(3600),
+						"limits":       map[string]any{"requests": float64(2)},
+					},
+					Storage: &staleStateRawJSONStorage{data: []byte(`{
+						"limits":{"requests":2.0},
+						"token":"refreshed-token",
+						"type":"codex"
+					}`)},
+				},
+				ReplaceMaterial: true,
+			})
+
+			updated, ok := manager.GetByID(authID)
+			if !ok || updated == nil {
+				t.Fatalf("expected updated auth %q to exist", authID)
+			}
+			updatedState := updated.ModelStates[modelID]
+			if updatedState == nil || !updatedState.Unavailable || !updatedState.Quota.Exceeded {
+				t.Fatalf("quota cooldown was cleared by material replacement: %+v", updatedState)
+			}
+			if !updatedState.NextRetryAfter.Equal(failedState.NextRetryAfter) {
+				t.Fatalf("next retry changed from %v to %v", failedState.NextRetryAfter, updatedState.NextRetryAfter)
+			}
+
+			if cooldownStore != nil {
+				if errFlush := manager.FlushCooldownStates(ctx); errFlush != nil {
+					t.Fatalf("flush cooldown after replacement: %v", errFlush)
+				}
+				snapshots, errLoad := cooldownStore.Load(ctx)
+				if errLoad != nil {
+					t.Fatalf("load persisted cooldown: %v", errLoad)
+				}
+				if len(snapshots) != 1 || len(snapshots[0].Records) != 1 || snapshots[0].Records[0].Model != modelID {
+					t.Fatalf("persisted cooldown was cleared by material replacement: %+v", snapshots)
+				}
+			}
+		})
 	}
 }
 

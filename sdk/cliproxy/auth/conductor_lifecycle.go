@@ -131,7 +131,9 @@ func (m *Manager) Update(ctx context.Context, auth *Auth) (*Auth, error) {
 	if trackCooldownState {
 		cooldownRecordsBefore = m.cooldownStateRecordsForAuthLocked(existing, now)
 	}
-	resetRuntimeState := shouldResetRuntimeStateOnUpdate(ctx) && !auth.Disabled && auth.Status != StatusDisabled
+	resetRuntimeState := shouldResetRuntimeStateOnUpdate(ctx) &&
+		!samePersistedAuthMaterial(existing, auth) &&
+		!auth.Disabled && auth.Status != StatusDisabled
 	if !auth.indexAssigned && auth.Index == "" {
 		auth.Index = existing.Index
 		auth.indexAssigned = existing.indexAssigned
