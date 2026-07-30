@@ -1541,6 +1541,7 @@ func TestApplyCodexHeadersUsesConfigUserAgentForOAuth(t *testing.T) {
 		t.Fatalf("NewRequest() error = %v", err)
 	}
 	cfg := &config.Config{
+		Codex: config.CodexConfig{DisableCodexCloaking: true},
 		CodexHeaderDefaults: config.CodexHeaderDefaults{
 			UserAgent:    "config-ua",
 			BetaFeatures: "config-beta",
@@ -1561,6 +1562,41 @@ func TestApplyCodexHeadersUsesConfigUserAgentForOAuth(t *testing.T) {
 	}
 	if got := req.Header.Get("x-codex-beta-features"); got != "" {
 		t.Fatalf("x-codex-beta-features = %q, want empty", got)
+	}
+}
+
+func TestApplyCodexHeadersDefaultsToCodexCloaking(t *testing.T) {
+	req, err := http.NewRequest(http.MethodPost, "https://example.com/responses", nil)
+	if err != nil {
+		t.Fatalf("NewRequest() error = %v", err)
+	}
+	req.Header.Set("User-Agent", "existing-ua")
+	req.Header.Set("Originator", "existing-origin")
+	cfg := &config.Config{
+		CodexHeaderDefaults: config.CodexHeaderDefaults{
+			UserAgent: "config-ua",
+		},
+	}
+	auth := &cliproxyauth.Auth{
+		Provider: "codex",
+		Attributes: map[string]string{
+			"api_key":           "api-key",
+			"header:User-Agent": "custom-ua",
+			"header:Originator": "custom-origin",
+		},
+	}
+	ginHeaders := http.Header{
+		"User-Agent": []string{"client-ua"},
+		"Originator": []string{"client-origin"},
+	}
+
+	applyCodexHeadersFromSources(req, auth, "api-key", false, cfg, ginHeaders)
+
+	if got := req.Header.Get("User-Agent"); got != codexUserAgent {
+		t.Fatalf("User-Agent = %q, want %q", got, codexUserAgent)
+	}
+	if got := req.Header.Get("Originator"); got != codexOriginator {
+		t.Fatalf("Originator = %q, want %q", got, codexOriginator)
 	}
 }
 
@@ -1645,7 +1681,8 @@ func TestApplyCodexHeadersPassesThroughClientIdentityHeaders(t *testing.T) {
 		"X-Client-Request-Id":   "019d2233-e240-7162-992d-38df0a2a0e0d",
 	}))
 
-	applyCodexHeaders(req, auth, "oauth-token", true, nil)
+	cfg := &config.Config{Codex: config.CodexConfig{DisableCodexCloaking: true}}
+	applyCodexHeaders(req, auth, "oauth-token", true, cfg)
 
 	if got := req.Header.Get("Originator"); got != "Codex Desktop" {
 		t.Fatalf("Originator = %s, want %s", got, "Codex Desktop")

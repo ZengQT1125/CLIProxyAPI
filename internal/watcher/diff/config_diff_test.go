@@ -39,6 +39,7 @@ func TestBuildConfigChangeDetails(t *testing.T) {
 	newCfg := &config.Config{
 		Port:    9090,
 		AuthDir: "/tmp/auth-new",
+		Codex:   config.CodexConfig{DisableCodexCloaking: true},
 		GeminiKey: []config.GeminiKey{
 			{APIKey: "old", BaseURL: "http://old", ExcludedModels: []string{"old-model", "extra"}},
 		},
@@ -83,6 +84,7 @@ func TestBuildConfigChangeDetails(t *testing.T) {
 		t.Fatalf("config change details leaked panel repository: %s", joined)
 	}
 	expectContains(t, details, "remote-management.secret-key: updated")
+	expectContains(t, details, "codex.disable-codex-cloaking: false -> true")
 	expectContains(t, details, "oauth-excluded-models[providera]: updated (1 -> 2 entries)")
 	expectContains(t, details, "oauth-excluded-models[providerb]: added (1 entries)")
 	expectContains(t, details, "openai-compatibility:")
