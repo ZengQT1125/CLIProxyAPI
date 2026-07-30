@@ -62,6 +62,28 @@ func TestRecordOmittedGenerateIsEnabled(t *testing.T) {
 	}
 }
 
+func TestIsFastMode(t *testing.T) {
+	tests := []struct {
+		name        string
+		provider    string
+		serviceTier string
+		want        bool
+	}{
+		{name: "codex priority", provider: "codex", serviceTier: "priority", want: true},
+		{name: "normalized codex priority", provider: " CODEX ", serviceTier: " PRIORITY ", want: true},
+		{name: "codex standard", provider: "codex", serviceTier: "default", want: false},
+		{name: "non-codex priority", provider: "openai", serviceTier: "priority", want: false},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			if got := IsFastMode(tt.provider, tt.serviceTier); got != tt.want {
+				t.Fatalf("IsFastMode(%q, %q) = %v, want %v", tt.provider, tt.serviceTier, got, tt.want)
+			}
+		})
+	}
+}
+
 func TestManagerDeleteAuthUsageNotifiesCleaners(t *testing.T) {
 	manager := NewManager(1)
 	cleaner := &authUsageCleanerRecorder{}

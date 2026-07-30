@@ -314,6 +314,8 @@ func (p *DatabasePlugin) HandleUsage(ctx context.Context, record coreusage.Recor
 		TotalTokens:      record.Detail.TotalTokens,
 		LatencyMs:        normaliseLatency(record.Latency),
 		TTFTMs:           normaliseLatency(record.TTFT),
+		Stream:           record.Stream,
+		Fast:             boolPointer(coreusage.IsFastMode(record.Provider, record.ServiceTier)),
 		Method:           method,
 		Path:             path,
 	}
@@ -373,6 +375,8 @@ func (p *DatabasePlugin) ImportRecords(snapshot StatisticsSnapshot) (added, skip
 					TotalTokens:      detail.Tokens.TotalTokens,
 					LatencyMs:        detail.LatencyMs,
 					TTFTMs:           detail.TTFTMs,
+					Stream:           detail.Stream,
+					Fast:             detail.Fast,
 				})
 			}
 		}

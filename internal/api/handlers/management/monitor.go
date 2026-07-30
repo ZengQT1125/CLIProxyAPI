@@ -37,6 +37,8 @@ type monitorRecord struct {
 	TotalTokens      int64
 	LatencyMs        int64
 	TTFTMs           int64
+	Stream           *bool
+	Fast             *bool
 }
 
 type monitorRecordFilter struct {
@@ -74,6 +76,8 @@ type monitorRequestLogItem struct {
 	TotalTokens      int64                  `json:"total_tokens"`
 	LatencyMs        int64                  `json:"latency_ms"`
 	TTFTMs           int64                  `json:"ttft_ms"`
+	Stream           *bool                  `json:"stream,omitempty"`
+	Fast             *bool                  `json:"fast,omitempty"`
 	RequestCount     int64                  `json:"request_count"`
 	SuccessRate      float64                `json:"success_rate"`
 	RecentRequests   []monitorRecentRequest `json:"recent_requests"`
@@ -86,17 +90,21 @@ type monitorFilterOptions struct {
 }
 
 type monitorModelStats struct {
-	Model            string                 `json:"model"`
-	Requests         int64                  `json:"requests"`
-	Success          int64                  `json:"success"`
-	Failed           int64                  `json:"failed"`
-	InputTokens      int64                  `json:"input_tokens"`
-	OutputTokens     int64                  `json:"output_tokens"`
-	CachedTokens     int64                  `json:"cached_tokens"`
-	CacheWriteTokens int64                  `json:"cache_write_tokens"`
-	SuccessRate      float64                `json:"success_rate"`
-	LastRequestAt    *time.Time             `json:"last_request_at,omitempty"`
-	Recent           []monitorRecentRequest `json:"recent_requests"`
+	Model                string                 `json:"model"`
+	Requests             int64                  `json:"requests"`
+	Success              int64                  `json:"success"`
+	Failed               int64                  `json:"failed"`
+	InputTokens          int64                  `json:"input_tokens"`
+	OutputTokens         int64                  `json:"output_tokens"`
+	CachedTokens         int64                  `json:"cached_tokens"`
+	CacheWriteTokens     int64                  `json:"cache_write_tokens"`
+	FastInputTokens      int64                  `json:"fast_input_tokens"`
+	FastOutputTokens     int64                  `json:"fast_output_tokens"`
+	FastCachedTokens     int64                  `json:"fast_cached_tokens"`
+	FastCacheWriteTokens int64                  `json:"fast_cache_write_tokens"`
+	SuccessRate          float64                `json:"success_rate"`
+	LastRequestAt        *time.Time             `json:"last_request_at,omitempty"`
+	Recent               []monitorRecentRequest `json:"recent_requests"`
 }
 
 type monitorChannelStatsItem struct {
@@ -136,16 +144,20 @@ type monitorChannelAggregate struct {
 }
 
 type monitorModelAggregate struct {
-	Model            string
-	Requests         int64
-	Success          int64
-	Failed           int64
-	InputTokens      int64
-	OutputTokens     int64
-	CachedTokens     int64
-	CacheWriteTokens int64
-	LastRequestAt    time.Time
-	Recent           []monitorRecentRequest
+	Model                string
+	Requests             int64
+	Success              int64
+	Failed               int64
+	InputTokens          int64
+	OutputTokens         int64
+	CachedTokens         int64
+	CacheWriteTokens     int64
+	FastInputTokens      int64
+	FastOutputTokens     int64
+	FastCachedTokens     int64
+	FastCacheWriteTokens int64
+	LastRequestAt        time.Time
+	Recent               []monitorRecentRequest
 }
 
 type monitorRequestGroupStats struct {
@@ -219,6 +231,8 @@ func (h *Handler) GetMonitorRequestLogs(c *gin.Context) {
 					TotalTokens:      row.TotalTokens,
 					LatencyMs:        row.LatencyMs,
 					TTFTMs:           row.TTFTMs,
+					Stream:           row.Stream,
+					Fast:             row.Fast,
 					RequestCount:     groupStats.Total,
 					SuccessRate:      calcRate(groupStats.Success, groupStats.Total),
 					RecentRequests:   fromUsageRecentRequests(groupStats.Recent),
@@ -280,6 +294,8 @@ func (h *Handler) GetMonitorRequestLogs(c *gin.Context) {
 			TotalTokens:      record.TotalTokens,
 			LatencyMs:        record.LatencyMs,
 			TTFTMs:           record.TTFTMs,
+			Stream:           record.Stream,
+			Fast:             record.Fast,
 		})
 	})
 
@@ -364,17 +380,21 @@ func (h *Handler) GetMonitorChannelStats(c *gin.Context) {
 				models := make([]monitorModelStats, 0, len(channel.Models))
 				for _, model := range channel.Models {
 					models = append(models, monitorModelStats{
-						Model:            model.Model,
-						Requests:         model.Requests,
-						Success:          model.Success,
-						Failed:           model.Failed,
-						InputTokens:      model.InputTokens,
-						OutputTokens:     model.OutputTokens,
-						CachedTokens:     model.CachedTokens,
-						CacheWriteTokens: model.CacheWriteTokens,
-						SuccessRate:      calcRate(model.Success, model.Requests),
-						LastRequestAt:    cloneTimePointer(model.LastRequestAt),
-						Recent:           fromUsageRecentRequests(model.Recent),
+						Model:                model.Model,
+						Requests:             model.Requests,
+						Success:              model.Success,
+						Failed:               model.Failed,
+						InputTokens:          model.InputTokens,
+						OutputTokens:         model.OutputTokens,
+						CachedTokens:         model.CachedTokens,
+						CacheWriteTokens:     model.CacheWriteTokens,
+						FastInputTokens:      model.FastInputTokens,
+						FastOutputTokens:     model.FastOutputTokens,
+						FastCachedTokens:     model.FastCachedTokens,
+						FastCacheWriteTokens: model.FastCacheWriteTokens,
+						SuccessRate:          calcRate(model.Success, model.Requests),
+						LastRequestAt:        cloneTimePointer(model.LastRequestAt),
+						Recent:               fromUsageRecentRequests(model.Recent),
 					})
 				}
 
@@ -460,6 +480,12 @@ func (h *Handler) GetMonitorChannelStats(c *gin.Context) {
 			modelAgg.OutputTokens += record.OutputTokens
 			modelAgg.CachedTokens += record.CachedTokens
 			modelAgg.CacheWriteTokens += record.CacheWriteTokens
+			if record.Fast != nil && *record.Fast {
+				modelAgg.FastInputTokens += record.InputTokens
+				modelAgg.FastOutputTokens += record.OutputTokens
+				modelAgg.FastCachedTokens += record.CachedTokens
+				modelAgg.FastCacheWriteTokens += record.CacheWriteTokens
+			}
 		}
 		if record.Timestamp.After(modelAgg.LastRequestAt) {
 			modelAgg.LastRequestAt = record.Timestamp
@@ -497,17 +523,21 @@ func (h *Handler) GetMonitorChannelStats(c *gin.Context) {
 				recent = normalizeRecentRequests(modelAgg.Recent)
 			}
 			models = append(models, monitorModelStats{
-				Model:            modelAgg.Model,
-				Requests:         modelAgg.Requests,
-				Success:          modelAgg.Success,
-				Failed:           modelAgg.Failed,
-				InputTokens:      modelAgg.InputTokens,
-				OutputTokens:     modelAgg.OutputTokens,
-				CachedTokens:     modelAgg.CachedTokens,
-				CacheWriteTokens: modelAgg.CacheWriteTokens,
-				SuccessRate:      calcRate(modelAgg.Success, modelAgg.Requests),
-				LastRequestAt:    timePointer(modelAgg.LastRequestAt),
-				Recent:           recent,
+				Model:                modelAgg.Model,
+				Requests:             modelAgg.Requests,
+				Success:              modelAgg.Success,
+				Failed:               modelAgg.Failed,
+				InputTokens:          modelAgg.InputTokens,
+				OutputTokens:         modelAgg.OutputTokens,
+				CachedTokens:         modelAgg.CachedTokens,
+				CacheWriteTokens:     modelAgg.CacheWriteTokens,
+				FastInputTokens:      modelAgg.FastInputTokens,
+				FastOutputTokens:     modelAgg.FastOutputTokens,
+				FastCachedTokens:     modelAgg.FastCachedTokens,
+				FastCacheWriteTokens: modelAgg.FastCacheWriteTokens,
+				SuccessRate:          calcRate(modelAgg.Success, modelAgg.Requests),
+				LastRequestAt:        timePointer(modelAgg.LastRequestAt),
+				Recent:               recent,
 			})
 		}
 		sort.Slice(models, func(i, j int) bool {
@@ -598,17 +628,21 @@ func (h *Handler) GetMonitorFailureAnalysis(c *gin.Context) {
 				models := make([]monitorModelStats, 0, len(channel.Models))
 				for _, model := range channel.Models {
 					models = append(models, monitorModelStats{
-						Model:            model.Model,
-						Requests:         model.Requests,
-						Success:          model.Success,
-						Failed:           model.Failed,
-						InputTokens:      model.InputTokens,
-						OutputTokens:     model.OutputTokens,
-						CachedTokens:     model.CachedTokens,
-						CacheWriteTokens: model.CacheWriteTokens,
-						SuccessRate:      calcRate(model.Success, model.Requests),
-						LastRequestAt:    cloneTimePointer(model.LastRequestAt),
-						Recent:           fromUsageRecentRequests(model.Recent),
+						Model:                model.Model,
+						Requests:             model.Requests,
+						Success:              model.Success,
+						Failed:               model.Failed,
+						InputTokens:          model.InputTokens,
+						OutputTokens:         model.OutputTokens,
+						CachedTokens:         model.CachedTokens,
+						CacheWriteTokens:     model.CacheWriteTokens,
+						FastInputTokens:      model.FastInputTokens,
+						FastOutputTokens:     model.FastOutputTokens,
+						FastCachedTokens:     model.FastCachedTokens,
+						FastCacheWriteTokens: model.FastCacheWriteTokens,
+						SuccessRate:          calcRate(model.Success, model.Requests),
+						LastRequestAt:        cloneTimePointer(model.LastRequestAt),
+						Recent:               fromUsageRecentRequests(model.Recent),
 					})
 				}
 
@@ -694,6 +728,12 @@ func (h *Handler) GetMonitorFailureAnalysis(c *gin.Context) {
 			modelAgg.OutputTokens += record.OutputTokens
 			modelAgg.CachedTokens += record.CachedTokens
 			modelAgg.CacheWriteTokens += record.CacheWriteTokens
+			if record.Fast != nil && *record.Fast {
+				modelAgg.FastInputTokens += record.InputTokens
+				modelAgg.FastOutputTokens += record.OutputTokens
+				modelAgg.FastCachedTokens += record.CachedTokens
+				modelAgg.FastCacheWriteTokens += record.CacheWriteTokens
+			}
 		}
 		if record.Timestamp.After(modelAgg.LastRequestAt) {
 			modelAgg.LastRequestAt = record.Timestamp
@@ -717,17 +757,21 @@ func (h *Handler) GetMonitorFailureAnalysis(c *gin.Context) {
 		models := make([]monitorModelStats, 0, len(agg.Models))
 		for _, modelAgg := range agg.Models {
 			models = append(models, monitorModelStats{
-				Model:            modelAgg.Model,
-				Requests:         modelAgg.Requests,
-				Success:          modelAgg.Success,
-				Failed:           modelAgg.Failed,
-				InputTokens:      modelAgg.InputTokens,
-				OutputTokens:     modelAgg.OutputTokens,
-				CachedTokens:     modelAgg.CachedTokens,
-				CacheWriteTokens: modelAgg.CacheWriteTokens,
-				SuccessRate:      calcRate(modelAgg.Success, modelAgg.Requests),
-				LastRequestAt:    timePointer(modelAgg.LastRequestAt),
-				Recent:           normalizeRecentRequests(modelAgg.Recent),
+				Model:                modelAgg.Model,
+				Requests:             modelAgg.Requests,
+				Success:              modelAgg.Success,
+				Failed:               modelAgg.Failed,
+				InputTokens:          modelAgg.InputTokens,
+				OutputTokens:         modelAgg.OutputTokens,
+				CachedTokens:         modelAgg.CachedTokens,
+				CacheWriteTokens:     modelAgg.CacheWriteTokens,
+				FastInputTokens:      modelAgg.FastInputTokens,
+				FastOutputTokens:     modelAgg.FastOutputTokens,
+				FastCachedTokens:     modelAgg.FastCachedTokens,
+				FastCacheWriteTokens: modelAgg.FastCacheWriteTokens,
+				SuccessRate:          calcRate(modelAgg.Success, modelAgg.Requests),
+				LastRequestAt:        timePointer(modelAgg.LastRequestAt),
+				Recent:               normalizeRecentRequests(modelAgg.Recent),
 			})
 		}
 		sort.Slice(models, func(i, j int) bool {
@@ -790,6 +834,8 @@ func visitSnapshotRecords(snapshot usage.StatisticsSnapshot, visit func(record m
 					TotalTokens:      detail.Tokens.TotalTokens,
 					LatencyMs:        detail.LatencyMs,
 					TTFTMs:           detail.TTFTMs,
+					Stream:           detail.Stream,
+					Fast:             detail.Fast,
 				})
 			}
 		}
@@ -2344,17 +2390,21 @@ func (h *Handler) buildMonitorChannelStatsPayload(
 				models := make([]monitorModelStats, 0, len(channel.Models))
 				for _, model := range channel.Models {
 					models = append(models, monitorModelStats{
-						Model:            model.Model,
-						Requests:         model.Requests,
-						Success:          model.Success,
-						Failed:           model.Failed,
-						InputTokens:      model.InputTokens,
-						OutputTokens:     model.OutputTokens,
-						CachedTokens:     model.CachedTokens,
-						CacheWriteTokens: model.CacheWriteTokens,
-						SuccessRate:      calcRate(model.Success, model.Requests),
-						LastRequestAt:    cloneTimePointer(model.LastRequestAt),
-						Recent:           fromUsageRecentRequests(model.Recent),
+						Model:                model.Model,
+						Requests:             model.Requests,
+						Success:              model.Success,
+						Failed:               model.Failed,
+						InputTokens:          model.InputTokens,
+						OutputTokens:         model.OutputTokens,
+						CachedTokens:         model.CachedTokens,
+						CacheWriteTokens:     model.CacheWriteTokens,
+						FastInputTokens:      model.FastInputTokens,
+						FastOutputTokens:     model.FastOutputTokens,
+						FastCachedTokens:     model.FastCachedTokens,
+						FastCacheWriteTokens: model.FastCacheWriteTokens,
+						SuccessRate:          calcRate(model.Success, model.Requests),
+						LastRequestAt:        cloneTimePointer(model.LastRequestAt),
+						Recent:               fromUsageRecentRequests(model.Recent),
 					})
 				}
 				items = append(items, monitorChannelStatsItem{
@@ -2433,6 +2483,12 @@ func (h *Handler) buildMonitorChannelStatsPayload(
 			modelAgg.OutputTokens += record.OutputTokens
 			modelAgg.CachedTokens += record.CachedTokens
 			modelAgg.CacheWriteTokens += record.CacheWriteTokens
+			if record.Fast != nil && *record.Fast {
+				modelAgg.FastInputTokens += record.InputTokens
+				modelAgg.FastOutputTokens += record.OutputTokens
+				modelAgg.FastCachedTokens += record.CachedTokens
+				modelAgg.FastCacheWriteTokens += record.CacheWriteTokens
+			}
 		}
 		if record.Timestamp.After(modelAgg.LastRequestAt) {
 			modelAgg.LastRequestAt = record.Timestamp
@@ -2449,17 +2505,21 @@ func (h *Handler) buildMonitorChannelStatsPayload(
 		models := make([]monitorModelStats, 0, len(agg.Models))
 		for _, modelAgg := range agg.Models {
 			models = append(models, monitorModelStats{
-				Model:            modelAgg.Model,
-				Requests:         modelAgg.Requests,
-				Success:          modelAgg.Success,
-				Failed:           modelAgg.Failed,
-				InputTokens:      modelAgg.InputTokens,
-				OutputTokens:     modelAgg.OutputTokens,
-				CachedTokens:     modelAgg.CachedTokens,
-				CacheWriteTokens: modelAgg.CacheWriteTokens,
-				SuccessRate:      calcRate(modelAgg.Success, modelAgg.Requests),
-				LastRequestAt:    timePointer(modelAgg.LastRequestAt),
-				Recent:           normalizeRecentRequests(modelAgg.Recent),
+				Model:                modelAgg.Model,
+				Requests:             modelAgg.Requests,
+				Success:              modelAgg.Success,
+				Failed:               modelAgg.Failed,
+				InputTokens:          modelAgg.InputTokens,
+				OutputTokens:         modelAgg.OutputTokens,
+				CachedTokens:         modelAgg.CachedTokens,
+				CacheWriteTokens:     modelAgg.CacheWriteTokens,
+				FastInputTokens:      modelAgg.FastInputTokens,
+				FastOutputTokens:     modelAgg.FastOutputTokens,
+				FastCachedTokens:     modelAgg.FastCachedTokens,
+				FastCacheWriteTokens: modelAgg.FastCacheWriteTokens,
+				SuccessRate:          calcRate(modelAgg.Success, modelAgg.Requests),
+				LastRequestAt:        timePointer(modelAgg.LastRequestAt),
+				Recent:               normalizeRecentRequests(modelAgg.Recent),
 			})
 		}
 		sort.Slice(models, func(i, j int) bool {

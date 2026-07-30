@@ -97,11 +97,50 @@ func TestGetMonitorRequestLogs_TimeRangeAndPagination(t *testing.T) {
 	assertStringSliceEqual(t, resp.Filters.Sources, []string{"source-1"})
 }
 
+func TestGetMonitorRequestLogsIncludesRequestModes(t *testing.T) {
+	gin.SetMode(gin.TestMode)
+
+	now := time.Now()
+	stream := true
+	fastRecord := testUsageRecord(now, "api-1", "gpt-5.6", "source-1", false)
+	fastRecord.Provider = "codex"
+	fastRecord.ServiceTier = "priority"
+	fastRecord.Stream = &stream
+	nonStream := false
+	standardRecord := testUsageRecord(now.Add(-time.Second), "api-1", "gpt-5.6", "source-1", false)
+	standardRecord.Provider = "codex"
+	standardRecord.ServiceTier = "default"
+	standardRecord.Stream = &nonStream
+	h := newMonitorTestHandler(fastRecord, standardRecord)
+
+	rr := executeMonitorRequest(h.GetMonitorRequestLogs, "/monitor/request-logs")
+	if rr.Code != http.StatusOK {
+		t.Fatalf("unexpected status: %d, body=%s", rr.Code, rr.Body.String())
+	}
+	var resp struct {
+		Items []struct {
+			Stream *bool `json:"stream"`
+			Fast   *bool `json:"fast"`
+		} `json:"items"`
+	}
+	if err := json.Unmarshal(rr.Body.Bytes(), &resp); err != nil {
+		t.Fatalf("decode response failed: %v", err)
+	}
+	if len(resp.Items) != 2 || resp.Items[0].Stream == nil || !*resp.Items[0].Stream || resp.Items[0].Fast == nil || !*resp.Items[0].Fast {
+		t.Fatalf("fast request modes = %+v, want stream=true fast=true", resp.Items)
+	}
+	if resp.Items[1].Stream == nil || *resp.Items[1].Stream || resp.Items[1].Fast == nil || *resp.Items[1].Fast {
+		t.Fatalf("standard request modes = %+v, want stream=false fast=false", resp.Items)
+	}
+}
+
 func TestGetMonitorChannelStats_StatusFilterAndAggregate(t *testing.T) {
 	gin.SetMode(gin.TestMode)
 
 	base := time.Date(2026, 2, 6, 12, 0, 0, 0, time.Local)
 	first := testUsageRecord(base.Add(-2*time.Hour), "api-1", "model-a", "source-a", false)
+	first.Provider = "codex"
+	first.ServiceTier = "priority"
 	first.Detail.CachedTokens = 3
 	first.Detail.CacheCreationTokens = 4
 	second := testUsageRecord(base.Add(-90*time.Minute), "api-1", "model-a", "source-a", true)
@@ -134,13 +173,17 @@ func TestGetMonitorChannelStats_StatusFilterAndAggregate(t *testing.T) {
 			CacheWriteTokens int64   `json:"cache_write_tokens"`
 			SuccessRate      float64 `json:"success_rate"`
 			Models           []struct {
-				Model            string `json:"model"`
-				Requests         int64  `json:"requests"`
-				Failed           int64  `json:"failed"`
-				InputTokens      int64  `json:"input_tokens"`
-				OutputTokens     int64  `json:"output_tokens"`
-				CachedTokens     int64  `json:"cached_tokens"`
-				CacheWriteTokens int64  `json:"cache_write_tokens"`
+				Model                string `json:"model"`
+				Requests             int64  `json:"requests"`
+				Failed               int64  `json:"failed"`
+				InputTokens          int64  `json:"input_tokens"`
+				OutputTokens         int64  `json:"output_tokens"`
+				CachedTokens         int64  `json:"cached_tokens"`
+				CacheWriteTokens     int64  `json:"cache_write_tokens"`
+				FastInputTokens      int64  `json:"fast_input_tokens"`
+				FastOutputTokens     int64  `json:"fast_output_tokens"`
+				FastCachedTokens     int64  `json:"fast_cached_tokens"`
+				FastCacheWriteTokens int64  `json:"fast_cache_write_tokens"`
 			} `json:"models"`
 		} `json:"items"`
 		Total int `json:"total"`
@@ -176,6 +219,9 @@ func TestGetMonitorChannelStats_StatusFilterAndAggregate(t *testing.T) {
 	}
 	if item.Models[0].Model != "model-a" || item.Models[0].InputTokens != 10 || item.Models[0].OutputTokens != 20 || item.Models[0].CachedTokens != 3 {
 		t.Fatalf("unexpected first model token aggregate: %+v", item.Models[0])
+	}
+	if item.Models[0].FastInputTokens != 10 || item.Models[0].FastOutputTokens != 20 || item.Models[0].FastCachedTokens != 3 || item.Models[0].FastCacheWriteTokens != 4 {
+		t.Fatalf("unexpected first model fast token aggregate: %+v", item.Models[0])
 	}
 }
 

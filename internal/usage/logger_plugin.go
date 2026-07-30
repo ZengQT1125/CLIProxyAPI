@@ -101,6 +101,8 @@ type RequestDetail struct {
 	Timestamp time.Time  `json:"timestamp"`
 	LatencyMs int64      `json:"latency_ms"`
 	TTFTMs    int64      `json:"ttft_ms"`
+	Stream    *bool      `json:"stream,omitempty"`
+	Fast      *bool      `json:"fast,omitempty"`
 	Source    string     `json:"source"`
 	AuthIndex string     `json:"auth_index"`
 	Tokens    TokenStats `json:"tokens"`
@@ -212,6 +214,8 @@ func (s *RequestStatistics) Record(ctx context.Context, record coreusage.Record)
 		Timestamp: timestamp,
 		LatencyMs: normaliseLatency(record.Latency),
 		TTFTMs:    normaliseLatency(record.TTFT),
+		Stream:    record.Stream,
+		Fast:      boolPointer(coreusage.IsFastMode(record.Provider, record.ServiceTier)),
 		Source:    record.Source,
 		AuthIndex: record.AuthIndex,
 		Tokens:    detail,
@@ -570,6 +574,10 @@ func normaliseLatency(latency time.Duration) int64 {
 		return 0
 	}
 	return latency.Milliseconds()
+}
+
+func boolPointer(value bool) *bool {
+	return &value
 }
 
 func formatHour(hour int) string {

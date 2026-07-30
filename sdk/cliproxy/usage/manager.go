@@ -41,6 +41,9 @@ type Record struct {
 	RequestServiceTier string
 	// ResponseServiceTier stores the final tier reported by the upstream response.
 	ResponseServiceTier string
+	// Stream stores whether the request used the streaming execution path.
+	// Nil means the caller did not provide an authoritative request mode.
+	Stream *bool
 	// Generate reports whether the client requested actual generation.
 	// nil or true means generation is enabled; only an explicit false disables generation.
 	// Use GenerateFlag to set the value and GenerateEnabled to read it with the default.
@@ -77,6 +80,7 @@ type Detail struct {
 type requestedModelAliasContextKey struct{}
 type reasoningEffortContextKey struct{}
 type serviceTierContextKey struct{}
+type streamContextKey struct{}
 type generateContextKey struct{}
 
 // WithRequestedModelAlias stores the client-requested model name for usage sinks.
@@ -169,6 +173,29 @@ func ServiceTierFromContext(ctx context.Context) string {
 	default:
 		return DefaultServiceTier
 	}
+}
+
+// WithStream stores the authoritative execution mode for usage sinks.
+func WithStream(ctx context.Context, stream bool) context.Context {
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	return context.WithValue(ctx, streamContextKey{}, stream)
+}
+
+// StreamFromContext returns the execution mode and whether it was explicitly set.
+func StreamFromContext(ctx context.Context) (bool, bool) {
+	if ctx == nil {
+		return false, false
+	}
+	stream, ok := ctx.Value(streamContextKey{}).(bool)
+	return stream, ok
+}
+
+// IsFastMode reports whether a request uses Codex Priority processing.
+func IsFastMode(provider, serviceTier string) bool {
+	return strings.EqualFold(strings.TrimSpace(provider), "codex") &&
+		strings.EqualFold(strings.TrimSpace(serviceTier), "priority")
 }
 
 // WithGenerate stores whether the client requested actual generation for usage sinks.

@@ -70,6 +70,12 @@ func TestSQLiteUsageStoreMigratesCacheWriteTokensColumn(t *testing.T) {
 	if err != nil {
 		t.Fatalf("create legacy schema failed: %v", err)
 	}
+	if _, err = db.ExecContext(ctx, `
+		INSERT INTO usage_records (api_key, model, requested_at)
+		VALUES ('legacy-api', 'legacy-model', 1700000000)
+	`); err != nil {
+		t.Fatalf("insert legacy record failed: %v", err)
+	}
 	if err = db.Close(); err != nil {
 		t.Fatalf("close legacy db failed: %v", err)
 	}
@@ -97,6 +103,20 @@ func TestSQLiteUsageStoreMigratesCacheWriteTokensColumn(t *testing.T) {
 	}
 	if _, ok := columns["cache_write_tokens"]; !ok {
 		t.Fatal("cache_write_tokens column missing after migration")
+	}
+	if _, ok := columns["stream"]; !ok {
+		t.Fatal("stream column missing after migration")
+	}
+	if _, ok := columns["fast"]; !ok {
+		t.Fatal("fast column missing after migration")
+	}
+
+	var stream, fast sql.NullBool
+	if err = store.db.QueryRowContext(ctx, "SELECT stream, fast FROM usage_records WHERE api_key = ?", "legacy-api").Scan(&stream, &fast); err != nil {
+		t.Fatalf("query migrated legacy record failed: %v", err)
+	}
+	if stream.Valid || fast.Valid {
+		t.Fatalf("legacy request modes = stream:%+v fast:%+v, want unknown", stream, fast)
 	}
 }
 

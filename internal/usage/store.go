@@ -30,6 +30,8 @@ type UsageRecord struct {
 	TotalTokens      int64
 	LatencyMs        int64
 	TTFTMs           int64
+	Stream           *bool
+	Fast             *bool
 	Method           string // HTTP method (GET, POST, etc.)
 	Path             string // Request URL path (/v1/chat/completions, etc.)
 }
@@ -76,6 +78,8 @@ type DetailRecord struct {
 	CachedTokens     int64
 	CacheWriteTokens int64
 	TotalTokens      int64
+	Stream           *bool
+	Fast             *bool
 }
 
 // UsageStore defines the interface for usage record persistence.
@@ -417,7 +421,9 @@ func (s *pgUsageStore) EnsureSchema(ctx context.Context) error {
 			reasoning_tokens BIGINT NOT NULL DEFAULT 0,
 			cached_tokens    BIGINT NOT NULL DEFAULT 0,
 			cache_write_tokens BIGINT NOT NULL DEFAULT 0,
-			total_tokens     BIGINT NOT NULL DEFAULT 0
+			total_tokens     BIGINT NOT NULL DEFAULT 0,
+			stream           BOOLEAN,
+			fast             BOOLEAN
 		)
 	`, table)
 	if _, err := s.db.ExecContext(ctx, createTable); err != nil {
@@ -458,6 +464,8 @@ func (s *pgUsageStore) EnsureSchema(ctx context.Context) error {
 		fmt.Sprintf("ALTER TABLE %s ADD COLUMN IF NOT EXISTS latency_ms BIGINT NOT NULL DEFAULT 0", table),
 		fmt.Sprintf("ALTER TABLE %s ADD COLUMN IF NOT EXISTS ttft_ms BIGINT NOT NULL DEFAULT 0", table),
 		fmt.Sprintf("ALTER TABLE %s ADD COLUMN IF NOT EXISTS cache_write_tokens BIGINT NOT NULL DEFAULT 0", table),
+		fmt.Sprintf("ALTER TABLE %s ADD COLUMN IF NOT EXISTS stream BOOLEAN", table),
+		fmt.Sprintf("ALTER TABLE %s ADD COLUMN IF NOT EXISTS fast BOOLEAN", table),
 	}
 	for _, m := range pgMigrations {
 		if _, err := s.db.ExecContext(ctx, m); err != nil {
@@ -486,8 +494,8 @@ func (s *pgUsageStore) Insert(ctx context.Context, record UsageRecord) error {
 	query := fmt.Sprintf(`
 		INSERT INTO %s (api_key, model, source, auth_index, failed, requested_at,
 			input_tokens, output_tokens, reasoning_tokens, cached_tokens, cache_write_tokens, total_tokens,
-			method, path, latency_ms, ttft_ms)
-		VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16)
+			method, path, latency_ms, ttft_ms, stream, fast)
+		VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, $17, $18)
 	`, table)
 	_, err := s.db.ExecContext(ctx, query,
 		record.APIKey,
@@ -506,6 +514,8 @@ func (s *pgUsageStore) Insert(ctx context.Context, record UsageRecord) error {
 		record.Path,
 		record.LatencyMs,
 		record.TTFTMs,
+		record.Stream,
+		record.Fast,
 	)
 	if err != nil {
 		return fmt.Errorf("usage store: insert record: %w", err)
@@ -528,8 +538,8 @@ func (s *pgUsageStore) InsertBatch(ctx context.Context, records []UsageRecord) (
 	query := fmt.Sprintf(`
 		INSERT INTO %s (api_key, model, source, auth_index, failed, requested_at,
 			input_tokens, output_tokens, reasoning_tokens, cached_tokens, cache_write_tokens, total_tokens,
-			method, path, latency_ms, ttft_ms)
-		VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16)
+			method, path, latency_ms, ttft_ms, stream, fast)
+		VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, $17, $18)
 	`, table)
 
 	stmt, err := tx.PrepareContext(ctx, query)
@@ -560,6 +570,8 @@ func (s *pgUsageStore) InsertBatch(ctx context.Context, records []UsageRecord) (
 			record.Path,
 			record.LatencyMs,
 			record.TTFTMs,
+			record.Stream,
+			record.Fast,
 		)
 		if execErr != nil {
 			skipped++
@@ -589,7 +601,7 @@ func (s *pgUsageStore) ListRecordsAfterID(ctx context.Context, afterID int64, li
 	query := fmt.Sprintf(`
 		SELECT id, api_key, model, source, auth_index, failed, requested_at,
 			input_tokens, output_tokens, reasoning_tokens, cached_tokens, cache_write_tokens, total_tokens,
-			method, path, latency_ms, ttft_ms
+			method, path, latency_ms, ttft_ms, stream, fast
 		FROM %s
 		WHERE id > $1
 		ORDER BY id ASC
@@ -628,6 +640,8 @@ func (s *pgUsageStore) ListRecordsAfterID(ctx context.Context, afterID int64, li
 			&record.Path,
 			&record.LatencyMs,
 			&record.TTFTMs,
+			&record.Stream,
+			&record.Fast,
 		); err != nil {
 			return nil, afterID, fmt.Errorf("usage store: scan list records after id: %w", err)
 		}
@@ -768,7 +782,8 @@ func (s *pgUsageStore) GetDetails(ctx context.Context, offset, limit int) ([]Det
 	table := s.fullTableName("usage_records")
 	query := fmt.Sprintf(`
 		SELECT api_key, model, source, auth_index, failed, requested_at,
-			input_tokens, output_tokens, reasoning_tokens, cached_tokens, cache_write_tokens, total_tokens
+			input_tokens, output_tokens, reasoning_tokens, cached_tokens, cache_write_tokens, total_tokens,
+			stream, fast
 		FROM %s ORDER BY requested_at DESC
 		LIMIT $1 OFFSET $2
 	`, table)
@@ -788,6 +803,7 @@ func (s *pgUsageStore) GetDetails(ctx context.Context, offset, limit int) ([]Det
 			&failed, &detail.RequestedAt,
 			&detail.InputTokens, &detail.OutputTokens, &detail.ReasoningTokens,
 			&detail.CachedTokens, &detail.CacheWriteTokens, &detail.TotalTokens,
+			&detail.Stream, &detail.Fast,
 		); err != nil {
 			return nil, fmt.Errorf("usage store: scan detail: %w", err)
 		}
@@ -900,7 +916,9 @@ func (s *sqliteUsageStore) EnsureSchema(ctx context.Context) error {
 			reasoning_tokens INTEGER NOT NULL DEFAULT 0,
 			cached_tokens    INTEGER NOT NULL DEFAULT 0,
 			cache_write_tokens INTEGER NOT NULL DEFAULT 0,
-			total_tokens     INTEGER NOT NULL DEFAULT 0
+			total_tokens     INTEGER NOT NULL DEFAULT 0,
+			stream           INTEGER,
+			fast             INTEGER
 		)
 	`
 	if _, err := s.db.ExecContext(ctx, createTable); err != nil {
@@ -941,6 +959,8 @@ func (s *sqliteUsageStore) EnsureSchema(ctx context.Context) error {
 		"ALTER TABLE usage_records ADD COLUMN latency_ms INTEGER NOT NULL DEFAULT 0",
 		"ALTER TABLE usage_records ADD COLUMN ttft_ms INTEGER NOT NULL DEFAULT 0",
 		"ALTER TABLE usage_records ADD COLUMN cache_write_tokens INTEGER NOT NULL DEFAULT 0",
+		"ALTER TABLE usage_records ADD COLUMN stream INTEGER",
+		"ALTER TABLE usage_records ADD COLUMN fast INTEGER",
 	}
 	for _, m := range migrations {
 		_, _ = s.db.ExecContext(ctx, m) // ignore "duplicate column" errors
@@ -987,8 +1007,8 @@ func (s *sqliteUsageStore) Insert(ctx context.Context, record UsageRecord) error
 	query := `
 		INSERT INTO usage_records (api_key, model, source, auth_index, failed, requested_at,
 			input_tokens, output_tokens, reasoning_tokens, cached_tokens, cache_write_tokens, total_tokens,
-			method, path, latency_ms, ttft_ms)
-		VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+			method, path, latency_ms, ttft_ms, stream, fast)
+		VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
 	`
 	_, err := s.db.ExecContext(ctx, query,
 		record.APIKey,
@@ -1007,6 +1027,8 @@ func (s *sqliteUsageStore) Insert(ctx context.Context, record UsageRecord) error
 		record.Path,
 		record.LatencyMs,
 		record.TTFTMs,
+		record.Stream,
+		record.Fast,
 	)
 	if err != nil {
 		return fmt.Errorf("usage store: insert record: %w", err)
@@ -1028,8 +1050,8 @@ func (s *sqliteUsageStore) InsertBatch(ctx context.Context, records []UsageRecor
 	query := `
 		INSERT INTO usage_records (api_key, model, source, auth_index, failed, requested_at,
 			input_tokens, output_tokens, reasoning_tokens, cached_tokens, cache_write_tokens, total_tokens,
-			method, path, latency_ms, ttft_ms)
-		VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+			method, path, latency_ms, ttft_ms, stream, fast)
+		VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
 	`
 
 	stmt, err := tx.PrepareContext(ctx, query)
@@ -1060,6 +1082,8 @@ func (s *sqliteUsageStore) InsertBatch(ctx context.Context, records []UsageRecor
 			record.Path,
 			record.LatencyMs,
 			record.TTFTMs,
+			record.Stream,
+			record.Fast,
 		)
 		if execErr != nil {
 			skipped++
@@ -1198,7 +1222,8 @@ func (s *sqliteUsageStore) GetDetails(ctx context.Context, offset, limit int) ([
 
 	query := `
 		SELECT api_key, model, source, auth_index, failed, requested_at,
-			input_tokens, output_tokens, reasoning_tokens, cached_tokens, cache_write_tokens, total_tokens
+			input_tokens, output_tokens, reasoning_tokens, cached_tokens, cache_write_tokens, total_tokens,
+			stream, fast
 		FROM usage_records ORDER BY requested_at DESC
 		LIMIT ? OFFSET ?
 	`
@@ -1219,6 +1244,7 @@ func (s *sqliteUsageStore) GetDetails(ctx context.Context, offset, limit int) ([
 			&failed, &unixTime,
 			&detail.InputTokens, &detail.OutputTokens, &detail.ReasoningTokens,
 			&detail.CachedTokens, &detail.CacheWriteTokens, &detail.TotalTokens,
+			&detail.Stream, &detail.Fast,
 		); err != nil {
 			return nil, fmt.Errorf("usage store: scan detail: %w", err)
 		}

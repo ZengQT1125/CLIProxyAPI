@@ -15,7 +15,7 @@ func TestSQLiteUsageStoreQueryMonitorRequestLogs(t *testing.T) {
 
 	base := time.Date(2026, 2, 7, 12, 0, 0, 0, time.UTC)
 	insertUsageRecords(t, store,
-		UsageRecord{APIKey: "api-1", Model: "model-a", Source: "source-a", RequestedAt: base.Add(-3 * time.Hour), CacheWriteTokens: 9, TotalTokens: 10},
+		UsageRecord{APIKey: "api-1", Model: "model-a", Source: "source-a", RequestedAt: base.Add(-3 * time.Hour), Stream: boolPtr(true), Fast: boolPtr(true), CacheWriteTokens: 9, TotalTokens: 10},
 		UsageRecord{APIKey: "api-1", Model: "model-a", Source: "source-a", RequestedAt: base.Add(-2 * time.Hour), Failed: true, TotalTokens: 20},
 		UsageRecord{APIKey: "api-1", Model: "model-a", Source: "source-a", RequestedAt: base.Add(-1 * time.Hour), TotalTokens: 30},
 		UsageRecord{APIKey: "api-2", Model: "model-b", Source: "source-b", RequestedAt: base.Add(-30 * time.Minute), TotalTokens: 40},
@@ -47,6 +47,12 @@ func TestSQLiteUsageStoreQueryMonitorRequestLogs(t *testing.T) {
 	if result.Items[0].CacheWriteTokens != 9 {
 		t.Fatalf("cache write tokens = %d, want 9", result.Items[0].CacheWriteTokens)
 	}
+	if result.Items[0].Stream == nil || !*result.Items[0].Stream {
+		t.Fatalf("stream = %v, want true", result.Items[0].Stream)
+	}
+	if result.Items[0].Fast == nil || !*result.Items[0].Fast {
+		t.Fatalf("fast = %v, want true", result.Items[0].Fast)
+	}
 
 	stats, ok := result.GroupStats[MonitorGroupKey("source-a", "model-a")]
 	if !ok {
@@ -74,7 +80,7 @@ func TestSQLiteUsageStoreQueryMonitorChannelStats(t *testing.T) {
 
 	base := time.Date(2026, 2, 7, 12, 0, 0, 0, time.UTC)
 	insertUsageRecords(t, store,
-		UsageRecord{APIKey: "api-1", Model: "model-a", Source: "source-a", RequestedAt: base.Add(-4 * time.Hour), InputTokens: 100, OutputTokens: 20, CachedTokens: 30, CacheWriteTokens: 40},
+		UsageRecord{APIKey: "api-1", Model: "model-a", Source: "source-a", RequestedAt: base.Add(-4 * time.Hour), Fast: boolPtr(true), InputTokens: 100, OutputTokens: 20, CachedTokens: 30, CacheWriteTokens: 40},
 		UsageRecord{APIKey: "api-1", Model: "model-a", Source: "source-a", RequestedAt: base.Add(-3 * time.Hour), Failed: true, InputTokens: 50, OutputTokens: 10, CachedTokens: 5, CacheWriteTokens: 5},
 		UsageRecord{APIKey: "api-1", Model: "model-b", Source: "source-a", RequestedAt: base.Add(-2 * time.Hour), InputTokens: 25, OutputTokens: 7, CacheWriteTokens: 7},
 		UsageRecord{APIKey: "api-2", Model: "model-c", Source: "source-b", RequestedAt: base.Add(-1 * time.Hour), InputTokens: 11, OutputTokens: 13, CachedTokens: 17, CacheWriteTokens: 17},
@@ -113,10 +119,15 @@ func TestSQLiteUsageStoreQueryMonitorChannelStats(t *testing.T) {
 	if item.Models[0].CacheWriteTokens != 40 {
 		t.Fatalf("first model cache write aggregate = %d, want 40", item.Models[0].CacheWriteTokens)
 	}
+	if item.Models[0].FastInputTokens != 100 || item.Models[0].FastOutputTokens != 20 || item.Models[0].FastCachedTokens != 30 || item.Models[0].FastCacheWriteTokens != 40 {
+		t.Fatalf("first model fast token aggregate = %+v", item.Models[0])
+	}
 
 	assertStringSliceEqual(t, result.Filters.Models, []string{"model-a", "model-b", "model-c"})
 	assertStringSliceEqual(t, result.Filters.Sources, []string{"source-a", "source-b"})
 }
+
+func boolPtr(value bool) *bool { return &value }
 
 func TestSQLiteUsageStoreQueryMonitorChannelStatsSummary(t *testing.T) {
 	ctx := context.Background()

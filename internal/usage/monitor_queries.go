@@ -61,6 +61,8 @@ type MonitorRequestLog struct {
 	TotalTokens      int64
 	LatencyMs        int64
 	TTFTMs           int64
+	Stream           *bool
+	Fast             *bool
 }
 
 // MonitorRequestGroupStats represents per-channel+model counters for request logs.
@@ -82,16 +84,20 @@ type MonitorRequestLogsResult struct {
 
 // MonitorModelStats is the model-level aggregate used by channel/failure analysis.
 type MonitorModelStats struct {
-	Model            string
-	Requests         int64
-	Success          int64
-	Failed           int64
-	InputTokens      int64
-	OutputTokens     int64
-	CachedTokens     int64
-	CacheWriteTokens int64
-	LastRequestAt    *time.Time
-	Recent           []MonitorRecentRequest
+	Model                string
+	Requests             int64
+	Success              int64
+	Failed               int64
+	InputTokens          int64
+	OutputTokens         int64
+	CachedTokens         int64
+	CacheWriteTokens     int64
+	FastInputTokens      int64
+	FastOutputTokens     int64
+	FastCachedTokens     int64
+	FastCacheWriteTokens int64
+	LastRequestAt        *time.Time
+	Recent               []MonitorRecentRequest
 }
 
 // MonitorChannelStats is the source-level aggregate used by channel stats endpoint.
@@ -474,7 +480,7 @@ func (s *sqliteUsageStore) QueryMonitorRequestLogs(ctx context.Context, filter M
 	query := fmt.Sprintf(`
 		SELECT api_key, model, COALESCE(NULLIF(source, ''), 'unknown'), auth_index,
 			failed, requested_at, input_tokens, output_tokens, reasoning_tokens,
-			cached_tokens, cache_write_tokens, total_tokens, latency_ms, ttft_ms
+			cached_tokens, cache_write_tokens, total_tokens, latency_ms, ttft_ms, stream, fast
 		FROM usage_records
 		WHERE %s
 		ORDER BY requested_at DESC, id DESC
@@ -512,6 +518,8 @@ func (s *sqliteUsageStore) QueryMonitorRequestLogs(ctx context.Context, filter M
 			&item.TotalTokens,
 			&item.LatencyMs,
 			&item.TTFTMs,
+			&item.Stream,
+			&item.Fast,
 		); err != nil {
 			return MonitorRequestLogsResult{}, fmt.Errorf("usage store: scan monitor request logs: %w", err)
 		}
@@ -1140,6 +1148,10 @@ func (s *sqliteUsageStore) attachChannelModels(ctx context.Context, whereClause 
 			COALESCE(SUM(CASE WHEN failed=0 THEN output_tokens ELSE 0 END), 0),
 			COALESCE(SUM(CASE WHEN failed=0 THEN cached_tokens ELSE 0 END), 0),
 			COALESCE(SUM(CASE WHEN failed=0 THEN cache_write_tokens ELSE 0 END), 0),
+			COALESCE(SUM(CASE WHEN failed=0 AND fast=1 THEN input_tokens ELSE 0 END), 0),
+			COALESCE(SUM(CASE WHEN failed=0 AND fast=1 THEN output_tokens ELSE 0 END), 0),
+			COALESCE(SUM(CASE WHEN failed=0 AND fast=1 THEN cached_tokens ELSE 0 END), 0),
+			COALESCE(SUM(CASE WHEN failed=0 AND fast=1 THEN cache_write_tokens ELSE 0 END), 0),
 			MAX(requested_at)
 		FROM usage_records
 		WHERE %s
@@ -1168,6 +1180,10 @@ func (s *sqliteUsageStore) attachChannelModels(ctx context.Context, whereClause 
 			&model.OutputTokens,
 			&model.CachedTokens,
 			&model.CacheWriteTokens,
+			&model.FastInputTokens,
+			&model.FastOutputTokens,
+			&model.FastCachedTokens,
+			&model.FastCacheWriteTokens,
 			&lastUnix,
 		); err != nil {
 			return fmt.Errorf("usage store: scan monitor channel model: %w", err)
@@ -1262,6 +1278,10 @@ func (s *sqliteUsageStore) attachFailureModels(ctx context.Context, failedWhere 
 			COALESCE(SUM(CASE WHEN failed=0 THEN output_tokens ELSE 0 END), 0),
 			COALESCE(SUM(CASE WHEN failed=0 THEN cached_tokens ELSE 0 END), 0),
 			COALESCE(SUM(CASE WHEN failed=0 THEN cache_write_tokens ELSE 0 END), 0),
+			COALESCE(SUM(CASE WHEN failed=0 AND fast=1 THEN input_tokens ELSE 0 END), 0),
+			COALESCE(SUM(CASE WHEN failed=0 AND fast=1 THEN output_tokens ELSE 0 END), 0),
+			COALESCE(SUM(CASE WHEN failed=0 AND fast=1 THEN cached_tokens ELSE 0 END), 0),
+			COALESCE(SUM(CASE WHEN failed=0 AND fast=1 THEN cache_write_tokens ELSE 0 END), 0),
 			MAX(requested_at)
 		FROM usage_records
 		WHERE %s
@@ -1290,6 +1310,10 @@ func (s *sqliteUsageStore) attachFailureModels(ctx context.Context, failedWhere 
 			&model.OutputTokens,
 			&model.CachedTokens,
 			&model.CacheWriteTokens,
+			&model.FastInputTokens,
+			&model.FastOutputTokens,
+			&model.FastCachedTokens,
+			&model.FastCacheWriteTokens,
 			&lastUnix,
 		); err != nil {
 			return fmt.Errorf("usage store: scan failure model: %w", err)
