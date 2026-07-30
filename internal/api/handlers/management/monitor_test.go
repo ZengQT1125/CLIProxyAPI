@@ -186,7 +186,10 @@ func TestGetMonitorChannelStats_StatusFilterAndAggregate(t *testing.T) {
 				FastCacheWriteTokens int64  `json:"fast_cache_write_tokens"`
 			} `json:"models"`
 		} `json:"items"`
-		Total int `json:"total"`
+		Total   int `json:"total"`
+		Filters struct {
+			APIs []string `json:"apis"`
+		} `json:"filters"`
 	}
 	if err := json.Unmarshal(rr.Body.Bytes(), &resp); err != nil {
 		t.Fatalf("decode response failed: %v", err)
@@ -195,6 +198,7 @@ func TestGetMonitorChannelStats_StatusFilterAndAggregate(t *testing.T) {
 	if resp.Total != 1 {
 		t.Fatalf("unexpected total: got %d want 1", resp.Total)
 	}
+	assertStringSliceEqual(t, resp.Filters.APIs, []string{"api-1", "api-2"})
 	if len(resp.Items) != 1 {
 		t.Fatalf("unexpected items count: got %d", len(resp.Items))
 	}
@@ -357,7 +361,7 @@ func TestGetMonitorRequestLogs_ApiFilterContains(t *testing.T) {
 	}
 }
 
-func TestGetMonitorRequestLogs_DatabasePluginPath(t *testing.T) {
+func TestGetMonitorDatabasePluginRequestLogsAndChannelFilters(t *testing.T) {
 	gin.SetMode(gin.TestMode)
 
 	usage.CloseDatabasePlugin()
@@ -427,6 +431,20 @@ func TestGetMonitorRequestLogs_DatabasePluginPath(t *testing.T) {
 	if !resp.Items[0].Failed {
 		t.Fatalf("expected latest item to be failed")
 	}
+
+	channelRR := executeMonitorRequest(h.GetMonitorChannelStats, "/monitor/channel-stats?start_time="+startQuery+"&end_time="+endQuery)
+	if channelRR.Code != http.StatusOK {
+		t.Fatalf("unexpected channel stats status: %d, body=%s", channelRR.Code, channelRR.Body.String())
+	}
+	var channelResp struct {
+		Filters struct {
+			APIs []string `json:"apis"`
+		} `json:"filters"`
+	}
+	if err = json.Unmarshal(channelRR.Body.Bytes(), &channelResp); err != nil {
+		t.Fatalf("decode channel stats response failed: %v", err)
+	}
+	assertStringSliceEqual(t, channelResp.Filters.APIs, []string{"api-db"})
 }
 
 func TestGetMonitorKeyStatsWithoutAuthIndexOmitsFilter(t *testing.T) {

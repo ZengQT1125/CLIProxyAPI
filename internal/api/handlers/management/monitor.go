@@ -418,7 +418,7 @@ func (h *Handler) GetMonitorChannelStats(c *gin.Context) {
 				"items":   items,
 				"total":   len(items),
 				"limit":   limit,
-				"filters": monitorFilterOptions{Models: queryResult.Filters.Models, Sources: queryResult.Filters.Sources},
+				"filters": monitorFilterOptions{APIs: queryResult.Filters.APIs, Models: queryResult.Filters.Models, Sources: queryResult.Filters.Sources},
 				"time_range": monitorTimeRange{
 					Start: start,
 					End:   end,
@@ -429,6 +429,7 @@ func (h *Handler) GetMonitorChannelStats(c *gin.Context) {
 	}
 
 	channelMap := make(map[string]*monitorChannelAggregate)
+	apiSet := make(map[string]struct{})
 	modelSet := make(map[string]struct{})
 	sourceSet := make(map[string]struct{})
 
@@ -495,6 +496,9 @@ func (h *Handler) GetMonitorChannelStats(c *gin.Context) {
 		}
 
 		if !summaryOnly {
+			if record.APIKey != "" {
+				apiSet[record.APIKey] = struct{}{}
+			}
 			sourceSet[source] = struct{}{}
 			if record.Model != "" {
 				modelSet[record.Model] = struct{}{}
@@ -579,7 +583,7 @@ func (h *Handler) GetMonitorChannelStats(c *gin.Context) {
 
 	filters := monitorFilterOptions{}
 	if !summaryOnly {
-		filters = monitorFilterOptions{Models: setToSortedSlice(modelSet), Sources: setToSortedSlice(sourceSet)}
+		filters = monitorFilterOptions{APIs: setToSortedSlice(apiSet), Models: setToSortedSlice(modelSet), Sources: setToSortedSlice(sourceSet)}
 	}
 	c.JSON(http.StatusOK, gin.H{
 		"items":      items,
@@ -2427,6 +2431,7 @@ func (h *Handler) buildMonitorChannelStatsPayload(
 				"total": len(items),
 				"limit": limit,
 				"filters": monitorFilterOptions{
+					APIs:    queryResult.Filters.APIs,
 					Models:  queryResult.Filters.Models,
 					Sources: queryResult.Filters.Sources,
 				},
@@ -2437,6 +2442,7 @@ func (h *Handler) buildMonitorChannelStatsPayload(
 
 	// Snapshot fallback mirrors GetMonitorChannelStats for consistency when DB is unavailable.
 	channelMap := make(map[string]*monitorChannelAggregate)
+	apiSet := make(map[string]struct{})
 	modelSet := make(map[string]struct{})
 	sourceSet := make(map[string]struct{})
 	visitSnapshotRecords(h.usageSnapshot(), func(record monitorRecord) {
@@ -2494,6 +2500,9 @@ func (h *Handler) buildMonitorChannelStatsPayload(
 			modelAgg.LastRequestAt = record.Timestamp
 		}
 		modelAgg.Recent = append(modelAgg.Recent, monitorRecentRequest{Failed: record.Failed, Timestamp: record.Timestamp})
+		if record.APIKey != "" {
+			apiSet[record.APIKey] = struct{}{}
+		}
 		sourceSet[source] = struct{}{}
 		if record.Model != "" {
 			modelSet[record.Model] = struct{}{}
@@ -2570,6 +2579,7 @@ func (h *Handler) buildMonitorChannelStatsPayload(
 		"total": len(items),
 		"limit": limit,
 		"filters": monitorFilterOptions{
+			APIs:    setToSortedSlice(apiSet),
 			Models:  models,
 			Sources: sources,
 		},

@@ -647,7 +647,7 @@ func (s *sqliteUsageStore) QueryMonitorChannelStats(ctx context.Context, filter 
 		return s.queryMonitorChannelSummary(ctx, whereClause, args, limit)
 	}
 
-	filters, err := s.queryMonitorFilterOptions(ctx, baseFilter, false, false)
+	filters, err := s.queryMonitorFilterOptions(ctx, baseFilter, false, true)
 	if err != nil {
 		return MonitorChannelStatsResult{}, err
 	}

@@ -123,6 +123,7 @@ func TestSQLiteUsageStoreQueryMonitorChannelStats(t *testing.T) {
 		t.Fatalf("first model fast token aggregate = %+v", item.Models[0])
 	}
 
+	assertStringSliceEqual(t, result.Filters.APIs, []string{"api-1", "api-2"})
 	assertStringSliceEqual(t, result.Filters.Models, []string{"model-a", "model-b", "model-c"})
 	assertStringSliceEqual(t, result.Filters.Sources, []string{"source-a", "source-b"})
 }
