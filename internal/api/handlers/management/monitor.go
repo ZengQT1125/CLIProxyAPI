@@ -346,7 +346,7 @@ func (h *Handler) GetMonitorChannelStats(c *gin.Context) {
 		c.JSON(http.StatusBadRequest, gin.H{"error": err.Error()})
 		return
 	}
-	limit, err := parseTopLimit(c)
+	page, pageSize, err := parsePagination(c)
 	if err != nil {
 		c.JSON(http.StatusBadRequest, gin.H{"error": err.Error()})
 		return
@@ -373,7 +373,7 @@ func (h *Handler) GetMonitorChannelStats(c *gin.Context) {
 		usageFilter.Status = strings.TrimSpace(status)
 		usageFilter.SummaryOnly = summaryOnly
 
-		queryResult, queryErr := dbPlugin.QueryMonitorChannelStats(c.Request.Context(), usageFilter, limit, monitorRecentLimit)
+		queryResult, queryErr := dbPlugin.QueryMonitorChannelStats(c.Request.Context(), usageFilter, page, pageSize, monitorRecentLimit)
 		if queryErr == nil {
 			items := make([]monitorChannelStatsItem, 0, len(queryResult.Items))
 			for _, channel := range queryResult.Items {
@@ -414,11 +414,16 @@ func (h *Handler) GetMonitorChannelStats(c *gin.Context) {
 				})
 			}
 
+			totalPages := calcTotalPages(queryResult.Total, queryResult.PageSize)
 			c.JSON(http.StatusOK, gin.H{
-				"items":   items,
-				"total":   len(items),
-				"limit":   limit,
-				"filters": monitorFilterOptions{APIs: queryResult.Filters.APIs, Models: queryResult.Filters.Models, Sources: queryResult.Filters.Sources},
+				"items":       items,
+				"total":       queryResult.Total,
+				"page":        queryResult.Page,
+				"page_size":   queryResult.PageSize,
+				"total_pages": totalPages,
+				"has_prev":    queryResult.Page > 1,
+				"has_next":    queryResult.Page < totalPages,
+				"filters":     monitorFilterOptions{APIs: queryResult.Filters.APIs, Models: queryResult.Filters.Models, Sources: queryResult.Filters.Sources},
 				"time_range": monitorTimeRange{
 					Start: start,
 					End:   end,
@@ -577,20 +582,24 @@ func (h *Handler) GetMonitorChannelStats(c *gin.Context) {
 		}
 		return items[i].TotalRequests > items[j].TotalRequests
 	})
-	if len(items) > limit {
-		items = items[:limit]
-	}
+	total := len(items)
+	items = paginate(items, page, pageSize)
+	totalPages := calcTotalPages(total, pageSize)
 
 	filters := monitorFilterOptions{}
 	if !summaryOnly {
 		filters = monitorFilterOptions{APIs: setToSortedSlice(apiSet), Models: setToSortedSlice(modelSet), Sources: setToSortedSlice(sourceSet)}
 	}
 	c.JSON(http.StatusOK, gin.H{
-		"items":      items,
-		"total":      len(items),
-		"limit":      limit,
-		"filters":    filters,
-		"time_range": monitorTimeRange{Start: start, End: end},
+		"items":       items,
+		"total":       total,
+		"page":        page,
+		"page_size":   pageSize,
+		"total_pages": totalPages,
+		"has_prev":    page > 1,
+		"has_next":    page < totalPages,
+		"filters":     filters,
+		"time_range":  monitorTimeRange{Start: start, End: end},
 	})
 }
 
@@ -2387,7 +2396,7 @@ func (h *Handler) buildMonitorChannelStatsPayload(
 	}
 
 	if dbPlugin := usage.GetDatabasePlugin(); dbPlugin != nil {
-		queryResult, queryErr := dbPlugin.QueryMonitorChannelStats(c.Request.Context(), toUsageMonitorFilter(filter), limit, monitorRecentLimit)
+		queryResult, queryErr := dbPlugin.QueryMonitorChannelStats(c.Request.Context(), toUsageMonitorFilter(filter), 1, limit, monitorRecentLimit)
 		if queryErr == nil {
 			items := make([]monitorChannelStatsItem, 0, len(queryResult.Items))
 			for _, channel := range queryResult.Items {

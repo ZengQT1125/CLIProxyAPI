@@ -117,8 +117,11 @@ type MonitorChannelStats struct {
 
 // MonitorChannelStatsResult is the SQL-backed result for channel stats endpoint.
 type MonitorChannelStatsResult struct {
-	Items   []MonitorChannelStats
-	Filters MonitorFilterOptions
+	Items    []MonitorChannelStats
+	Total    int
+	Page     int
+	PageSize int
+	Filters  MonitorFilterOptions
 }
 
 // MonitorFailureStats is the source-level aggregate used by failure analysis endpoint.
@@ -137,7 +140,7 @@ type MonitorFailureStatsResult struct {
 
 type monitorQueryableStore interface {
 	QueryMonitorRequestLogs(ctx context.Context, filter MonitorQueryFilter, page, pageSize, recentLimit int) (MonitorRequestLogsResult, error)
-	QueryMonitorChannelStats(ctx context.Context, filter MonitorQueryFilter, limit, recentLimit int) (MonitorChannelStatsResult, error)
+	QueryMonitorChannelStats(ctx context.Context, filter MonitorQueryFilter, page, pageSize, recentLimit int) (MonitorChannelStatsResult, error)
 	QueryMonitorFailureStats(ctx context.Context, filter MonitorQueryFilter, limit, recentLimit int) (MonitorFailureStatsResult, error)
 	QueryMonitorRequestDetails(ctx context.Context, center *time.Time, windowSec int, method, path string, limit int) ([]MonitorRequestDetail, error)
 	QueryMonitorKpi(ctx context.Context, filter MonitorQueryFilter) (MonitorKpiResult, error)
@@ -248,7 +251,7 @@ func (p *DatabasePlugin) QueryMonitorRequestLogs(ctx context.Context, filter Mon
 }
 
 // QueryMonitorChannelStats queries channel aggregates directly from persistence layer.
-func (p *DatabasePlugin) QueryMonitorChannelStats(ctx context.Context, filter MonitorQueryFilter, limit, recentLimit int) (MonitorChannelStatsResult, error) {
+func (p *DatabasePlugin) QueryMonitorChannelStats(ctx context.Context, filter MonitorQueryFilter, page, pageSize, recentLimit int) (MonitorChannelStatsResult, error) {
 	queryable, err := p.monitorQueryableStore()
 	if err != nil {
 		return MonitorChannelStatsResult{}, err
@@ -256,7 +259,7 @@ func (p *DatabasePlugin) QueryMonitorChannelStats(ctx context.Context, filter Mo
 	if ctx == nil {
 		ctx = context.Background()
 	}
-	return queryable.QueryMonitorChannelStats(ctx, normalizeMonitorFilter(filter), limit, recentLimit)
+	return queryable.QueryMonitorChannelStats(ctx, normalizeMonitorFilter(filter), page, pageSize, recentLimit)
 }
 
 // QueryMonitorFailureStats queries failure aggregates directly from persistence layer.
@@ -385,11 +388,11 @@ func (s *mirrorUsageStore) QueryMonitorRequestLogs(ctx context.Context, filter M
 	return s.local.QueryMonitorRequestLogs(ctx, filter, page, pageSize, recentLimit)
 }
 
-func (s *mirrorUsageStore) QueryMonitorChannelStats(ctx context.Context, filter MonitorQueryFilter, limit, recentLimit int) (MonitorChannelStatsResult, error) {
+func (s *mirrorUsageStore) QueryMonitorChannelStats(ctx context.Context, filter MonitorQueryFilter, page, pageSize, recentLimit int) (MonitorChannelStatsResult, error) {
 	if s == nil || s.local == nil {
 		return MonitorChannelStatsResult{}, fmt.Errorf("usage store: mirror store not initialized")
 	}
-	return s.local.QueryMonitorChannelStats(ctx, filter, limit, recentLimit)
+	return s.local.QueryMonitorChannelStats(ctx, filter, page, pageSize, recentLimit)
 }
 
 func (s *mirrorUsageStore) QueryMonitorFailureStats(ctx context.Context, filter MonitorQueryFilter, limit, recentLimit int) (MonitorFailureStatsResult, error) {
@@ -631,11 +634,12 @@ func (s *sqliteUsageStore) QueryMonitorRequestLogs(ctx context.Context, filter M
 	}, nil
 }
 
-func (s *sqliteUsageStore) QueryMonitorChannelStats(ctx context.Context, filter MonitorQueryFilter, limit, recentLimit int) (MonitorChannelStatsResult, error) {
+func (s *sqliteUsageStore) QueryMonitorChannelStats(ctx context.Context, filter MonitorQueryFilter, page, pageSize, recentLimit int) (MonitorChannelStatsResult, error) {
 	if s == nil || s.db == nil {
 		return MonitorChannelStatsResult{}, fmt.Errorf("usage store: sqlite store not initialized")
 	}
-	limit = clampInt(limit, 1, 100, 10)
+	page = clampInt(page, 1, 1_000_000, 1)
+	pageSize = clampInt(pageSize, 1, 200, 20)
 	recentLimit = clampInt(recentLimit, 1, 100, monitorDefaultRecentLimit)
 
 	baseFilter := filter
@@ -644,7 +648,7 @@ func (s *sqliteUsageStore) QueryMonitorChannelStats(ctx context.Context, filter 
 
 	whereClause, args := buildSQLiteMonitorWhere(baseFilter, false)
 	if filter.SummaryOnly {
-		return s.queryMonitorChannelSummary(ctx, whereClause, args, limit)
+		return s.queryMonitorChannelSummary(ctx, whereClause, args, pageSize)
 	}
 
 	filters, err := s.queryMonitorFilterOptions(ctx, baseFilter, false, true)
@@ -657,7 +661,7 @@ func (s *sqliteUsageStore) QueryMonitorChannelStats(ctx context.Context, filter 
 		return MonitorChannelStatsResult{}, err
 	}
 	if len(channelMap) == 0 {
-		return MonitorChannelStatsResult{Items: []MonitorChannelStats{}, Filters: filters}, nil
+		return MonitorChannelStatsResult{Items: []MonitorChannelStats{}, Page: page, PageSize: pageSize, Filters: filters}, nil
 	}
 
 	if err = s.attachChannelModels(ctx, whereClause, args, channelMap); err != nil {
@@ -699,8 +703,16 @@ func (s *sqliteUsageStore) QueryMonitorChannelStats(ctx context.Context, filter 
 		return items[i].TotalRequests > items[j].TotalRequests
 	})
 
-	if len(items) > limit {
-		items = items[:limit]
+	total := len(items)
+	start := (page - 1) * pageSize
+	if start >= total {
+		items = []MonitorChannelStats{}
+	} else {
+		end := start + pageSize
+		if end > total {
+			end = total
+		}
+		items = items[start:end]
 	}
 
 	// Batch: channel-level recent requests using ROW_NUMBER
@@ -796,7 +808,13 @@ func (s *sqliteUsageStore) QueryMonitorChannelStats(ctx context.Context, filter 
 		}
 	}
 
-	return MonitorChannelStatsResult{Items: items, Filters: filters}, nil
+	return MonitorChannelStatsResult{
+		Items:    items,
+		Total:    total,
+		Page:     page,
+		PageSize: pageSize,
+		Filters:  filters,
+	}, nil
 }
 
 func (s *sqliteUsageStore) QueryMonitorFailureStats(ctx context.Context, filter MonitorQueryFilter, limit, recentLimit int) (MonitorFailureStatsResult, error) {
@@ -1104,8 +1122,10 @@ func (s *sqliteUsageStore) queryMonitorChannelSummary(ctx context.Context, where
 	}
 	if len(orderedSources) == 0 {
 		return MonitorChannelStatsResult{
-			Items:   []MonitorChannelStats{},
-			Filters: MonitorFilterOptions{APIs: []string{}, Models: []string{}, Sources: []string{}},
+			Items:    []MonitorChannelStats{},
+			Page:     1,
+			PageSize: limit,
+			Filters:  MonitorFilterOptions{APIs: []string{}, Models: []string{}, Sources: []string{}},
 		}, nil
 	}
 
@@ -1132,8 +1152,11 @@ func (s *sqliteUsageStore) queryMonitorChannelSummary(ctx context.Context, where
 	}
 
 	return MonitorChannelStatsResult{
-		Items:   items,
-		Filters: MonitorFilterOptions{APIs: []string{}, Models: []string{}, Sources: []string{}},
+		Items:    items,
+		Total:    len(items),
+		Page:     1,
+		PageSize: limit,
+		Filters:  MonitorFilterOptions{APIs: []string{}, Models: []string{}, Sources: []string{}},
 	}, nil
 }
 

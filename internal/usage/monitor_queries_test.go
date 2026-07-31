@@ -86,7 +86,7 @@ func TestSQLiteUsageStoreQueryMonitorChannelStats(t *testing.T) {
 		UsageRecord{APIKey: "api-2", Model: "model-c", Source: "source-b", RequestedAt: base.Add(-1 * time.Hour), InputTokens: 11, OutputTokens: 13, CachedTokens: 17, CacheWriteTokens: 17},
 	)
 
-	result, err := store.QueryMonitorChannelStats(ctx, MonitorQueryFilter{Status: "failed"}, 10, 12)
+	result, err := store.QueryMonitorChannelStats(ctx, MonitorQueryFilter{Status: "failed"}, 1, 10, 12)
 	if err != nil {
 		t.Fatalf("QueryMonitorChannelStats failed: %v", err)
 	}
@@ -130,6 +130,31 @@ func TestSQLiteUsageStoreQueryMonitorChannelStats(t *testing.T) {
 
 func boolPtr(value bool) *bool { return &value }
 
+func TestSQLiteUsageStoreQueryMonitorChannelStatsPagination(t *testing.T) {
+	ctx := context.Background()
+	store := newTestSQLiteUsageStore(t)
+	defer store.Close()
+
+	base := time.Date(2026, 7, 31, 12, 0, 0, 0, time.UTC)
+	insertUsageRecords(t, store,
+		UsageRecord{APIKey: "api-1", Model: "model-a", Source: "source-a", RequestedAt: base.Add(-4 * time.Minute)},
+		UsageRecord{APIKey: "api-1", Model: "model-a", Source: "source-a", RequestedAt: base.Add(-3 * time.Minute)},
+		UsageRecord{APIKey: "api-1", Model: "model-a", Source: "source-b", RequestedAt: base.Add(-2 * time.Minute)},
+		UsageRecord{APIKey: "api-1", Model: "model-a", Source: "source-c", RequestedAt: base.Add(-time.Minute)},
+	)
+
+	result, err := store.QueryMonitorChannelStats(ctx, MonitorQueryFilter{}, 2, 2, 12)
+	if err != nil {
+		t.Fatalf("QueryMonitorChannelStats failed: %v", err)
+	}
+	if result.Total != 3 || result.Page != 2 || result.PageSize != 2 {
+		t.Fatalf("unexpected pagination: total=%d page=%d page_size=%d", result.Total, result.Page, result.PageSize)
+	}
+	if len(result.Items) != 1 || result.Items[0].Source != "source-c" {
+		t.Fatalf("unexpected page items: %+v", result.Items)
+	}
+}
+
 func TestSQLiteUsageStoreQueryMonitorChannelStatsSummary(t *testing.T) {
 	ctx := context.Background()
 	store := newTestSQLiteUsageStore(t)
@@ -142,7 +167,7 @@ func TestSQLiteUsageStoreQueryMonitorChannelStatsSummary(t *testing.T) {
 		UsageRecord{APIKey: "api-2", Model: "model-c", Source: "source-b", RequestedAt: base.Add(-1 * time.Hour), InputTokens: 11, OutputTokens: 13},
 	)
 
-	result, err := store.QueryMonitorChannelStats(ctx, MonitorQueryFilter{SummaryOnly: true}, 1, 12)
+	result, err := store.QueryMonitorChannelStats(ctx, MonitorQueryFilter{SummaryOnly: true}, 1, 1, 12)
 	if err != nil {
 		t.Fatalf("QueryMonitorChannelStats summary failed: %v", err)
 	}
@@ -172,7 +197,7 @@ func TestSQLiteUsageStoreQueryMonitorChannelStatsSummaryCombinesUnknownSources(t
 		UsageRecord{APIKey: "api-1", Model: "model-literal", Source: "unknown", RequestedAt: base.Add(-time.Hour)},
 	)
 
-	result, err := store.QueryMonitorChannelStats(ctx, MonitorQueryFilter{SummaryOnly: true}, 1, 12)
+	result, err := store.QueryMonitorChannelStats(ctx, MonitorQueryFilter{SummaryOnly: true}, 1, 1, 12)
 	if err != nil {
 		t.Fatalf("QueryMonitorChannelStats summary failed: %v", err)
 	}

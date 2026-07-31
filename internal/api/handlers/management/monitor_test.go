@@ -229,6 +229,48 @@ func TestGetMonitorChannelStats_StatusFilterAndAggregate(t *testing.T) {
 	}
 }
 
+func TestGetMonitorChannelStats_PaginatesWithoutDroppingChannels(t *testing.T) {
+	gin.SetMode(gin.TestMode)
+
+	base := time.Date(2026, 7, 31, 12, 0, 0, 0, time.Local)
+	h := newMonitorTestHandler(
+		testUsageRecord(base.Add(-5*time.Minute), "api-1", "model-a", "source-a", false),
+		testUsageRecord(base.Add(-4*time.Minute), "api-1", "model-a", "source-a", false),
+		testUsageRecord(base.Add(-3*time.Minute), "api-1", "model-a", "source-b", false),
+		testUsageRecord(base.Add(-2*time.Minute), "api-1", "model-a", "source-c", false),
+	)
+
+	rr := executeMonitorRequest(h.GetMonitorChannelStats, "/monitor/channel-stats?page=2&page_size=2")
+	if rr.Code != http.StatusOK {
+		t.Fatalf("unexpected status: %d, body=%s", rr.Code, rr.Body.String())
+	}
+
+	var resp struct {
+		Items []struct {
+			Source string `json:"source"`
+		} `json:"items"`
+		Page       int  `json:"page"`
+		PageSize   int  `json:"page_size"`
+		Total      int  `json:"total"`
+		TotalPages int  `json:"total_pages"`
+		HasPrev    bool `json:"has_prev"`
+		HasNext    bool `json:"has_next"`
+	}
+	if err := json.Unmarshal(rr.Body.Bytes(), &resp); err != nil {
+		t.Fatalf("decode response failed: %v", err)
+	}
+
+	if resp.Total != 3 || resp.TotalPages != 2 {
+		t.Fatalf("unexpected totals: total=%d total_pages=%d", resp.Total, resp.TotalPages)
+	}
+	if resp.Page != 2 || resp.PageSize != 2 || !resp.HasPrev || resp.HasNext {
+		t.Fatalf("unexpected pagination: page=%d page_size=%d has_prev=%t has_next=%t", resp.Page, resp.PageSize, resp.HasPrev, resp.HasNext)
+	}
+	if len(resp.Items) != 1 || resp.Items[0].Source != "source-c" {
+		t.Fatalf("unexpected page items: %+v", resp.Items)
+	}
+}
+
 func TestGetMonitorChannelStats_SummaryOmitsFiltersAndRecent(t *testing.T) {
 	gin.SetMode(gin.TestMode)
 
