@@ -62,7 +62,7 @@ func (e *AntigravityExecutor) ExecuteStream(ctx context.Context, auth *cliproxya
 
 	originalTranslated, translated := translateAntigravityRequestPair(ctx, opts.Headers, e.cfg, from, to, baseModel, originalPayload, req.Payload, true)
 
-	translated, err = thinking.ApplyThinking(translated, req.Model, from.String(), to.String(), e.Identifier())
+	translated, err = helps.ApplyThinkingWithSourcePayload(translated, req.Payload, originalPayloadSource, req.Model, from.String(), to.String(), e.Identifier())
 	if err != nil {
 		return nil, err
 	}
