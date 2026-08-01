@@ -1000,7 +1000,66 @@ func TestApplyCodexWebsocketHeadersDefaultsToCurrentResponsesBeta(t *testing.T) 
 	}
 }
 
-func TestApplyCodexWebsocketHeadersPassesThroughClientIdentityHeaders(t *testing.T) {
+func TestApplyCodexWebsocketHeadersDefaultsToCodexCloaking(t *testing.T) {
+	tests := []struct {
+		name  string
+		auth  *cliproxyauth.Auth
+		token string
+	}{
+		{
+			name: "OAuth",
+			auth: &cliproxyauth.Auth{
+				Provider: "codex",
+				Attributes: map[string]string{
+					"header:User-Agent": "custom-ua",
+					"header:Originator": "custom-origin",
+				},
+			},
+		},
+		{
+			name: "API key",
+			auth: &cliproxyauth.Auth{
+				Provider: "codex",
+				Attributes: map[string]string{
+					"api_key":           "sk-test",
+					"header:User-Agent": "custom-ua",
+					"header:Originator": "custom-origin",
+				},
+			},
+			token: "sk-test",
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			cfg := &config.Config{
+				CodexHeaderDefaults: config.CodexHeaderDefaults{UserAgent: "config-ua"},
+			}
+			ctx := contextWithGinHeaders(map[string]string{
+				"User-Agent": "client-ua",
+				"Originator": "client-origin",
+			})
+			headers := http.Header{}
+			headers.Set("User-Agent", "existing-ua")
+			headers.Set("Originator", "existing-origin")
+
+			headers, err := applyCodexWebsocketHeaders(ctx, headers, tt.auth, tt.token, cfg)
+			if err != nil {
+				t.Fatalf("applyCodexWebsocketHeaders() error = %v", err)
+			}
+
+			if got := headers.Get("User-Agent"); got != codexUserAgent {
+				t.Fatalf("User-Agent = %q, want %q", got, codexUserAgent)
+			}
+			if got := headers.Get("Originator"); got != codexOriginator {
+				t.Fatalf("Originator = %q, want %q", got, codexOriginator)
+			}
+		})
+	}
+}
+
+func TestApplyCodexWebsocketHeadersPassesThroughClientIdentityHeadersWhenCloakingDisabled(t *testing.T) {
+	cfg := &config.Config{Codex: config.CodexConfig{DisableCodexCloaking: true}}
 	auth := &cliproxyauth.Auth{
 		Provider: "codex",
 		Metadata: map[string]any{"email": "user@example.com"},
@@ -1014,7 +1073,7 @@ func TestApplyCodexWebsocketHeadersPassesThroughClientIdentityHeaders(t *testing
 		"session-id":            "legacy-session",
 	})
 
-	headers, err := applyCodexWebsocketHeaders(ctx, http.Header{}, auth, "", nil)
+	headers, err := applyCodexWebsocketHeaders(ctx, http.Header{}, auth, "", cfg)
 	if err != nil {
 		t.Fatalf("applyCodexWebsocketHeaders() error = %v", err)
 	}
@@ -1068,6 +1127,7 @@ func TestApplyCodexWebsocketHeadersCanonicalizesLegacyUnderscoreSessionHeader(t 
 
 func TestApplyCodexWebsocketHeadersUsesConfigDefaultsForOAuth(t *testing.T) {
 	cfg := &config.Config{
+		Codex: config.CodexConfig{DisableCodexCloaking: true},
 		CodexHeaderDefaults: config.CodexHeaderDefaults{
 			UserAgent:    "my-codex-client/1.0",
 			BetaFeatures: "feature-a,feature-b",
@@ -1096,6 +1156,7 @@ func TestApplyCodexWebsocketHeadersUsesConfigDefaultsForOAuth(t *testing.T) {
 
 func TestApplyCodexWebsocketHeadersPrefersExistingHeadersOverClientAndConfig(t *testing.T) {
 	cfg := &config.Config{
+		Codex: config.CodexConfig{DisableCodexCloaking: true},
 		CodexHeaderDefaults: config.CodexHeaderDefaults{
 			UserAgent:    "config-ua",
 			BetaFeatures: "config-beta",
@@ -1128,6 +1189,7 @@ func TestApplyCodexWebsocketHeadersPrefersExistingHeadersOverClientAndConfig(t *
 
 func TestApplyCodexWebsocketHeadersConfigUserAgentOverridesClientHeader(t *testing.T) {
 	cfg := &config.Config{
+		Codex: config.CodexConfig{DisableCodexCloaking: true},
 		CodexHeaderDefaults: config.CodexHeaderDefaults{
 			UserAgent:    "config-ua",
 			BetaFeatures: "config-beta",
@@ -1157,6 +1219,7 @@ func TestApplyCodexWebsocketHeadersConfigUserAgentOverridesClientHeader(t *testi
 
 func TestApplyCodexWebsocketHeadersIgnoresConfigForAPIKeyAuth(t *testing.T) {
 	cfg := &config.Config{
+		Codex: config.CodexConfig{DisableCodexCloaking: true},
 		CodexHeaderDefaults: config.CodexHeaderDefaults{
 			UserAgent:    "config-ua",
 			BetaFeatures: "config-beta",
