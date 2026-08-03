@@ -64,6 +64,7 @@ func (e *AntigravityExecutor) Execute(ctx context.Context, auth *cliproxyauth.Au
 	}
 	if updatedAuth != nil {
 		auth = updatedAuth
+		reporter.UpdateAccessTokenFingerprint(auth)
 	}
 	originalTranslated, translated := translateAntigravityRequestPair(ctx, opts.Headers, e.cfg, from, to, baseModel, originalPayload, req.Payload, false)
 
@@ -289,6 +290,7 @@ func (e *AntigravityExecutor) executeClaudeNonStream(ctx context.Context, auth *
 	}
 	if updatedAuth != nil {
 		auth = updatedAuth
+		reporter.UpdateAccessTokenFingerprint(auth)
 	}
 	originalTranslated, translated := translateAntigravityRequestPair(ctx, opts.Headers, e.cfg, from, to, baseModel, originalPayload, req.Payload, true)
 
