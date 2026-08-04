@@ -1927,6 +1927,7 @@ func TestModelsWithClientVersionReturnsCodexCatalog(t *testing.T) {
 		{ID: "gpt-image-2", Object: "model", OwnedBy: "openai", Type: "openai"},
 		{ID: "grok-imagine-image", Object: "model", OwnedBy: "xai", Type: "openai"},
 		{ID: "grok-imagine-video", Object: "model", OwnedBy: "xai", Type: "openai"},
+		{ID: "grok-imagine-video-1.5", Object: "model", OwnedBy: "xai", Type: "openai"},
 		{ID: "grok-imagine-video-1.5-preview", Object: "model", OwnedBy: "xai", Type: "openai"},
 	})
 	t.Cleanup(func() {
@@ -2026,6 +2027,7 @@ func TestModelsWithClientVersionReturnsCodexCatalog(t *testing.T) {
 		"gpt-image-2":                    false,
 		"grok-imagine-image":             false,
 		"grok-imagine-video":             false,
+		"grok-imagine-video-1.5":         false,
 		"grok-imagine-video-1.5-preview": false,
 	}
 	for _, model := range resp.Models {
