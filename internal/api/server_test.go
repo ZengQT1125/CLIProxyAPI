@@ -1320,6 +1320,28 @@ func TestManagementAPICallBatchUsesCustomRoute(t *testing.T) {
 	}
 }
 
+func TestManagementDashboardSummaryRoute(t *testing.T) {
+	t.Setenv("MANAGEMENT_PASSWORD", "test-management-key")
+	server := newTestServer(t)
+
+	req := httptest.NewRequest(http.MethodGet, "/v0/management/custom/dashboard", nil)
+	req.Header.Set("Authorization", "Bearer test-management-key")
+	recorder := httptest.NewRecorder()
+	server.engine.ServeHTTP(recorder, req)
+
+	if recorder.Code != http.StatusOK {
+		t.Fatalf("status = %d, want %d body=%s", recorder.Code, http.StatusOK, recorder.Body.String())
+	}
+	var got struct {
+		APIKeys   int `json:"api_keys"`
+		AuthFiles int `json:"auth_files"`
+		Models    int `json:"models"`
+	}
+	if errDecode := json.Unmarshal(recorder.Body.Bytes(), &got); errDecode != nil {
+		t.Fatalf("decode response: %v", errDecode)
+	}
+}
+
 func TestServerListening(t *testing.T) {
 	server := newTestServer(t)
 	server.server.Addr = "127.0.0.1:0"
