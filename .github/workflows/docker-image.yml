@@ -102,7 +102,9 @@ jobs:
       - name: Generate build args
         id: buildargs
         run: |
-          VERSION=$(git describe --tags --always --dirty | sed 's|^\(fork\|mirror\)/||')
+          TAG=$(git describe --tags --always --dirty)
+          VERSION=${TAG#mirror/}
+          VERSION=${VERSION#fork/}
           echo "VERSION=$VERSION" >> $GITHUB_OUTPUT
           echo "COMMIT=$(git rev-parse --short HEAD)" >> $GITHUB_OUTPUT
           echo "BUILD_DATE=$(date -u +%Y-%m-%dT%H:%M:%SZ)" >> $GITHUB_OUTPUT
@@ -158,7 +160,10 @@ jobs:
         id: version
         run: |
           # Remove fork/ prefix and v prefix for semver compatibility
-          VERSION=$(git describe --tags --always --dirty | sed 's|^\(fork\|mirror\)/||' | sed 's|^v||')
+          TAG=$(git describe --tags --always --dirty)
+          VERSION=${TAG#mirror/}
+          VERSION=${VERSION#fork/}
+          VERSION=${VERSION#v}
           echo "VERSION=$VERSION" >> $GITHUB_OUTPUT
 
       - name: Download digests
