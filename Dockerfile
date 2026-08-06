@@ -1,53 +1,42 @@
 # CLIProxyAPI Docker镜像构建文件
-# 多平台构建：使用 tonistiigi/xx + 交叉编译，避免 QEMU 模拟
+# 原生编译：GitHub Actions 按平台矩阵使用原生 runner（amd64/arm64），
+# 因此直接用 go build 编译（不再用 tonistiigi/xx + clang 交叉编译，
+# 避免 xx/clang 构建出的 host 二进制 dlopen 动态插件时崩溃）
 # syntax=docker/dockerfile:1.4
 
-# 构建阶段 - 使用 BUILDPLATFORM 在原生架构执行
+# 构建阶段 - 使用 BUILDPLATFORM（= 目标平台，原生）
 FROM --platform=$BUILDPLATFORM golang:1.26-alpine AS builder
 
-# 版本号参数
 ARG VERSION=dev
 ARG COMMIT=none
 ARG BUILD_DATE=unknown
 
-# 安装交叉编译工具链
-# tonistiigi/xx 提供跨架构编译辅助工具
-COPY --from=tonistiigi/xx:1.6.1 / /
-RUN apk add --no-cache git ca-certificates tzdata clang lld
+# 原生构建工具链
+RUN apk add --no-cache git ca-certificates tzdata gcc musl-dev
 
 WORKDIR /app
 
-# 配置目标平台的交叉编译工具链
-ARG TARGETPLATFORM
-RUN xx-apk add musl-dev gcc
-
-# 设置Go模块代理
 ENV GOPROXY=https://proxy.golang.org,direct
 
-# 复制go mod文件
 COPY go.mod go.sum ./
 
-# 下载依赖（在原生平台执行，速度快）
 RUN --mount=type=cache,target=/root/.cache/go-mod \
     go mod download
 
-# 复制源代码
 COPY . .
 
-# 启用 cgo：CPA 动态库插件（dlopen .so）依赖 cgo，若 CGO_ENABLED=0 则插件宿主会被编译期裁掉
-# -trimpath 移除构建路径信息，增强安全性和可复现性
+# 启用 cgo：CPA 动态库插件（dlopen .so）依赖 cgo
 ENV CGO_ENABLED=1
 RUN --mount=type=cache,target=/root/.cache/go-build \
     --mount=type=cache,target=/root/.cache/go-mod \
-    xx-go build \
+    go build \
     -buildvcs=false \
     -trimpath \
     -ldflags="-s -w \
       -X 'main.Version=${VERSION}' \
       -X 'main.Commit=${COMMIT}' \
       -X 'main.BuildDate=${BUILD_DATE}'" \
-    -o ./CLIProxyAPI ./cmd/server/ && \
-    xx-verify CLIProxyAPI
+    -o ./CLIProxyAPI ./cmd/server/
 
 # 运行阶段
 FROM alpine:3.23
