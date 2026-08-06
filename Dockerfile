@@ -34,9 +34,9 @@ RUN --mount=type=cache,target=/root/.cache/go-mod \
 # 复制源代码
 COPY . .
 
-# 静态编译（CGO_ENABLED=0）
+# 启用 cgo：CPA 动态库插件（dlopen .so）依赖 cgo，若 CGO_ENABLED=0 则插件宿主会被编译期裁掉
 # -trimpath 移除构建路径信息，增强安全性和可复现性
-ENV CGO_ENABLED=0
+ENV CGO_ENABLED=1
 RUN --mount=type=cache,target=/root/.cache/go-build \
     --mount=type=cache,target=/root/.cache/go-mod \
     xx-go build \
