@@ -36,16 +36,22 @@ jobs:
             echo "Upstream has new commits; will sync and build."
           fi
 
-      - name: Sync upstream and keep CGO patch
+      - name: Sync upstream and keep glibc Dockerfile
         if: steps.check.outputs.changed == 'true'
         run: |
+          # 备份自定义 glibc Dockerfile（reset 会把它删掉）
+          cp Dockerfile.glibc /tmp/Dockerfile.glibc 2>/dev/null || true
           git reset --hard upstream/main
-          sed -i 's/^ENV CGO_ENABLED=0$/ENV CGO_ENABLED=1/' Dockerfile
-          grep -n 'ENV CGO_ENABLED' Dockerfile
+          # 恢复 glibc 构建模板：与官方一致，可 dlopen glibc 插件
+          if [ -f /tmp/Dockerfile.glibc ]; then
+            cp /tmp/Dockerfile.glibc Dockerfile
+          fi
+          grep -n '^FROM' Dockerfile
+          grep -n 'CGO_ENABLED' Dockerfile
           git config user.name "github-actions[bot]"
           git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
           git add Dockerfile
-          git commit -m "chore: keep CGO_ENABLED=1 for dynamic plugin support" || true
+          git commit -m "chore: keep glibc Dockerfile for dynamic plugin support" || true
           git push origin main
 
       - name: Resolve upstream version
