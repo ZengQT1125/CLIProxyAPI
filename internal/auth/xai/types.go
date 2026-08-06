@@ -26,9 +26,17 @@ const (
 	// CLIClientVersionHeader carries the Grok CLI protocol version.
 	CLIClientVersionHeader = "x-grok-client-version"
 	// CLIClientVersion must stay aligned with the Grok CLI version expected by chat-proxy.
-	CLIClientVersion = "0.2.93"
+	CLIClientVersion = "0.2.120"
 	// CLIUserAgent identifies CLIProxyAPI requests to Grok chat-proxy endpoints.
 	CLIUserAgent = "xai-grok-workspace/" + CLIClientVersion
+	// CLIClientIdentifierHeader carries the Grok CLI client identifier.
+	CLIClientIdentifierHeader = "x-grok-client-identifier"
+	// CLIClientIdentifier identifies requests originating from Grok Shell.
+	CLIClientIdentifier = "grok-shell"
+	// CLIAuthenticateResponseHeader requests the chat-proxy authentication response flow.
+	CLIAuthenticateResponseHeader = "x-authenticateresponse"
+	// CLIAuthenticateResponse is the required authentication response marker.
+	CLIAuthenticateResponse = "authenticate-response"
 	// Issuer is xAI's OAuth issuer.
 	Issuer = "https://auth.x.ai"
 	// DiscoveryURL is the OIDC discovery endpoint used to resolve OAuth endpoints.

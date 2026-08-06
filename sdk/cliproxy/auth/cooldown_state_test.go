@@ -1350,6 +1350,78 @@ func TestManager_PickNextMixedWithoutExecutorYieldsAuthNotFound(t *testing.T) {
 	}
 }
 
+func TestManager_RestoreCooldownStatesCanonicalizesThinkingSuffixes(t *testing.T) {
+	now := time.Now().UTC().Truncate(time.Second)
+	laterRetry := now.Add(2 * time.Hour)
+	store := &recordingCooldownStateStore{
+		load: []CooldownStateSnapshot{{
+			AuthID: "auth-thinking",
+			Records: []CooldownStateRecord{
+				{
+					Provider:       "gemini",
+					AuthID:         "auth-thinking",
+					Model:          "gemini-3.1-pro-preview(high)",
+					NextRetryAfter: now.Add(time.Hour),
+					Quota: QuotaState{
+						Exceeded:      true,
+						Reason:        "quota",
+						NextRecoverAt: now.Add(time.Hour),
+					},
+					UpdatedAt: now,
+				},
+				{
+					Provider:       "gemini",
+					AuthID:         "auth-thinking",
+					Model:          "gemini-3.1-pro-preview(low)",
+					NextRetryAfter: laterRetry,
+					Quota: QuotaState{
+						Exceeded:      true,
+						Reason:        "quota",
+						NextRecoverAt: laterRetry,
+					},
+					UpdatedAt: now.Add(time.Minute),
+				},
+			},
+		}},
+	}
+	manager := NewManager(nil, nil, nil)
+	manager.SetCooldownStateStore(store)
+	if _, errRegister := manager.Register(WithSkipPersist(context.Background()), &Auth{ID: "auth-thinking", Provider: "gemini"}); errRegister != nil {
+		t.Fatalf("Register() returned error: %v", errRegister)
+	}
+
+	if errRestore := manager.RestoreCooldownStates(context.Background()); errRestore != nil {
+		t.Fatalf("RestoreCooldownStates() returned error: %v", errRestore)
+	}
+
+	auth, ok := manager.GetByID("auth-thinking")
+	if !ok || auth == nil {
+		t.Fatal("restored auth was not found")
+	}
+	if len(auth.ModelStates) != 1 {
+		t.Fatalf("len(ModelStates) = %d, want 1: %+v", len(auth.ModelStates), auth.ModelStates)
+	}
+	state := auth.ModelStates["gemini-3.1-pro-preview"]
+	if state == nil || !state.Unavailable || !state.NextRetryAfter.Equal(laterRetry) {
+		t.Fatalf("canonical model state = %+v, want unavailable until %v", state, laterRetry)
+	}
+
+	store.mu.Lock()
+	persisted := cloneCooldownStateSnapshots(store.snapshots)
+	store.mu.Unlock()
+	modelRecords := make([]CooldownStateRecord, 0)
+	for _, snapshot := range persisted {
+		for _, record := range snapshot.Records {
+			if record.Model != "" {
+				modelRecords = append(modelRecords, record)
+			}
+		}
+	}
+	if len(modelRecords) != 1 || modelRecords[0].Model != "gemini-3.1-pro-preview" || !modelRecords[0].NextRetryAfter.Equal(laterRetry) {
+		t.Fatalf("persisted model records = %+v, want one canonical record until %v", modelRecords, laterRetry)
+	}
+}
+
 func TestManagerResultSaveWaitsForCooldownStoreTransition(t *testing.T) {
 	// Fork uses an async cooldown persister with storeVersion guards.
 	// MarkResult does NOT block on store transitions — instead, the

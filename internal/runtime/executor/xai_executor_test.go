@@ -5267,6 +5267,11 @@ func TestApplyXAIChatHeaders(t *testing.T) {
 		if got := req.Header.Get(xaiauth.CLIClientVersionHeader); got != "" {
 			t.Fatalf("%s = %q, want empty for official API", xaiauth.CLIClientVersionHeader, got)
 		}
+		for _, header := range []string{xaiauth.CLIClientIdentifierHeader, xaiauth.CLIAuthenticateResponseHeader} {
+			if got := req.Header.Get(header); got != "" {
+				t.Fatalf("%s = %q, want empty for official API", header, got)
+			}
+		}
 		if got := req.Header.Get("User-Agent"); got != "" {
 			t.Fatalf("User-Agent = %q, want empty for official API", got)
 		}
@@ -5294,6 +5299,12 @@ func TestApplyXAIChatHeaders(t *testing.T) {
 		if got := req.Header.Get(xaiauth.CLIClientVersionHeader); got != xaiauth.CLIClientVersion {
 			t.Fatalf("%s = %q, want %q", xaiauth.CLIClientVersionHeader, got, xaiauth.CLIClientVersion)
 		}
+		if got := req.Header.Get(xaiauth.CLIClientIdentifierHeader); got != xaiauth.CLIClientIdentifier {
+			t.Fatalf("%s = %q, want %q", xaiauth.CLIClientIdentifierHeader, got, xaiauth.CLIClientIdentifier)
+		}
+		if got := req.Header.Get(xaiauth.CLIAuthenticateResponseHeader); got != xaiauth.CLIAuthenticateResponse {
+			t.Fatalf("%s = %q, want %q", xaiauth.CLIAuthenticateResponseHeader, got, xaiauth.CLIAuthenticateResponse)
+		}
 		if got := req.Header.Get("User-Agent"); got != "xai-grok-workspace/"+xaiauth.CLIClientVersion {
 			t.Fatalf("User-Agent = %q, want xai-grok-workspace/%s", got, xaiauth.CLIClientVersion)
 		}
@@ -5316,6 +5327,12 @@ func TestApplyXAIChatHeaders(t *testing.T) {
 		if got := req.Header.Get(xaiauth.CLIClientVersionHeader); got != xaiauth.CLIClientVersion {
 			t.Fatalf("%s = %q, want %q", xaiauth.CLIClientVersionHeader, got, xaiauth.CLIClientVersion)
 		}
+		if got := req.Header.Get(xaiauth.CLIClientIdentifierHeader); got != xaiauth.CLIClientIdentifier {
+			t.Fatalf("%s = %q, want %q", xaiauth.CLIClientIdentifierHeader, got, xaiauth.CLIClientIdentifier)
+		}
+		if got := req.Header.Get(xaiauth.CLIAuthenticateResponseHeader); got != xaiauth.CLIAuthenticateResponse {
+			t.Fatalf("%s = %q, want %q", xaiauth.CLIAuthenticateResponseHeader, got, xaiauth.CLIAuthenticateResponse)
+		}
 	})
 
 	t.Run("no cli headers on custom gateway with using_api false", func(t *testing.T) {
@@ -5334,6 +5351,11 @@ func TestApplyXAIChatHeaders(t *testing.T) {
 		if got := req.Header.Get(xaiauth.CLIClientVersionHeader); got != "" {
 			t.Fatalf("%s = %q, want empty for custom gateway", xaiauth.CLIClientVersionHeader, got)
 		}
+		for _, header := range []string{xaiauth.CLIClientIdentifierHeader, xaiauth.CLIAuthenticateResponseHeader} {
+			if got := req.Header.Get(header); got != "" {
+				t.Fatalf("%s = %q, want empty for custom gateway", header, got)
+			}
+		}
 		if got := req.Header.Get("User-Agent"); got != "" {
 			t.Fatalf("User-Agent = %q, want empty for custom gateway", got)
 		}
@@ -5343,10 +5365,12 @@ func TestApplyXAIChatHeaders(t *testing.T) {
 		req := httptest.NewRequest(http.MethodPost, xaiauth.CLIChatProxyBaseURL+"/responses", nil)
 		auth := &cliproxyauth.Auth{
 			Attributes: map[string]string{
-				"base_url":                                 xaiauth.CLIChatProxyBaseURL,
-				xaiUsingAPIAttr:                            "false",
-				"header:" + xaiauth.CLITokenAuthHeader:     "custom-token-auth",
-				"header:" + xaiauth.CLIClientVersionHeader: "custom-client-version",
+				"base_url":                                        xaiauth.CLIChatProxyBaseURL,
+				xaiUsingAPIAttr:                                   "false",
+				"header:" + xaiauth.CLITokenAuthHeader:            "custom-token-auth",
+				"header:" + xaiauth.CLIClientVersionHeader:        "custom-client-version",
+				"header:" + xaiauth.CLIClientIdentifierHeader:     "custom-client-identifier",
+				"header:" + xaiauth.CLIAuthenticateResponseHeader: "custom-authenticate-response",
 			},
 		}
 		applyXAIChatHeaders(req, auth, "xai-token", true, "")
@@ -5356,6 +5380,12 @@ func TestApplyXAIChatHeaders(t *testing.T) {
 		}
 		if got := req.Header.Get(xaiauth.CLIClientVersionHeader); got != "custom-client-version" {
 			t.Fatalf("%s = %q, want custom-client-version", xaiauth.CLIClientVersionHeader, got)
+		}
+		if got := req.Header.Get(xaiauth.CLIClientIdentifierHeader); got != "custom-client-identifier" {
+			t.Fatalf("%s = %q, want custom-client-identifier", xaiauth.CLIClientIdentifierHeader, got)
+		}
+		if got := req.Header.Get(xaiauth.CLIAuthenticateResponseHeader); got != "custom-authenticate-response" {
+			t.Fatalf("%s = %q, want custom-authenticate-response", xaiauth.CLIAuthenticateResponseHeader, got)
 		}
 	})
 

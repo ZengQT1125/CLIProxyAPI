@@ -322,14 +322,18 @@ func (m *Manager) SetRoundTripperProvider(p RoundTripperProvider) {
 }
 
 func (m *Manager) availableAuthsForRouteModel(auths []*Auth, provider, routeModel string, now time.Time) ([]*Auth, error) {
-	ready, err := m.readyAuthsForRouteModel(auths, provider, routeModel, now)
-	if err != nil {
-		return nil, err
-	}
-	return highestPriorityAuths(ready), nil
+	return m.availableAuthsForRouteModelWithPriorityMode(auths, provider, routeModel, now, false)
 }
 
 func (m *Manager) readyAuthsForRouteModel(auths []*Auth, provider, routeModel string, now time.Time) ([]*Auth, error) {
+	return m.availableAuthsForRouteModelWithPriorityMode(auths, provider, routeModel, now, true)
+}
+
+func (m *Manager) availableAuthsForRouteModelAcrossPriorities(auths []*Auth, provider, routeModel string, now time.Time) ([]*Auth, error) {
+	return m.availableAuthsForRouteModelWithPriorityMode(auths, provider, routeModel, now, true)
+}
+
+func (m *Manager) availableAuthsForRouteModelWithPriorityMode(auths []*Auth, provider, routeModel string, now time.Time, allPriorities bool) ([]*Auth, error) {
 	if len(auths) == 0 {
 		return nil, &Error{Code: "auth_not_found", Message: "no auth candidates"}
 	}
@@ -370,7 +374,34 @@ func (m *Manager) readyAuthsForRouteModel(auths []*Auth, provider, routeModel st
 	if len(ready) > 1 {
 		sort.Slice(ready, func(i, j int) bool { return ready[i].ID < ready[j].ID })
 	}
-	return ready, nil
+	if allPriorities {
+		return ready, nil
+	}
+	return highestPriorityAuths(ready), nil
+}
+
+// availableAuthsForSelector reports the candidates handed to priority-scoped consumers such as
+// the plugin scheduler, plus the candidates handed to the configured selector. Retry-aware
+// selectors receive every ready priority tier so request-scoped failover and established session
+// bindings do not mutate sticky state. Other selectors receive only the highest ready tier.
+func (m *Manager) availableAuthsForSelector(selector Selector, auths []*Auth, provider, routeModel string, now time.Time) (priorityAuths, selectorAuths []*Auth, err error) {
+	if _, retryAware := selector.(retryAwareSelector); !retryAware {
+		priorityAuths, err = m.availableAuthsForRouteModel(auths, provider, routeModel, now)
+		if err != nil {
+			return nil, nil, err
+		}
+		priorityAuths = cloneAuthSlice(priorityAuths)
+		return priorityAuths, priorityAuths, nil
+	}
+
+	// One availability pass and one clone pass serve both lists: the highest priority tier is a
+	// subset of the across-priority candidates, so it is narrowed from the same cloned auths.
+	selectorAuths, err = m.availableAuthsForRouteModelAcrossPriorities(auths, provider, routeModel, now)
+	if err != nil {
+		return nil, nil, err
+	}
+	selectorAuths = cloneAuthSlice(selectorAuths)
+	return highestPriorityAuths(selectorAuths), selectorAuths, nil
 }
 
 func selectionArgForSelector(selector Selector, routeModel string) string {
@@ -1046,25 +1077,21 @@ func (m *Manager) pickNextLegacy(ctx context.Context, provider, model string, op
 		m.mu.RUnlock()
 		return nil, nil, &Error{Code: "auth_not_found", Message: "no auth available"}
 	}
-	var available []*Auth
-	var errAvailable error
-	if retryAware {
-		available, errAvailable = m.readyAuthsForRouteModel(candidates, provider, model, time.Now())
-	} else {
-		available, errAvailable = m.availableAuthsForRouteModel(candidates, provider, model, time.Now())
-	}
+	priorityAuths, available, errAvailable := m.availableAuthsForSelector(selector, candidates, provider, model, time.Now())
 	if errAvailable != nil {
 		m.mu.RUnlock()
 		return nil, nil, errAvailable
 	}
-	available = cloneAuthSlice(available)
 	m.mu.RUnlock()
 
 	selectable := available
 	if retryAware {
 		selectable = filterUntriedAuths(available, tried)
 	}
-	schedulerCandidates := highestPriorityAuths(selectable)
+	schedulerCandidates := priorityAuths
+	if retryAware {
+		schedulerCandidates = highestPriorityAuths(selectable)
+	}
 	selected, handled, errPick := m.pickViaPluginScheduler(ctx, pluginScheduler, provider, []string{provider}, model, opts, tried, schedulerCandidates)
 	if errPick != nil {
 		return nil, nil, errPick
@@ -1378,25 +1405,21 @@ func (m *Manager) pickNextMixedLegacy(ctx context.Context, providers []string, m
 		m.mu.RUnlock()
 		return nil, nil, "", &Error{Code: "auth_not_found", Message: "no auth available"}
 	}
-	var available []*Auth
-	var errAvailable error
-	if retryAware {
-		available, errAvailable = m.readyAuthsForRouteModel(candidates, "mixed", model, time.Now())
-	} else {
-		available, errAvailable = m.availableAuthsForRouteModel(candidates, "mixed", model, time.Now())
-	}
+	priorityAuths, available, errAvailable := m.availableAuthsForSelector(selector, candidates, "mixed", model, time.Now())
 	if errAvailable != nil {
 		m.mu.RUnlock()
 		return nil, nil, "", errAvailable
 	}
-	available = cloneAuthSlice(available)
 	m.mu.RUnlock()
 
 	selectable := available
 	if retryAware {
 		selectable = filterUntriedAuths(available, tried)
 	}
-	schedulerCandidates := highestPriorityAuths(selectable)
+	schedulerCandidates := priorityAuths
+	if retryAware {
+		schedulerCandidates = highestPriorityAuths(selectable)
+	}
 	selected, handled, errPick := m.pickViaPluginScheduler(ctx, pluginScheduler, "mixed", providers, model, opts, tried, schedulerCandidates)
 	if errPick != nil {
 		return nil, nil, "", errPick

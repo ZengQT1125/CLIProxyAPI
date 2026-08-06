@@ -82,9 +82,9 @@ func (m *Manager) Register(ctx context.Context, auth *Auth) (*Auth, error) {
 	m.mu.Lock()
 	_, deferCooldownCleanup := m.cooldownRestoreIDs[auth.ID]
 	m.applyPendingCooldownRestoreLocked(auth, now)
-	clearedCooldown := false
+	cooldownStateChanged := normalizeModelStates(auth)
 	if m.cooldownDisabledForAuth(auth) || auth.Disabled || auth.Status == StatusDisabled {
-		clearedCooldown = clearCooldownStateForAuth(auth, now)
+		cooldownStateChanged = clearCooldownStateForAuth(auth, now) || cooldownStateChanged
 	}
 	auth.EnsureIndex()
 	authClone := auth.Clone()
@@ -99,7 +99,7 @@ func (m *Manager) Register(ctx context.Context, auth *Auth) (*Auth, error) {
 	m.queueRefreshReschedule(auth.ID)
 	_ = m.persist(ctx, auth)
 	registered := auth.Clone()
-	if clearedCooldown && !deferCooldownCleanup {
+	if cooldownStateChanged && !deferCooldownCleanup {
 		m.queueCooldownStatePersist(auth.ID)
 	}
 	unlockLifecycle()
@@ -151,9 +151,9 @@ func (m *Manager) Update(ctx context.Context, auth *Auth) (*Auth, error) {
 	}
 	_, deferCooldownCleanup := m.cooldownRestoreIDs[auth.ID]
 	m.applyPendingCooldownRestoreLocked(auth, now)
-	clearedCooldown := false
+	cooldownStateChanged = normalizeModelStates(auth) || cooldownStateChanged
 	if m.cooldownDisabledForAuth(auth) || auth.Disabled || auth.Status == StatusDisabled {
-		clearedCooldown = clearCooldownStateForAuth(auth, now)
+		cooldownStateChanged = clearCooldownStateForAuth(auth, now) || cooldownStateChanged
 	}
 	auth.EnsureIndex()
 	authClone := auth.Clone()
@@ -172,7 +172,7 @@ func (m *Manager) Update(ctx context.Context, auth *Auth) (*Auth, error) {
 	m.queueRefreshReschedule(auth.ID)
 	_ = m.persist(ctx, auth)
 	updated := auth.Clone()
-	if !deferCooldownCleanup && (clearedCooldown || cooldownStateChanged) {
+	if !deferCooldownCleanup && cooldownStateChanged {
 		m.queueCooldownStatePersist(auth.ID)
 	}
 	for _, model := range resumeModels {
