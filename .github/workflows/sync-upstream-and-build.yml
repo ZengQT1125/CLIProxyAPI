@@ -1,0 +1,70 @@
+name: sync-upstream-and-build
+
+on:
+  schedule:
+    - cron: "0 */12 * * *"
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  sync-and-build:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          ref: main
+          fetch-depth: 0
+          token: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Fetch upstream
+        run: |
+          git remote remove upstream 2>/dev/null || true
+          git remote add upstream https://github.com/caidaoli/CLIProxyAPI.git
+          git fetch upstream main --tags --force
+
+      - name: Check upstream changes
+        id: check
+        run: |
+          if git merge-base --is-ancestor upstream/main HEAD; then
+            echo "changed=false" >> "$GITHUB_OUTPUT"
+            echo "Upstream already included; no build needed."
+          else
+            echo "changed=true" >> "$GITHUB_OUTPUT"
+            echo "Upstream has new commits; will sync and build."
+          fi
+
+      - name: Sync upstream and keep CGO patch
+        if: steps.check.outputs.changed == 'true'
+        run: |
+          git reset --hard upstream/main
+          sed -i 's/^ENV CGO_ENABLED=0$/ENV CGO_ENABLED=1/' Dockerfile
+          grep -n 'ENV CGO_ENABLED' Dockerfile
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add Dockerfile
+          git commit -m "chore: keep CGO_ENABLED=1 for dynamic plugin support" || true
+          git push origin main
+
+      - name: Resolve upstream version
+        id: version
+        if: steps.check.outputs.changed == 'true'
+        run: |
+          VER=$(git tag --sort=-v:refname | grep '^fork/v' | head -1 | sed 's|^fork/||')
+          if [ -z "$VER" ]; then VER=$(date -u +%Y%m%d%H%M); fi
+          echo "version=$VER" >> "$GITHUB_OUTPUT"
+          echo "Upstream version: $VER"
+
+      - name: Tag and push mirror image
+        if: steps.check.outputs.changed == 'true'
+        run: |
+          TAG="mirror/${{ steps.version.outputs.version }}"
+          if git rev-parse "$TAG" >/dev/null 2>&1; then
+            echo "Tag $TAG already exists; skip."
+          else
+            git tag "$TAG"
+            git push origin "$TAG"
+            echo "Pushed $TAG; docker-image workflow will build the image."
+          fi
