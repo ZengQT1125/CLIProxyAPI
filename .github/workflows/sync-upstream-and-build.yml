@@ -41,13 +41,14 @@ jobs:
         run: |
           # 备份本分支(glibc) Dockerfile —— merge 可能被上游改动覆盖
           cp Dockerfile /tmp/Dockerfile.glibc.mine
+          # merge 创建合并提交需要身份，必须先配置（否则 empty ident name）
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
           # 优先普通合并：保留上游代码更新；若产生冲突则以本分支(ours)为准。
           # 关键：用 merge 而非 reset，保留 fork 历史 -> push 不再是 non-fast-forward。
           git merge --no-edit upstream/main 2>/dev/null || git merge --no-edit -X ours upstream/main
           # 无论合并结果如何，Dockerfile 强制恢复为我方 glibc 版（满足 dlopen 动态插件）
           cp /tmp/Dockerfile.glibc.mine Dockerfile
-          git config user.name "github-actions[bot]"
-          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
           git add -A
           if ! git diff --cached --quiet; then
             git commit -m "chore: sync upstream + keep glibc Dockerfile"
