@@ -35,6 +35,7 @@ auths/*
 /docs/superpowers/
 /superpowers/
 GEMINI.md
+AGENTS.override.md
 
 # Tooling metadata
 /.superpowers/
@@ -50,10 +51,17 @@ GEMINI.md
 .bmad/*
 _bmad/*
 _bmad-output/*
+.gitnexus/
 
 # macOS
 .DS_Store
 ._*
+
+# Docker
+docker-compose.override.yml
+
+# Local LLM Wiki vault
+.llm-wiki
 
 # Fork-specific: usage database files
 usage.*
