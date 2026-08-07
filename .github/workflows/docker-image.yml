@@ -162,11 +162,10 @@ jobs:
       - name: Generate version
         id: version
         run: |
-          # Remove fork/ prefix and v prefix for semver compatibility
-          TAG=$(git describe --tags --always --dirty)
+          # 版本与 git tag(mirror/vX-glibc) 保持一致，去掉 --dirty，保留 v 前缀
+          TAG=$(git describe --tags --always)
           VERSION=${TAG#mirror/}
           VERSION=${VERSION#fork/}
-          VERSION=${VERSION#v}
           echo "VERSION=$VERSION" >> $GITHUB_OUTPUT
 
       - name: Download digests
@@ -192,9 +191,9 @@ jobs:
         with:
           images: ${{ env.REGISTRY }}/${{ env.IMAGE_NAME_LC }}
           tags: |
-            type=semver,pattern={{version}},value=${{ steps.version.outputs.VERSION }}
-            type=semver,pattern={{major}}.{{minor}},value=${{ steps.version.outputs.VERSION }}
-            type=semver,pattern={{major}},value=${{ steps.version.outputs.VERSION }}
+            # 直接以镜像版本作为 tag（如 v8.63.0-glibc），并附 latest 与 dispatch 手动 tag
+            type=raw,value=${{ steps.version.outputs.VERSION }}
+            type=raw,value=${{ steps.version.outputs.VERSION }}-glibc,enable=${{ !endsWith(steps.version.outputs.VERSION, '-glibc') }}
             type=raw,value=latest,enable=${{ github.event_name == 'push' }}
             type=raw,value=${{ github.event.inputs.tag }},enable=${{ github.event_name == 'workflow_dispatch' && github.event.inputs.tag != '' }}
 
