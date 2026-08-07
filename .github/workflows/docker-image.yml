@@ -104,10 +104,11 @@ jobs:
         run: |
           # 不用 --dirty：Actions 构建时下载的 management panel 会让工作区变脏，
           # 导致版本被标成 vX.Y.Z-dirty。这里固定追加 -glibc 标识。
+          # git tag 名自带 -glibc（如 mirror/v8.63.0-glibc），describe 后 VERSION 已含 glibc
           TAG=$(git describe --tags --always)
           VERSION=${TAG#mirror/}
           VERSION=${VERSION#fork/}
-          echo "VERSION=${VERSION}-glibc" >> $GITHUB_OUTPUT
+          echo "VERSION=$VERSION" >> $GITHUB_OUTPUT
           echo "COMMIT=$(git rev-parse --short HEAD)" >> $GITHUB_OUTPUT
           echo "BUILD_DATE=$(date -u +%Y-%m-%dT%H:%M:%SZ)" >> $GITHUB_OUTPUT
 
@@ -196,7 +197,6 @@ jobs:
             type=semver,pattern={{major}},value=${{ steps.version.outputs.VERSION }}
             type=raw,value=latest,enable=${{ github.event_name == 'push' }}
             type=raw,value=${{ github.event.inputs.tag }},enable=${{ github.event_name == 'workflow_dispatch' && github.event.inputs.tag != '' }}
-            type=raw,value=${{ steps.version.outputs.VERSION }}-glibc
 
       - name: Create manifest list
         working-directory: /tmp/digests
