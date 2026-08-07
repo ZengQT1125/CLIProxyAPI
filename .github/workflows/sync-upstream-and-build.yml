@@ -39,19 +39,21 @@ jobs:
       - name: Sync upstream and keep glibc Dockerfile
         if: steps.check.outputs.changed == 'true'
         run: |
-          # 备份自定义 glibc Dockerfile（reset 会把它删掉）
-          cp Dockerfile.glibc /tmp/Dockerfile.glibc 2>/dev/null || true
-          git reset --hard upstream/main
-          # 恢复 glibc 构建模板：与官方一致，可 dlopen glibc 插件
-          if [ -f /tmp/Dockerfile.glibc ]; then
-            cp /tmp/Dockerfile.glibc Dockerfile
+          # 备份本分支(glibc) Dockerfile —— merge 可能被上游改动覆盖
+          cp Dockerfile /tmp/Dockerfile.glibc.mine
+          # 优先普通合并：保留上游代码更新；若产生冲突则以本分支(ours)为准。
+          # 关键：用 merge 而非 reset，保留 fork 历史 -> push 不再是 non-fast-forward。
+          git merge --no-edit upstream/main 2>/dev/null || git merge --no-edit -X ours upstream/main
+          # 无论合并结果如何，Dockerfile 强制恢复为我方 glibc 版（满足 dlopen 动态插件）
+          cp /tmp/Dockerfile.glibc.mine Dockerfile
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add -A
+          if ! git diff --cached --quiet; then
+            git commit -m "chore: sync upstream + keep glibc Dockerfile"
           fi
           grep -n '^FROM' Dockerfile
           grep -n 'CGO_ENABLED' Dockerfile
-          git config user.name "github-actions[bot]"
-          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
-          git add Dockerfile
-          git commit -m "chore: keep glibc Dockerfile for dynamic plugin support" || true
           git push origin main
 
       - name: Resolve upstream version
