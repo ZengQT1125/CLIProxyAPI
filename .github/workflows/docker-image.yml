@@ -194,6 +194,7 @@ jobs:
             type=semver,pattern={{major}},value=${{ steps.version.outputs.VERSION }}
             type=raw,value=latest,enable=${{ github.event_name == 'push' }}
             type=raw,value=${{ github.event.inputs.tag }},enable=${{ github.event_name == 'workflow_dispatch' && github.event.inputs.tag != '' }}
+            type=raw,value=${{ steps.version.outputs.VERSION }}-glibc
 
       - name: Create manifest list
         working-directory: /tmp/digests
