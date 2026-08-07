@@ -70,7 +70,7 @@ jobs:
       - name: Tag and push mirror image
         if: steps.check.outputs.changed == 'true'
         run: |
-          TAG="mirror/${{ steps.version.outputs.version }}"
+          TAG="mirror/${{ steps.version.outputs.version }}-glibc"
           if git rev-parse "$TAG" >/dev/null 2>&1; then
             echo "Tag $TAG already exists; skip."
           else
@@ -88,5 +88,5 @@ jobs:
             -H "Authorization: Bearer ${{ secrets.GITHUB_TOKEN }}" \
             -H "Accept: application/vnd.github+json" \
             https://api.github.com/repos/${{ github.repository }}/actions/workflows/docker-image.yml/dispatches \
-            -d "{\"ref\":\"mirror/${{ steps.version.outputs.version }}\",\"inputs\":{\"tag\":\"${{ steps.version.outputs.version }}\"}}"
+            -d "{\"ref\":\"mirror/${{ steps.version.outputs.version }}-glibc\",\"inputs\":{\"tag\":\"${{ steps.version.outputs.version }}-glibc\"}}"
           echo "Dispatched docker-image build for ${{ steps.version.outputs.version }}"
