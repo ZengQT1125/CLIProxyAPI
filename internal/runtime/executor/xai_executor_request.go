@@ -67,9 +67,9 @@ func (e *XAIExecutor) prepareResponsesRequestTo(ctx context.Context, req cliprox
 		originalPayloadSource = opts.OriginalRequest
 	}
 	originalPayload := bytes.Clone(originalPayloadSource)
-	originalTranslated := sdktranslator.TranslateRequest(from, to, baseModel, originalPayload, stream)
+	originalTranslated := helps.TranslateRequestWithAPIKeyModelCompatibility(ctx, opts.Headers, e.cfg, from, to, baseModel, originalPayload, stream, helps.APIKeyModelIsCompat(req))
 	originalTranslated = preserveXAIResponsesOutputControls(originalTranslated, originalPayload, from)
-	body := sdktranslator.TranslateRequest(from, to, baseModel, bytes.Clone(req.Payload), stream)
+	body := helps.TranslateRequestWithAPIKeyModelCompatibility(ctx, opts.Headers, e.cfg, from, to, baseModel, bytes.Clone(req.Payload), stream, helps.APIKeyModelIsCompat(req))
 	body = preserveXAIResponsesOutputControls(body, req.Payload, from)
 
 	var err error
@@ -328,6 +328,8 @@ func applyXAIChatHeaders(r *http.Request, auth *cliproxyauth.Auth, token string,
 	r.Header.Set(xaiauth.CLITokenAuthHeader, xaiauth.CLITokenAuthValue)
 	r.Header.Set(xaiauth.CLIClientVersionHeader, xaiauth.CLIClientVersion)
 	r.Header.Set("User-Agent", xaiauth.CLIUserAgent)
+	r.Header.Set(xaiauth.CLIClientIdentifierHeader, xaiauth.CLIClientIdentifier)
+	r.Header.Set(xaiauth.CLIAuthenticateResponseHeader, xaiauth.CLIAuthenticateResponse)
 	applyXAICustomHeaders(r, auth)
 }
 
