@@ -193,7 +193,7 @@ jobs:
             # 直接以镜像版本作为 tag（如 v8.63.0-glibc），并附 latest 与 dispatch 手动 tag
             type=raw,value=${{ steps.version.outputs.VERSION }}
             type=raw,value=${{ steps.version.outputs.VERSION }}-glibc,enable=${{ !endsWith(steps.version.outputs.VERSION, '-glibc') }}
-            type=raw,value=latest,enable=${{ github.event_name == 'push' }}
+            type=raw,value=latest,enable=${{ github.event_name == 'push' || github.event_name == 'workflow_dispatch' }}
             type=raw,value=${{ github.event.inputs.tag }},enable=${{ github.event_name == 'workflow_dispatch' && github.event.inputs.tag != '' }}
 
       - name: Create manifest list
