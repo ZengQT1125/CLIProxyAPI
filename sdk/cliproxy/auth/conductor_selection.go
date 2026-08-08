@@ -411,6 +411,17 @@ func selectionArgForSelector(selector Selector, routeModel string) string {
 	return routeModel
 }
 
+func restoreModelCooldownErrorModel(err error, requestedModel string) error {
+	if err == nil || requestedModel == "" {
+		return err
+	}
+	var cooldownErr *modelCooldownError
+	if !errors.As(err, &cooldownErr) || cooldownErr == nil || cooldownErr.model != "" {
+		return err
+	}
+	return newModelCooldownError(requestedModel, cooldownErr.provider, cooldownErr.resetIn)
+}
+
 func schedulerAttributeSensitive(key string) bool {
 	key = strings.ToLower(strings.TrimSpace(key))
 	normalized := strings.NewReplacer("-", "_", ".", "_", " ", "_").Replace(key)
@@ -1100,6 +1111,9 @@ func (m *Manager) pickNextLegacy(ctx context.Context, provider, model string, op
 		selectorCtx := withWeightedSelectorStateModel(ctx, selector, model)
 		selected, errPick = pickSelectorWithRetry(selectorCtx, selector, provider, selectionArgForSelector(selector, model), opts, available, selectable)
 		if errPick != nil {
+			if isBuiltInSelector(selector) {
+				errPick = restoreModelCooldownErrorModel(errPick, model)
+			}
 			return nil, nil, errPick
 		}
 	}
@@ -1428,6 +1442,9 @@ func (m *Manager) pickNextMixedLegacy(ctx context.Context, providers []string, m
 		selectorCtx := withWeightedSelectorStateModel(ctx, selector, model)
 		selected, errPick = pickSelectorWithRetry(selectorCtx, selector, "mixed", selectionArgForSelector(selector, model), opts, available, selectable)
 		if errPick != nil {
+			if isBuiltInSelector(selector) {
+				errPick = restoreModelCooldownErrorModel(errPick, model)
+			}
 			return nil, nil, "", errPick
 		}
 	}
