@@ -912,7 +912,7 @@ func (m *Manager) MarkResult(ctx context.Context, result Result) {
 		return
 	}
 	modelKey := canonicalModelKey(result.Model)
-	deleteUnauthorized := shouldDeleteUnauthorizedAuth(result)
+	deleteUnauthorized := m.shouldDeleteUnauthorizedAuth(result)
 	unlockLifecycle := func() {}
 	if deleteUnauthorized {
 		unlockLifecycle = m.lockAuthLifecycle(result.AuthID)
@@ -1145,23 +1145,17 @@ func (m *Manager) reportHomeResult(ctx context.Context, result Result, auth *Aut
 	m.publishErrorEvent(result, snapshot)
 }
 
-func shouldDeleteUnauthorizedAuth(result Result) bool {
+func (m *Manager) shouldDeleteUnauthorizedAuth(result Result) bool {
 	if result.Success || !deleteUnauthorizedAuth.Load() {
 		return false
 	}
-	if statusCodeFromResult(result.Error) == http.StatusUnauthorized {
-		return true
-	}
-	if result.Error == nil || !strings.EqualFold(strings.TrimSpace(result.Provider), "xai") {
+	if statusCodeFromResult(result.Error) != http.StatusUnauthorized {
 		return false
 	}
-	var payload struct {
-		Code string `json:"code"`
-	}
-	if errUnmarshal := json.Unmarshal([]byte(strings.TrimSpace(result.Error.Message)), &payload); errUnmarshal != nil {
-		return false
-	}
-	return strings.EqualFold(strings.TrimSpace(payload.Code), "permission-denied")
+	m.mu.RLock()
+	auth := m.auths[result.AuthID]
+	m.mu.RUnlock()
+	return !usesUpstreamXAIOAuthLifecycle(auth)
 }
 
 func (m *Manager) lockAuthLifecycle(authID string) func() {
@@ -1717,6 +1711,44 @@ func hasTerminalRefreshAuthFailure(auth *Auth) bool {
 	return auth.LastError.StatusCode() == http.StatusUnauthorized ||
 		strings.EqualFold(auth.LastError.Code, "unauthorized") ||
 		strings.EqualFold(auth.LastError.Code, "invalid_grant")
+}
+
+func hasUnauthorizedAuthFailure(auth *Auth) bool {
+	if auth == nil || auth.LastError == nil {
+		return false
+	}
+	return auth.LastError.StatusCode() == http.StatusUnauthorized || strings.EqualFold(auth.LastError.Code, "unauthorized")
+}
+
+func usesUpstreamXAIOAuthLifecycle(auth *Auth) bool {
+	return auth != nil && strings.EqualFold(strings.TrimSpace(auth.Provider), "xai") && auth.AuthKind() == AuthKindOAuth
+}
+
+func upstreamRefreshErrorFromError(err error) *Error {
+	if err == nil {
+		return nil
+	}
+	statusCode := statusCodeFromError(err)
+	if statusCode == 0 && isUpstreamUnauthorizedError(err) {
+		statusCode = http.StatusUnauthorized
+	}
+	authErr := &Error{Message: err.Error(), HTTPStatus: statusCode}
+	if statusCode == http.StatusUnauthorized {
+		authErr.Code = "unauthorized"
+		authErr.Retryable = false
+	}
+	return authErr
+}
+
+func isUpstreamUnauthorizedError(err error) bool {
+	if err == nil {
+		return false
+	}
+	if statusCodeFromError(err) == http.StatusUnauthorized {
+		return true
+	}
+	raw := strings.ToLower(err.Error())
+	return strings.Contains(raw, "status 401") || strings.Contains(raw, "401 unauthorized")
 }
 
 func refreshErrorFromError(err error) *Error {

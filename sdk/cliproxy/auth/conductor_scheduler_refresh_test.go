@@ -104,44 +104,54 @@ func (e blankingRefreshTestExecutor) Refresh(ctx context.Context, auth *Auth) (*
 	return auth, nil
 }
 
-func TestManager_RefreshAuth_RejectsRefreshThatBlanksAccessToken(t *testing.T) {
-	ctx := context.Background()
-	manager := NewManager(nil, &RoundRobinSelector{}, nil)
-	manager.RegisterExecutor(blankingRefreshTestExecutor{
-		schedulerProviderTestExecutor: schedulerProviderTestExecutor{provider: "claude"},
-	})
+func TestManager_RefreshAuth_HandlesBlankAccessTokenByProviderLifecycle(t *testing.T) {
+	for _, tc := range []struct {
+		provider      string
+		wantToken     string
+		wantError     bool
+		wantRefreshed bool
+	}{
+		{provider: "claude", wantToken: "working-access-token", wantError: true},
+		{provider: "xai", wantRefreshed: true},
+	} {
+		t.Run(tc.provider, func(t *testing.T) {
+			ctx := context.Background()
+			manager := NewManager(nil, &RoundRobinSelector{}, nil)
+			manager.RegisterExecutor(blankingRefreshTestExecutor{
+				schedulerProviderTestExecutor: schedulerProviderTestExecutor{provider: tc.provider},
+			})
 
-	auth := &Auth{
-		ID:       "blanked-refresh",
-		Provider: "claude",
-		Metadata: map[string]any{
-			"access_token":  "working-access-token",
-			"refresh_token": "some-refresh-token",
-		},
-	}
-	if _, errRegister := manager.Register(ctx, auth); errRegister != nil {
-		t.Fatalf("register auth: %v", errRegister)
-	}
+			auth := &Auth{
+				ID:       "blanked-refresh-" + tc.provider,
+				Provider: tc.provider,
+				Metadata: map[string]any{
+					"access_token":  "working-access-token",
+					"refresh_token": "some-refresh-token",
+				},
+			}
+			if _, errRegister := manager.Register(ctx, auth); errRegister != nil {
+				t.Fatalf("register auth: %v", errRegister)
+			}
 
-	manager.refreshAuth(ctx, auth.ID)
+			manager.refreshAuth(ctx, auth.ID)
 
-	updated, ok := manager.GetByID(auth.ID)
-	if !ok {
-		t.Fatalf("expected auth %q after refresh", auth.ID)
-	}
-	if got := authAccessToken(updated); got != "working-access-token" {
-		t.Fatalf("access_token = %q, want the previous working token to survive", got)
-	}
-	if updated.LastError == nil {
-		t.Fatal("expected a refresh that yields no token to be recorded as an error")
-	}
-	// The previous token may still be valid, so the credential stays usable and
-	// the refresh is retried after a backoff rather than being marked terminal.
-	if updated.NextRefreshAfter.IsZero() {
-		t.Fatal("expected a backoff to be scheduled so the refresh is retried")
-	}
-	if !updated.LastRefreshedAt.IsZero() {
-		t.Fatal("expected a refresh yielding no token to not count as a successful refresh")
+			updated, ok := manager.GetByID(auth.ID)
+			if !ok {
+				t.Fatalf("expected auth %q after refresh", auth.ID)
+			}
+			if got := authAccessToken(updated); got != tc.wantToken {
+				t.Fatalf("access_token = %q, want %q", got, tc.wantToken)
+			}
+			if gotError := updated.LastError != nil; gotError != tc.wantError {
+				t.Fatalf("LastError = %#v, want error %v", updated.LastError, tc.wantError)
+			}
+			if gotRefreshed := !updated.LastRefreshedAt.IsZero(); gotRefreshed != tc.wantRefreshed {
+				t.Fatalf("LastRefreshedAt = %s, want refreshed %v", updated.LastRefreshedAt, tc.wantRefreshed)
+			}
+			if tc.wantError && updated.NextRefreshAfter.IsZero() {
+				t.Fatal("expected a backoff to be scheduled so the refresh is retried")
+			}
+		})
 	}
 }
 

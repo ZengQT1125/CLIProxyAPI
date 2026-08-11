@@ -1125,95 +1125,6 @@ func TestUploadAuthFile_Sub2APICodexUsesAliasesJWTAndFlexibleTimestamps(t *testi
 	}
 }
 
-func TestUploadAuthFile_Sub2APIConvertsGrokOAuthToXAI(t *testing.T) {
-	t.Setenv("MANAGEMENT_PASSWORD", "")
-	gin.SetMode(gin.TestMode)
-
-	authDir := t.TempDir()
-	manager := coreauth.NewManager(nil, nil, nil)
-	h := NewHandlerWithoutConfigFilePath(&config.Config{AuthDir: authDir}, manager)
-	accessToken := buildAuthTestJWT(t, map[string]any{
-		"email": "grok@example.com",
-		"exp":   1800000000,
-		"sub":   "grok-subject",
-	})
-	payload, errMarshal := json.Marshal(map[string]any{
-		"accounts": []any{
-			map[string]any{
-				"name":     "Grok Account",
-				"platform": "grok",
-				"type":     "oauth",
-				"credentials": map[string]any{
-					"access_token":  accessToken,
-					"refresh_token": "refresh-grok",
-					"base_url":      "https://cli-chat-proxy.grok.com/v1",
-					"expires_in":    "3600",
-					"token_type":    "Bearer",
-				},
-				"extra": map[string]any{
-					"last_refresh":   "2026-07-18T10:00:00.123Z",
-					"redirect_uri":   "http://127.0.0.1:56121/callback",
-					"token_endpoint": "https://auth.x.ai/oauth2/token",
-				},
-				"headers": map[string]any{
-					"X-Grok-Test": "yes",
-				},
-			},
-		},
-	})
-	if errMarshal != nil {
-		t.Fatalf("marshal Sub2API payload: %v", errMarshal)
-	}
-
-	rec := uploadRawAuthPayload(t, h, "grok.json", payload)
-	if rec.Code != http.StatusOK {
-		t.Fatalf("upload status = %d, want %d; body = %s", rec.Code, http.StatusOK, rec.Body.String())
-	}
-	path := filepath.Join(authDir, "xai-grok@example.com.json")
-	data, errRead := os.ReadFile(path)
-	if errRead != nil {
-		t.Fatalf("read converted xAI auth file: %v", errRead)
-	}
-	var document map[string]any
-	if errDecode := json.Unmarshal(data, &document); errDecode != nil {
-		t.Fatalf("decode converted xAI auth file: %v", errDecode)
-	}
-	wantStrings := map[string]string{
-		"type":           "xai",
-		"auth_kind":      "oauth",
-		"email":          "grok@example.com",
-		"sub":            "grok-subject",
-		"refresh_token":  "refresh-grok",
-		"token_type":     "Bearer",
-		"expired":        time.Unix(1800000000, 0).UTC().Format(time.RFC3339),
-		"last_refresh":   "2026-07-18T10:00:00Z",
-		"base_url":       "https://cli-chat-proxy.grok.com/v1",
-		"redirect_uri":   "http://127.0.0.1:56121/callback",
-		"token_endpoint": "https://auth.x.ai/oauth2/token",
-	}
-	for key, want := range wantStrings {
-		if got, _ := document[key].(string); got != want {
-			t.Fatalf("converted %s = %q, want %q", key, got, want)
-		}
-	}
-	if got := int(document["expires_in"].(float64)); got != 3600 {
-		t.Fatalf("converted expires_in = %d, want 3600", got)
-	}
-	if _, exists := document["id_token"]; exists {
-		t.Fatalf("converted xAI auth must not synthesize id_token")
-	}
-	if _, exists := document["client_id"]; exists {
-		t.Fatalf("converted xAI auth must not persist unsupported client_id")
-	}
-	auth, okAuth := manager.GetByID("xai-grok@example.com.json")
-	if !okAuth || auth.Provider != "xai" {
-		t.Fatalf("converted runtime auth = %#v, want xai", auth)
-	}
-	if got := auth.Attributes["header:X-Grok-Test"]; got != "yes" {
-		t.Fatalf("converted runtime header attribute = %q, want yes", got)
-	}
-}
-
 func TestUploadAuthFile_Sub2APIConvertsAnthropicOAuthToClaude(t *testing.T) {
 	t.Setenv("MANAGEMENT_PASSWORD", "")
 	gin.SetMode(gin.TestMode)
@@ -1296,65 +1207,6 @@ func TestUploadAuthFile_Sub2APIConvertsAnthropicOAuthToClaude(t *testing.T) {
 	}
 	if got, _ := auth.Metadata["refresh_token"].(string); got != "anthropic-refresh" {
 		t.Fatalf("converted runtime refresh token = %q, want synthetic refresh token", got)
-	}
-}
-
-func TestUploadAuthFile_GrokBuildFlatAccountConvertsToXAI(t *testing.T) {
-	t.Setenv("MANAGEMENT_PASSWORD", "")
-	gin.SetMode(gin.TestMode)
-
-	authDir := t.TempDir()
-	manager := coreauth.NewManager(nil, nil, nil)
-	h := NewHandlerWithoutConfigFilePath(&config.Config{AuthDir: authDir}, manager)
-	accessToken := buildAuthTestJWT(t, map[string]any{
-		"email": "grok-build@example.com",
-		"exp":   1800000000,
-		"sub":   "grok-build-user",
-	})
-	payload, errMarshal := json.Marshal(map[string]any{
-		"accounts": []any{
-			map[string]any{
-				"provider":      "grok_build",
-				"name":          "Grok Build Account",
-				"client_id":     "b1a00492-073a-47ea-816f-4c329264a828",
-				"access_token":  accessToken,
-				"refresh_token": "refresh-grok-build",
-				"token_type":    "Bearer",
-				"expires_at":    "2027-01-15T08:00:00Z",
-				"expires_in":    3600,
-				"email":         "grok-build@example.com",
-				"user_id":       "grok-build-user",
-			},
-		},
-	})
-	if errMarshal != nil {
-		t.Fatalf("marshal grok2api payload: %v", errMarshal)
-	}
-
-	rec := uploadRawAuthPayload(t, h, "grok2api.json", payload)
-	if rec.Code != http.StatusOK {
-		t.Fatalf("upload status = %d, want %d; body = %s", rec.Code, http.StatusOK, rec.Body.String())
-	}
-	path := filepath.Join(authDir, "xai-grok-build@example.com.json")
-	data, errRead := os.ReadFile(path)
-	if errRead != nil {
-		t.Fatalf("read converted xAI auth file: %v", errRead)
-	}
-	var document map[string]any
-	if errDecode := json.Unmarshal(data, &document); errDecode != nil {
-		t.Fatalf("decode converted xAI auth file: %v", errDecode)
-	}
-	if got, _ := document["type"].(string); got != "xai" {
-		t.Fatalf("converted type = %q, want xai", got)
-	}
-	if got, _ := document["email"].(string); got != "grok-build@example.com" {
-		t.Fatalf("converted email = %q, want grok-build@example.com", got)
-	}
-	if got, _ := document["sub"].(string); got != "grok-build-user" {
-		t.Fatalf("converted sub = %q, want grok-build-user", got)
-	}
-	if got := len(manager.List()); got != 1 {
-		t.Fatalf("registered auth count = %d, want 1", got)
 	}
 }
 
@@ -1498,7 +1350,7 @@ func TestUploadAuthFile_Sub2APIDataMultipartReportsUnsupportedAccount(t *testing
 		"version":1,
 		"accounts":[
 			{"name":"valid@example.com","platform":"openai","type":"oauth","credentials":{"access_token":"access","refresh_token":"refresh","chatgpt_account_id":"account"}},
-			{"name":"unsupported@example.com","platform":"gemini","type":"oauth","credentials":{"access_token":"access","refresh_token":"refresh"}}
+			{"name":"unsupported@example.com","platform":"grok","type":"oauth","credentials":{"access_token":"access","refresh_token":"refresh"}}
 		]
 	}`
 

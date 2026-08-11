@@ -258,6 +258,50 @@ func TestManager_Execute_UnauthorizedRefreshFailureFallsBackToNextAuth(t *testin
 	}
 }
 
+func TestManager_Execute_XAIOAuthRefreshFailureKeepsCredential(t *testing.T) {
+	SetDeleteUnauthorizedAuth(true)
+	t.Cleanup(func() { SetDeleteUnauthorizedAuth(false) })
+
+	const model = "grok-4.5"
+	auth := &Auth{
+		ID:       "xai-primary",
+		Provider: "xai",
+		Metadata: map[string]any{
+			"access_token":  "stale-access-token",
+			"refresh_token": "invalid-refresh-token",
+			"auth_kind":     "oauth",
+		},
+	}
+	executor := &unauthorizedRefreshExecutor{
+		id:           "xai",
+		tokenInvalid: map[string]struct{}{"stale-access-token": {}},
+		refreshFail:  true,
+	}
+	store := &deleteTrackingStore{}
+	manager := NewManager(store, nil, nil)
+	manager.RegisterExecutor(executor)
+	if _, errRegister := manager.Register(WithSkipPersist(context.Background()), auth); errRegister != nil {
+		t.Fatalf("register auth: %v", errRegister)
+	}
+	registry.GetGlobalRegistry().RegisterClient(auth.ID, "xai", []*registry.ModelInfo{{ID: model}})
+	t.Cleanup(func() { registry.GetGlobalRegistry().UnregisterClient(auth.ID) })
+	manager.RefreshSchedulerEntry(auth.ID)
+
+	_, errExecute := manager.Execute(context.Background(), []string{"xai"}, cliproxyexecutor.Request{Model: model}, cliproxyexecutor.Options{})
+	if errExecute == nil {
+		t.Fatal("Execute() error = nil, want unauthorized refresh failure")
+	}
+	if got := executor.RefreshCalls(); got != 1 {
+		t.Fatalf("refresh calls = %d, want 1", got)
+	}
+	if _, ok := manager.GetByID(auth.ID); !ok {
+		t.Fatal("expected xai OAuth credential to remain registered")
+	}
+	if got := store.deleted(); len(got) != 0 {
+		t.Fatalf("deleted auths = %v, want none", got)
+	}
+}
+
 func TestManager_Execute_UnauthorizedWithoutRefreshTokenDoesNotCallRefresh(t *testing.T) {
 	model := "gpt-5.5"
 	primary := &Auth{

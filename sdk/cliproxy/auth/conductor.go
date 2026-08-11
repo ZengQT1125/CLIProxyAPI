@@ -30,12 +30,6 @@ type ProviderExecutor interface {
 	HttpRequest(ctx context.Context, auth *Auth, req *http.Request) (*http.Response, error)
 }
 
-// CredentialProber performs a minimal provider conversation to verify that the
-// current access credential still works after a terminal refresh failure.
-type CredentialProber interface {
-	ProbeCredential(ctx context.Context, auth *Auth) error
-}
-
 // RequestAuthPreparer lets an executor update missing auth metadata immediately
 // before a request. Manager serializes and persists returned updates.
 type RequestAuthPreparer interface {

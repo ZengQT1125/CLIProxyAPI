@@ -264,8 +264,8 @@ func TestUploadAuthFile_FillsMissingEmailFromRawUploadName(t *testing.T) {
 	if err = json.Unmarshal(data, &saved); err != nil {
 		t.Fatalf("failed to decode saved auth file: %v", err)
 	}
-	if got := saved["email"]; got != "user@example.com" {
-		t.Fatalf("saved email = %#v, want %q", got, "user@example.com")
+	if got := saved["email"]; got != "xai-user@example.com" {
+		t.Fatalf("saved email = %#v, want %q", got, "xai-user@example.com")
 	}
 }
 

@@ -17,7 +17,6 @@ import (
 	"strings"
 	"time"
 
-	xaiauth "github.com/router-for-me/CLIProxyAPI/v7/internal/auth/xai"
 	coreauth "github.com/router-for-me/CLIProxyAPI/v7/sdk/cliproxy/auth"
 )
 
@@ -267,8 +266,6 @@ func convertSub2APIAccount(candidate sub2APIAccountCandidate, now time.Time) (su
 		provider = "codex"
 	case "anthropic":
 		provider = "claude"
-	case "grok", "grok_build", "xai":
-		provider = "xai"
 	}
 	if provider == "" || authType != "oauth" {
 		return sub2APIConvertedAuth{}, fmt.Errorf("unsupported account platform/type %q/%q", platform, authType)
@@ -343,13 +340,6 @@ func convertSub2APIAccount(candidate sub2APIAccountCandidate, now time.Time) (su
 	if clientID == "" {
 		clientID = firstSub2APIMapString([]map[string]any{accessPayload, idPayload}, "client_id")
 	}
-	subject := sub2APIFirstString(record,
-		[]string{"credentials", "sub"}, []string{"credential", "sub"},
-		[]string{"extra", "sub"}, []string{"sub"},
-	)
-	if subject == "" {
-		subject = firstSub2APIMapString([]map[string]any{accessPayload, idPayload}, "sub")
-	}
 	accountUUID := sub2APIFirstString(record,
 		[]string{"credentials", "account_uuid"}, []string{"credentials", "accountUuid"},
 		[]string{"credential", "account_uuid"}, []string{"credential", "accountUuid"},
@@ -403,9 +393,6 @@ func convertSub2APIAccount(candidate sub2APIAccountCandidate, now time.Time) (su
 	if identity == "" && provider == "codex" {
 		identity = accountID
 	}
-	if identity == "" && provider == "xai" {
-		identity = subject
-	}
 	if identity == "" && provider == "claude" {
 		identity = accountUUID
 	}
@@ -414,7 +401,7 @@ func convertSub2APIAccount(candidate sub2APIAccountCandidate, now time.Time) (su
 	}
 	filenameToken := sanitizeAuthFileToken(identity)
 	if filenameToken == "" {
-		return sub2APIConvertedAuth{}, fmt.Errorf("account has no usable email, subject, account id, account UUID, or name")
+		return sub2APIConvertedAuth{}, fmt.Errorf("account has no usable email, account id, account UUID, or name")
 	}
 	baseFilename := provider + "-" + filenameToken + ".json"
 
@@ -448,38 +435,6 @@ func convertSub2APIAccount(candidate sub2APIAccountCandidate, now time.Time) (su
 		setSub2APIString(native, "session_token", sub2APIFirstString(record,
 			[]string{"credentials", "session_token"}, []string{"credential", "session_token"}, []string{"session_token"},
 		))
-	case "xai":
-		native["auth_kind"] = "oauth"
-		setSub2APIString(native, "sub", subject)
-		setSub2APIString(native, "token_type", sub2APIFirstString(record,
-			[]string{"credentials", "token_type"}, []string{"credential", "token_type"}, []string{"token_type"},
-		))
-		if hasExpiresIn && expiresIn > 0 {
-			native["expires_in"] = expiresIn
-		}
-		baseURL := sub2APIFirstString(record,
-			[]string{"credentials", "base_url"}, []string{"credential", "base_url"},
-			[]string{"extra", "base_url"}, []string{"base_url"},
-		)
-		if baseURL == "" {
-			baseURL = xaiauth.DefaultAPIBaseURL
-		}
-		native["base_url"] = baseURL
-		setSub2APIString(native, "redirect_uri", sub2APIFirstString(record,
-			[]string{"credentials", "redirect_uri"}, []string{"credential", "redirect_uri"},
-			[]string{"extra", "redirect_uri"}, []string{"redirect_uri"},
-		))
-		tokenEndpoint := sub2APIFirstString(record,
-			[]string{"credentials", "token_endpoint"}, []string{"credential", "token_endpoint"},
-			[]string{"extra", "token_endpoint"}, []string{"token_endpoint"},
-		)
-		if tokenEndpoint != "" {
-			validatedEndpoint, errValidate := xaiauth.ValidateOAuthEndpoint(tokenEndpoint, "token_endpoint")
-			if errValidate != nil {
-				return sub2APIConvertedAuth{baseFilename: baseFilename}, fmt.Errorf("invalid xai token_endpoint: %w", errValidate)
-			}
-			native["token_endpoint"] = validatedEndpoint
-		}
 	}
 	if errConfig := copySub2APIConfiguration(record, native); errConfig != nil {
 		return sub2APIConvertedAuth{baseFilename: baseFilename}, errConfig
@@ -493,8 +448,6 @@ func convertSub2APIAccount(candidate sub2APIAccountCandidate, now time.Time) (su
 	switch provider {
 	case "claude":
 		fingerprintIdentity = accountUUID
-	case "xai":
-		fingerprintIdentity = subject
 	}
 	fingerprint := sha256.Sum256([]byte(accessToken + "\x00" + fingerprintIdentity))
 	return sub2APIConvertedAuth{

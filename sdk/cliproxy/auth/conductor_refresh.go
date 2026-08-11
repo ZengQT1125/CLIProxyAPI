@@ -115,7 +115,11 @@ func (m *Manager) shouldRefresh(a *Auth, now time.Time) bool {
 	if a == nil {
 		return false
 	}
-	if hasTerminalRefreshAuthFailure(a) {
+	if usesUpstreamXAIOAuthLifecycle(a) {
+		if hasUnauthorizedAuthFailure(a) {
+			return false
+		}
+	} else if hasTerminalRefreshAuthFailure(a) {
 		return false
 	}
 	if !a.NextRefreshAfter.IsZero() && now.Before(a.NextRefreshAfter) {
@@ -485,17 +489,13 @@ func (m *Manager) tryRefreshAfterUnauthorized(ctx context.Context, auth *Auth, e
 }
 
 func (m *Manager) refreshAuth(ctx context.Context, id string) {
-	_, _ = m.refreshAuthWithPolicy(ctx, id, "", true)
+	_, _ = m.refreshAuthForRequest(ctx, id, "")
 }
 
 // refreshAuthForRequest performs a synchronous credential refresh for the given auth.
 // failedAccessToken lets concurrent callers reuse a refresh that already replaced the
 // access token that produced the unauthorized response.
 func (m *Manager) refreshAuthForRequest(ctx context.Context, id, failedAccessToken string) (*Auth, error) {
-	return m.refreshAuthWithPolicy(ctx, id, failedAccessToken, false)
-}
-
-func (m *Manager) refreshAuthWithPolicy(ctx context.Context, id, failedAccessToken string, probeBeforeDelete bool) (*Auth, error) {
 	if m == nil {
 		return nil, errors.New("auth manager is nil")
 	}
@@ -528,6 +528,7 @@ func (m *Manager) refreshAuthWithPolicy(ctx context.Context, id, failedAccessTok
 	if auth == nil || exec == nil {
 		return nil, errors.New("auth or executor not found")
 	}
+	useUpstreamXAI := usesUpstreamXAIOAuthLifecycle(auth)
 
 	// Another request may already have refreshed this credential.
 	if failedAccessToken != "" {
@@ -538,7 +539,7 @@ func (m *Manager) refreshAuthWithPolicy(ctx context.Context, id, failedAccessTok
 
 	cloned := auth.Clone()
 	updated, err := exec.Refresh(ctx, cloned)
-	if err == nil {
+	if err == nil && !useUpstreamXAI {
 		// A refresh that hands back no access token is not a success. Accepting it
 		// would overwrite a credential that still works with an empty string, then
 		// persist that and report the auth as healthy. Keep the previous token and
@@ -563,11 +564,10 @@ func (m *Manager) refreshAuthWithPolicy(ctx context.Context, id, failedAccessTok
 	now := time.Now()
 	if err != nil {
 		terminal := isPermanentRefreshAuthError(err)
-		deleteTerminal := terminal && deleteUnauthorizedAuth.Load()
-		probeValidated := false
-		if deleteTerminal && probeBeforeDelete {
-			deleteTerminal, probeValidated = shouldDeleteAfterCredentialProbe(ctx, exec, auth)
+		if useUpstreamXAI {
+			terminal = isUpstreamUnauthorizedError(err)
 		}
+		deleteTerminal := terminal && deleteUnauthorizedAuth.Load() && !useUpstreamXAI
 		var unlockLifecycle func()
 		if deleteTerminal {
 			unlockLifecycle = m.lockAuthLifecycle(id)
@@ -580,7 +580,11 @@ func (m *Manager) refreshAuthWithPolicy(ctx context.Context, id, failedAccessTok
 		var deleteStore Store
 		m.mu.Lock()
 		if current := m.auths[id]; current == auth {
-			current.LastError = refreshErrorFromError(err)
+			if useUpstreamXAI {
+				current.LastError = upstreamRefreshErrorFromError(err)
+			} else {
+				current.LastError = refreshErrorFromError(err)
+			}
 			if deleteTerminal {
 				deleteStore = m.store
 				deleteAuthIndex = current.EnsureIndex()
@@ -589,18 +593,15 @@ func (m *Manager) refreshAuthWithPolicy(ctx context.Context, id, failedAccessTok
 			} else {
 				if terminal {
 					current.NextRefreshAfter = time.Time{}
-					if probeValidated {
-						current.Unavailable = false
-						if !current.Disabled && current.Status != StatusDisabled {
-							current.Status = StatusActive
-						}
-						current.StatusMessage = ""
+					current.Unavailable = true
+					current.Status = StatusError
+					if useUpstreamXAI {
+						current.StatusMessage = "unauthorized"
+						shouldReschedule = true
 					} else {
-						current.Unavailable = true
-						current.Status = StatusError
 						current.StatusMessage = current.LastError.Code
+						shouldUnschedule = true
 					}
-					shouldUnschedule = true
 				} else {
 					current.NextRefreshAfter = now.Add(refreshFailureBackoff)
 					shouldReschedule = true
@@ -653,24 +654,4 @@ func (m *Manager) refreshAuthWithPolicy(ctx context.Context, id, failedAccessTok
 		return saved, nil
 	}
 	return updated.Clone(), nil
-}
-
-func shouldDeleteAfterCredentialProbe(ctx context.Context, exec ProviderExecutor, auth *Auth) (deleteAuth, validated bool) {
-	prober, ok := exec.(CredentialProber)
-	if !ok || prober == nil {
-		return true, false
-	}
-
-	errProbe := prober.ProbeCredential(ctx, auth.Clone())
-	if errProbe == nil {
-		log.Debugf("credential conversation probe succeeded for %s (%s); keeping auth after refresh failure", auth.Provider, auth.ID)
-		return false, true
-	}
-	if isUnauthorizedError(errProbe) {
-		log.Debugf("credential conversation probe rejected %s (%s): %v", auth.Provider, auth.ID, errProbe)
-		return true, false
-	}
-
-	log.Warnf("credential conversation probe was inconclusive for %s (%s); keeping auth: %v", auth.Provider, auth.ID, errProbe)
-	return false, false
 }
