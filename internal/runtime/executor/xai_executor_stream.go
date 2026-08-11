@@ -31,7 +31,6 @@ func (e *XAIExecutor) ExecuteStream(ctx context.Context, auth *cliproxyauth.Auth
 	if err != nil {
 		return nil, err
 	}
-	prepared.body = ensureXAIChatProxyWebSearch(auth, baseURL, prepared.body)
 
 	reporter := helps.NewExecutorUsageReporter(ctx, e, prepared.baseModel, auth)
 	defer reporter.TrackFailure(ctx, &err)

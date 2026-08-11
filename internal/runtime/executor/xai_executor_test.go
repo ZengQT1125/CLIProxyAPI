@@ -133,7 +133,7 @@ func captureXAIResponsesRequest(t *testing.T, auth *cliproxyauth.Auth, payload [
 	return gotBaseURL, gotBody
 }
 
-func TestXAIExecutorExecuteInjectsNativeWebSearchOnlyForCLIChatProxy(t *testing.T) {
+func TestXAIExecutorExecuteDoesNotInjectOrRewriteWebSearch(t *testing.T) {
 	tests := []struct {
 		name            string
 		auth            *cliproxyauth.Auth
@@ -141,10 +141,11 @@ func TestXAIExecutorExecuteInjectsNativeWebSearchOnlyForCLIChatProxy(t *testing.
 		payload         []byte
 		wantBaseURL     string
 		wantNativeTools int
+		wantNamedTools  int
 		wantLookup      bool
 	}{
 		{
-			name: "OAuth default injects native web search",
+			name: "OAuth default does not inject native web search",
 			auth: &cliproxyauth.Auth{
 				Provider: "xai",
 				Attributes: map[string]string{
@@ -155,11 +156,11 @@ func TestXAIExecutorExecuteInjectsNativeWebSearchOnlyForCLIChatProxy(t *testing.
 			},
 			payload:         []byte(`{"model":"grok-4.5","input":[{"role":"user","content":"hello"}],"tools":[{"type":"function","name":"lookup","parameters":{"type":"object"}}]}`),
 			wantBaseURL:     xaiauth.CLIChatProxyBaseURL,
-			wantNativeTools: 1,
+			wantNativeTools: 0,
 			wantLookup:      true,
 		},
 		{
-			name: "environment override takes priority over credential base url",
+			name: "environment override does not inject native web search",
 			auth: &cliproxyauth.Auth{
 				Provider: "xai",
 				Attributes: map[string]string{
@@ -172,11 +173,11 @@ func TestXAIExecutorExecuteInjectsNativeWebSearchOnlyForCLIChatProxy(t *testing.
 			envBaseURL:      "https://proxy.example.test/xai/v1",
 			payload:         []byte(`{"model":"grok-4.5","input":[{"role":"user","content":"hello"}],"tools":[{"type":"function","name":"lookup","parameters":{"type":"object"}}]}`),
 			wantBaseURL:     "https://proxy.example.test/xai/v1",
-			wantNativeTools: 1,
+			wantNativeTools: 0,
 			wantLookup:      true,
 		},
 		{
-			name: "existing native web search is not duplicated",
+			name: "existing native web search is preserved",
 			auth: &cliproxyauth.Auth{
 				Provider: "xai",
 				Attributes: map[string]string{
@@ -191,7 +192,7 @@ func TestXAIExecutorExecuteInjectsNativeWebSearchOnlyForCLIChatProxy(t *testing.
 			wantLookup:      true,
 		},
 		{
-			name: "duplicate and named web search tools are removed",
+			name: "duplicate and named web search tools are preserved",
 			auth: &cliproxyauth.Auth{
 				Provider: "xai",
 				Attributes: map[string]string{
@@ -202,7 +203,8 @@ func TestXAIExecutorExecuteInjectsNativeWebSearchOnlyForCLIChatProxy(t *testing.
 			},
 			payload:         []byte(`{"model":"grok-4.5","input":[{"role":"user","content":"hello"}],"tools":[{"type":"web_search"},{"type":"web_search"},{"type":"function","name":"web_search","parameters":{"type":"object"}},{"type":"custom","name":"web_search"},{"type":"function","name":"lookup","parameters":{"type":"object"}}]}`),
 			wantBaseURL:     xaiauth.CLIChatProxyBaseURL,
-			wantNativeTools: 1,
+			wantNativeTools: 2,
+			wantNamedTools:  2,
 			wantLookup:      true,
 		},
 		{
@@ -278,8 +280,8 @@ func TestXAIExecutorExecuteInjectsNativeWebSearchOnlyForCLIChatProxy(t *testing.
 			if nativeTools != tt.wantNativeTools {
 				t.Fatalf("native web_search tools = %d, want %d; body=%s", nativeTools, tt.wantNativeTools, gotBody)
 			}
-			if tt.wantNativeTools > 0 && namedWebSearchTools != 0 {
-				t.Fatalf("named web_search tools = %d, want 0; body=%s", namedWebSearchTools, gotBody)
+			if namedWebSearchTools != tt.wantNamedTools {
+				t.Fatalf("named web_search tools = %d, want %d; body=%s", namedWebSearchTools, tt.wantNamedTools, gotBody)
 			}
 			if gotLookup := lookupTools == 1; gotLookup != tt.wantLookup {
 				t.Fatalf("lookup tool present = %v, want %v; body=%s", gotLookup, tt.wantLookup, gotBody)
@@ -401,27 +403,31 @@ func TestCountXAIInputTokensExcludesRequestStructure(t *testing.T) {
 	}
 }
 
-func TestXAIExecutorExecuteRemovesConflictingWebSearchToolChoices(t *testing.T) {
+func TestXAIExecutorExecutePreservesSupportedClientWebSearchToolChoices(t *testing.T) {
 	tests := []struct {
 		name              string
 		payload           []byte
 		wantChoice        bool
 		wantChoiceType    string
+		wantChoiceName    string
 		wantNativeChoices int
 		wantNamedChoices  int
 		wantLookupChoices int
 	}{
 		{
-			name:       "direct named choice is removed",
-			payload:    []byte(`{"model":"grok-4.5","input":[{"role":"user","content":"hello"}],"tools":[{"type":"function","name":"web_search","parameters":{"type":"object"}}],"tool_choice":{"type":"function","name":"web_search"}}`),
-			wantChoice: false,
+			name:           "direct named choice is preserved",
+			payload:        []byte(`{"model":"grok-4.5","input":[{"role":"user","content":"hello"}],"tools":[{"type":"function","name":"web_search","parameters":{"type":"object"}}],"tool_choice":{"type":"function","name":"web_search"}}`),
+			wantChoice:     true,
+			wantChoiceType: "function",
+			wantChoiceName: "web_search",
 		},
 		{
-			name:              "allowed choices remove named conflicts and duplicate native choices",
+			name:              "allowed choices retain matching function choices",
 			payload:           []byte(`{"model":"grok-4.5","input":[{"role":"user","content":"hello"}],"tools":[{"type":"function","name":"web_search","parameters":{"type":"object"}},{"type":"function","name":"lookup","parameters":{"type":"object"}}],"tool_choice":{"type":"allowed_tools","tools":[{"type":"function","name":"web_search"},{"type":"custom","name":"WEB_SEARCH"},{"type":"web_search"},{"type":"web_search"},{"type":"function","name":"lookup"}]}}`),
 			wantChoice:        true,
 			wantChoiceType:    "allowed_tools",
-			wantNativeChoices: 1,
+			wantNativeChoices: 0,
+			wantNamedChoices:  1,
 			wantLookupChoices: 1,
 		},
 	}
@@ -447,6 +453,9 @@ func TestXAIExecutorExecuteRemovesConflictingWebSearchToolChoices(t *testing.T) 
 			}
 			if gotType := choice.Get("type").String(); gotType != tt.wantChoiceType {
 				t.Fatalf("tool_choice.type = %q, want %q; body=%s", gotType, tt.wantChoiceType, gotBody)
+			}
+			if gotName := choice.Get("name").String(); gotName != tt.wantChoiceName {
+				t.Fatalf("tool_choice.name = %q, want %q; body=%s", gotName, tt.wantChoiceName, gotBody)
 			}
 			nativeChoices := 0
 			namedChoices := 0
@@ -476,7 +485,7 @@ func TestXAIExecutorExecuteRemovesConflictingWebSearchToolChoices(t *testing.T) 
 	}
 }
 
-func TestXAIExecutorExecuteStreamInjectsNativeWebSearchForCLIChatProxy(t *testing.T) {
+func TestXAIExecutorExecuteStreamDoesNotInjectNativeWebSearchForCLIChatProxy(t *testing.T) {
 	auth := &cliproxyauth.Auth{
 		Provider: "xai",
 		Attributes: map[string]string{
@@ -494,8 +503,8 @@ func TestXAIExecutorExecuteStreamInjectsNativeWebSearchForCLIChatProxy(t *testin
 		}
 		return true
 	})
-	if nativeTools != 1 {
-		t.Fatalf("native web_search tools = %d, want 1; body=%s", nativeTools, gotBody)
+	if nativeTools != 0 {
+		t.Fatalf("native web_search tools = %d, want 0; body=%s", nativeTools, gotBody)
 	}
 }
 
