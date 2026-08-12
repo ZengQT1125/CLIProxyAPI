@@ -309,7 +309,7 @@ func (h *Handler) sendCodexAgentIdentityRequest(ctx context.Context, method, req
 		request.Header.Set("X-OpenAI-Fedramp", "true")
 	}
 
-	client := &http.Client{Timeout: 30 * time.Second, Transport: h.apiCallTransport(nil)}
+	client := &http.Client{Timeout: 30 * time.Second, Transport: h.apiCallTransport(nil, "")}
 	response, errDo := client.Do(request)
 	if errDo != nil {
 		return fmt.Errorf("request failed")
