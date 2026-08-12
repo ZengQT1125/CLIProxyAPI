@@ -3,7 +3,6 @@ package executor
 import (
 	"bytes"
 	"context"
-	"encoding/json"
 	"fmt"
 	"io"
 	"net/http"
@@ -18,32 +17,6 @@ import (
 	"github.com/tidwall/gjson"
 	"github.com/tidwall/sjson"
 )
-
-// ProbeCredential verifies the current access token with a minimal Responses
-// conversation. It intentionally reuses Execute so the probe follows the same
-// endpoint, headers, proxy, and payload translation as real traffic.
-func (e *XAIExecutor) ProbeCredential(ctx context.Context, auth *cliproxyauth.Auth) error {
-	if auth == nil {
-		return fmt.Errorf("xai executor: auth is nil")
-	}
-	if ctx == nil {
-		ctx = context.Background()
-	}
-	payload, errMarshal := json.Marshal(map[string]any{
-		"model": xaiCredentialProbeModel,
-		"input": "Reply with OK.",
-	})
-	if errMarshal != nil {
-		return fmt.Errorf("xai executor: marshal credential probe: %w", errMarshal)
-	}
-	_, errExecute := e.Execute(ctx, auth, cliproxyexecutor.Request{
-		Model:   xaiCredentialProbeModel,
-		Payload: payload,
-	}, cliproxyexecutor.Options{
-		SourceFormat: sdktranslator.FormatOpenAIResponse,
-	})
-	return errExecute
-}
 
 func (e *XAIExecutor) Execute(ctx context.Context, auth *cliproxyauth.Auth, req cliproxyexecutor.Request, opts cliproxyexecutor.Options) (resp cliproxyexecutor.Response, err error) {
 	if opts.Alt == "responses/compact" {
@@ -64,7 +37,6 @@ func (e *XAIExecutor) Execute(ctx context.Context, auth *cliproxyauth.Auth, req 
 	if err != nil {
 		return resp, err
 	}
-	prepared.body = ensureXAIChatProxyWebSearch(auth, baseURL, prepared.body)
 
 	reporter := helps.NewExecutorUsageReporter(ctx, e, prepared.baseModel, auth)
 	defer reporter.TrackFailure(ctx, &err)

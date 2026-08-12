@@ -50,15 +50,6 @@ func TestPrepareRequestRejectsMissingToken(t *testing.T) {
 			},
 		},
 		{
-			name:     "xai",
-			preparer: NewXAIExecutor(&config.Config{}),
-			auth: &cliproxyauth.Auth{
-				ID:       "xai-oauth",
-				Provider: "xai",
-				Metadata: map[string]any{"type": "xai"},
-			},
-		},
-		{
 			name:     "openai-compat",
 			preparer: NewOpenAICompatExecutor("example", &config.Config{}),
 			auth: &cliproxyauth.Auth{

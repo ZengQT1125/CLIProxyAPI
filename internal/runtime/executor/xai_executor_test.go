@@ -44,52 +44,6 @@ func (f xaiTestRoundTripper) RoundTrip(req *http.Request) (*http.Response, error
 	return f(req)
 }
 
-func TestXAIExecutorProbeCredentialUsesConversation(t *testing.T) {
-	var gotAuthorization string
-	var gotPath string
-	var gotBody []byte
-	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		gotAuthorization = r.Header.Get("Authorization")
-		gotPath = r.URL.Path
-		var errRead error
-		gotBody, errRead = io.ReadAll(r.Body)
-		if errRead != nil {
-			t.Fatalf("read request body: %v", errRead)
-		}
-		model := gjson.GetBytes(gotBody, "model").String()
-		w.Header().Set("Content-Type", "text/event-stream")
-		_, _ = fmt.Fprintf(w, "data: {\"type\":\"response.completed\",\"response\":{\"id\":\"resp_probe\",\"object\":\"response\",\"status\":\"completed\",\"model\":%q,\"output\":[]}}\n\n", model)
-	}))
-	defer server.Close()
-
-	exec := NewXAIAutoExecutor(&config.Config{})
-	auth := &cliproxyauth.Auth{
-		ID:       "xai-probe",
-		Provider: "xai",
-		Attributes: map[string]string{
-			"base_url":  server.URL,
-			"auth_kind": "oauth",
-		},
-		Metadata: map[string]any{"access_token": "working-access-token"},
-	}
-
-	if err := exec.ProbeCredential(context.Background(), auth); err != nil {
-		t.Fatalf("ProbeCredential() error = %v", err)
-	}
-	if gotAuthorization != "Bearer working-access-token" {
-		t.Fatalf("Authorization = %q, want bearer access token", gotAuthorization)
-	}
-	if gotPath != "/responses" {
-		t.Fatalf("request path = %q, want /responses", gotPath)
-	}
-	if model := gjson.GetBytes(gotBody, "model").String(); model != "grok-4.5" {
-		t.Fatalf("probe model = %q, want grok-4.5; body=%s", model, string(gotBody))
-	}
-	if input := gjson.GetBytes(gotBody, "input.0.content.0.text").String(); input != "Reply with OK." {
-		t.Fatalf("probe input text = %q, want minimal conversation; body=%s", input, string(gotBody))
-	}
-}
-
 func captureXAIResponsesRequest(t *testing.T, auth *cliproxyauth.Auth, payload []byte, sourceFormat sdktranslator.Format, stream bool) (string, []byte) {
 	t.Helper()
 	var gotBaseURL string
@@ -133,18 +87,18 @@ func captureXAIResponsesRequest(t *testing.T, auth *cliproxyauth.Auth, payload [
 	return gotBaseURL, gotBody
 }
 
-func TestXAIExecutorExecuteInjectsNativeWebSearchOnlyForCLIChatProxy(t *testing.T) {
+func TestXAIExecutorExecuteDoesNotInjectOrRewriteWebSearch(t *testing.T) {
 	tests := []struct {
 		name            string
 		auth            *cliproxyauth.Auth
-		envBaseURL      string
 		payload         []byte
 		wantBaseURL     string
 		wantNativeTools int
+		wantNamedTools  int
 		wantLookup      bool
 	}{
 		{
-			name: "OAuth default injects native web search",
+			name: "OAuth default does not inject native web search",
 			auth: &cliproxyauth.Auth{
 				Provider: "xai",
 				Attributes: map[string]string{
@@ -155,28 +109,11 @@ func TestXAIExecutorExecuteInjectsNativeWebSearchOnlyForCLIChatProxy(t *testing.
 			},
 			payload:         []byte(`{"model":"grok-4.5","input":[{"role":"user","content":"hello"}],"tools":[{"type":"function","name":"lookup","parameters":{"type":"object"}}]}`),
 			wantBaseURL:     xaiauth.CLIChatProxyBaseURL,
-			wantNativeTools: 1,
+			wantNativeTools: 0,
 			wantLookup:      true,
 		},
 		{
-			name: "environment override takes priority over credential base url",
-			auth: &cliproxyauth.Auth{
-				Provider: "xai",
-				Attributes: map[string]string{
-					"auth_kind":     "oauth",
-					"base_url":      "https://credential-proxy.example.test/xai/v1",
-					xaiUsingAPIAttr: "true",
-				},
-				Metadata: map[string]any{"access_token": "xai-token"},
-			},
-			envBaseURL:      "https://proxy.example.test/xai/v1",
-			payload:         []byte(`{"model":"grok-4.5","input":[{"role":"user","content":"hello"}],"tools":[{"type":"function","name":"lookup","parameters":{"type":"object"}}]}`),
-			wantBaseURL:     "https://proxy.example.test/xai/v1",
-			wantNativeTools: 1,
-			wantLookup:      true,
-		},
-		{
-			name: "existing native web search is not duplicated",
+			name: "existing native web search is preserved",
 			auth: &cliproxyauth.Auth{
 				Provider: "xai",
 				Attributes: map[string]string{
@@ -191,7 +128,7 @@ func TestXAIExecutorExecuteInjectsNativeWebSearchOnlyForCLIChatProxy(t *testing.
 			wantLookup:      true,
 		},
 		{
-			name: "duplicate and named web search tools are removed",
+			name: "duplicate and named web search tools are preserved",
 			auth: &cliproxyauth.Auth{
 				Provider: "xai",
 				Attributes: map[string]string{
@@ -202,7 +139,8 @@ func TestXAIExecutorExecuteInjectsNativeWebSearchOnlyForCLIChatProxy(t *testing.
 			},
 			payload:         []byte(`{"model":"grok-4.5","input":[{"role":"user","content":"hello"}],"tools":[{"type":"web_search"},{"type":"web_search"},{"type":"function","name":"web_search","parameters":{"type":"object"}},{"type":"custom","name":"web_search"},{"type":"function","name":"lookup","parameters":{"type":"object"}}]}`),
 			wantBaseURL:     xaiauth.CLIChatProxyBaseURL,
-			wantNativeTools: 1,
+			wantNativeTools: 2,
+			wantNamedTools:  2,
 			wantLookup:      true,
 		},
 		{
@@ -254,7 +192,6 @@ func TestXAIExecutorExecuteInjectsNativeWebSearchOnlyForCLIChatProxy(t *testing.
 
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
-			t.Setenv(xaiauth.CLIChatProxyBaseURLEnv, tt.envBaseURL)
 			gotBaseURL, gotBody := captureXAIResponsesRequest(t, tt.auth, tt.payload, sdktranslator.FormatOpenAIResponse, false)
 			if gotBaseURL != tt.wantBaseURL {
 				t.Fatalf("base URL = %q, want %q", gotBaseURL, tt.wantBaseURL)
@@ -278,8 +215,8 @@ func TestXAIExecutorExecuteInjectsNativeWebSearchOnlyForCLIChatProxy(t *testing.
 			if nativeTools != tt.wantNativeTools {
 				t.Fatalf("native web_search tools = %d, want %d; body=%s", nativeTools, tt.wantNativeTools, gotBody)
 			}
-			if tt.wantNativeTools > 0 && namedWebSearchTools != 0 {
-				t.Fatalf("named web_search tools = %d, want 0; body=%s", namedWebSearchTools, gotBody)
+			if namedWebSearchTools != tt.wantNamedTools {
+				t.Fatalf("named web_search tools = %d, want %d; body=%s", namedWebSearchTools, tt.wantNamedTools, gotBody)
 			}
 			if gotLookup := lookupTools == 1; gotLookup != tt.wantLookup {
 				t.Fatalf("lookup tool present = %v, want %v; body=%s", gotLookup, tt.wantLookup, gotBody)
@@ -401,27 +338,31 @@ func TestCountXAIInputTokensExcludesRequestStructure(t *testing.T) {
 	}
 }
 
-func TestXAIExecutorExecuteRemovesConflictingWebSearchToolChoices(t *testing.T) {
+func TestXAIExecutorExecutePreservesSupportedClientWebSearchToolChoices(t *testing.T) {
 	tests := []struct {
 		name              string
 		payload           []byte
 		wantChoice        bool
 		wantChoiceType    string
+		wantChoiceName    string
 		wantNativeChoices int
 		wantNamedChoices  int
 		wantLookupChoices int
 	}{
 		{
-			name:       "direct named choice is removed",
-			payload:    []byte(`{"model":"grok-4.5","input":[{"role":"user","content":"hello"}],"tools":[{"type":"function","name":"web_search","parameters":{"type":"object"}}],"tool_choice":{"type":"function","name":"web_search"}}`),
-			wantChoice: false,
+			name:           "direct named choice is preserved",
+			payload:        []byte(`{"model":"grok-4.5","input":[{"role":"user","content":"hello"}],"tools":[{"type":"function","name":"web_search","parameters":{"type":"object"}}],"tool_choice":{"type":"function","name":"web_search"}}`),
+			wantChoice:     true,
+			wantChoiceType: "function",
+			wantChoiceName: "web_search",
 		},
 		{
-			name:              "allowed choices remove named conflicts and duplicate native choices",
+			name:              "allowed choices retain matching function choices",
 			payload:           []byte(`{"model":"grok-4.5","input":[{"role":"user","content":"hello"}],"tools":[{"type":"function","name":"web_search","parameters":{"type":"object"}},{"type":"function","name":"lookup","parameters":{"type":"object"}}],"tool_choice":{"type":"allowed_tools","tools":[{"type":"function","name":"web_search"},{"type":"custom","name":"WEB_SEARCH"},{"type":"web_search"},{"type":"web_search"},{"type":"function","name":"lookup"}]}}`),
 			wantChoice:        true,
 			wantChoiceType:    "allowed_tools",
-			wantNativeChoices: 1,
+			wantNativeChoices: 0,
+			wantNamedChoices:  1,
 			wantLookupChoices: 1,
 		},
 	}
@@ -447,6 +388,9 @@ func TestXAIExecutorExecuteRemovesConflictingWebSearchToolChoices(t *testing.T) 
 			}
 			if gotType := choice.Get("type").String(); gotType != tt.wantChoiceType {
 				t.Fatalf("tool_choice.type = %q, want %q; body=%s", gotType, tt.wantChoiceType, gotBody)
+			}
+			if gotName := choice.Get("name").String(); gotName != tt.wantChoiceName {
+				t.Fatalf("tool_choice.name = %q, want %q; body=%s", gotName, tt.wantChoiceName, gotBody)
 			}
 			nativeChoices := 0
 			namedChoices := 0
@@ -476,7 +420,7 @@ func TestXAIExecutorExecuteRemovesConflictingWebSearchToolChoices(t *testing.T) 
 	}
 }
 
-func TestXAIExecutorExecuteStreamInjectsNativeWebSearchForCLIChatProxy(t *testing.T) {
+func TestXAIExecutorExecuteStreamDoesNotInjectNativeWebSearchForCLIChatProxy(t *testing.T) {
 	auth := &cliproxyauth.Auth{
 		Provider: "xai",
 		Attributes: map[string]string{
@@ -494,8 +438,8 @@ func TestXAIExecutorExecuteStreamInjectsNativeWebSearchForCLIChatProxy(t *testin
 		}
 		return true
 	})
-	if nativeTools != 1 {
-		t.Fatalf("native web_search tools = %d, want 1; body=%s", nativeTools, gotBody)
+	if nativeTools != 0 {
+		t.Fatalf("native web_search tools = %d, want 0; body=%s", nativeTools, gotBody)
 	}
 }
 
@@ -2328,8 +2272,8 @@ func TestXAIExecutorCompactOAuthUsesOfficialAPIHeadersNotCLIProxy(t *testing.T) 
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		gotPath = r.URL.Path
 		gotHost = r.Host
-		gotTokenAuth = r.Header.Get(xaiauth.CLITokenAuthHeader)
-		gotClientVersion = r.Header.Get(xaiauth.CLIClientVersionHeader)
+		gotTokenAuth = r.Header.Get(xaiTokenAuthHeader)
+		gotClientVersion = r.Header.Get(xaiClientVersionHeader)
 		gotUserAgent = r.Header.Get("User-Agent")
 		w.Header().Set("Content-Type", "application/json")
 		_, _ = w.Write([]byte(`{"id":"resp_1","object":"response.compaction","output":[{"type":"compaction","encrypted_content":"opaque-out"}],"usage":{"input_tokens":1,"output_tokens":2,"total_tokens":3}}`))
@@ -2370,10 +2314,10 @@ func TestXAIExecutorCompactOAuthUsesOfficialAPIHeadersNotCLIProxy(t *testing.T) 
 		t.Fatalf("host = %q, want %q", gotHost, wantHost)
 	}
 	if gotTokenAuth != "" {
-		t.Fatalf("%s = %q, want empty on compact (not CLI proxy)", xaiauth.CLITokenAuthHeader, gotTokenAuth)
+		t.Fatalf("%s = %q, want empty on compact (not CLI proxy)", xaiTokenAuthHeader, gotTokenAuth)
 	}
 	if gotClientVersion != "" {
-		t.Fatalf("%s = %q, want empty on compact", xaiauth.CLIClientVersionHeader, gotClientVersion)
+		t.Fatalf("%s = %q, want empty on compact", xaiClientVersionHeader, gotClientVersion)
 	}
 	if strings.Contains(gotUserAgent, "xai-grok-workspace/") {
 		t.Fatalf("User-Agent = %q, want no CLI workspace UA on compact", gotUserAgent)
@@ -2987,8 +2931,8 @@ func TestXAIExecutorExecuteImagesUsesImagesEndpointAndPublishesUsage(t *testing.
 		gotPath = r.URL.Path
 		gotAuth = r.Header.Get("Authorization")
 		gotAccept = r.Header.Get("Accept")
-		gotTokenAuth = r.Header.Get(xaiauth.CLITokenAuthHeader)
-		gotClientVersion = r.Header.Get(xaiauth.CLIClientVersionHeader)
+		gotTokenAuth = r.Header.Get(xaiTokenAuthHeader)
+		gotClientVersion = r.Header.Get(xaiClientVersionHeader)
 		var errRead error
 		gotBody, errRead = io.ReadAll(r.Body)
 		if errRead != nil {
@@ -3037,10 +2981,10 @@ func TestXAIExecutorExecuteImagesUsesImagesEndpointAndPublishesUsage(t *testing.
 		t.Fatalf("Accept = %q, want application/json", gotAccept)
 	}
 	if gotTokenAuth != "" {
-		t.Fatalf("%s = %q, want empty on media path", xaiauth.CLITokenAuthHeader, gotTokenAuth)
+		t.Fatalf("%s = %q, want empty on media path", xaiTokenAuthHeader, gotTokenAuth)
 	}
 	if gotClientVersion != "" {
-		t.Fatalf("%s = %q, want empty on media path", xaiauth.CLIClientVersionHeader, gotClientVersion)
+		t.Fatalf("%s = %q, want empty on media path", xaiClientVersionHeader, gotClientVersion)
 	}
 	if string(gotBody) != `{"model":"grok-imagine-image-quality","prompt":"draw"}` {
 		t.Fatalf("body = %s", string(gotBody))
@@ -5190,10 +5134,9 @@ func TestXAIChatBaseURL(t *testing.T) {
 
 func TestXAICompactBaseURL(t *testing.T) {
 	tests := []struct {
-		name       string
-		auth       *cliproxyauth.Auth
-		envBaseURL string
-		want       string
+		name string
+		auth *cliproxyauth.Auth
+		want string
 	}{
 		{
 			name: "empty base url defaults to official api",
@@ -5250,16 +5193,6 @@ func TestXAICompactBaseURL(t *testing.T) {
 			want: xaiauth.DefaultAPIBaseURL,
 		},
 		{
-			name: "configured CLI chat proxy is rewritten to official api for compact",
-			auth: &cliproxyauth.Auth{
-				Attributes: map[string]string{
-					"base_url": "https://configured-cli-proxy.example/v1",
-				},
-			},
-			envBaseURL: "https://configured-cli-proxy.example/v1",
-			want:       xaiauth.DefaultAPIBaseURL,
-		},
-		{
 			name: "custom gateway is honored for compact",
 			auth: &cliproxyauth.Auth{
 				Attributes: map[string]string{
@@ -5273,7 +5206,6 @@ func TestXAICompactBaseURL(t *testing.T) {
 
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
-			t.Setenv(xaiauth.CLIChatProxyBaseURLEnv, tt.envBaseURL)
 			got := xaiCompactBaseURL(tt.auth)
 			if got != tt.want {
 				t.Fatalf("xaiCompactBaseURL() = %q, want %q", got, tt.want)
@@ -5301,13 +5233,13 @@ func TestApplyXAIChatHeaders(t *testing.T) {
 		if got := req.Header.Get("x-grok-conv-id"); got != "conv-1" {
 			t.Fatalf("x-grok-conv-id = %q, want conv-1", got)
 		}
-		if got := req.Header.Get(xaiauth.CLITokenAuthHeader); got != "" {
-			t.Fatalf("%s = %q, want empty for official API", xaiauth.CLITokenAuthHeader, got)
+		if got := req.Header.Get(xaiTokenAuthHeader); got != "" {
+			t.Fatalf("%s = %q, want empty for official API", xaiTokenAuthHeader, got)
 		}
-		if got := req.Header.Get(xaiauth.CLIClientVersionHeader); got != "" {
-			t.Fatalf("%s = %q, want empty for official API", xaiauth.CLIClientVersionHeader, got)
+		if got := req.Header.Get(xaiClientVersionHeader); got != "" {
+			t.Fatalf("%s = %q, want empty for official API", xaiClientVersionHeader, got)
 		}
-		for _, header := range []string{xaiauth.CLIClientIdentifierHeader, xaiauth.CLIAuthenticateResponseHeader} {
+		for _, header := range []string{xaiClientIdentifierHeader, xaiAuthenticateResponseHeader} {
 			if got := req.Header.Get(header); got != "" {
 				t.Fatalf("%s = %q, want empty for official API", header, got)
 			}
@@ -5333,45 +5265,20 @@ func TestApplyXAIChatHeaders(t *testing.T) {
 		if got := req.Header.Get("x-grok-conv-id"); got != "conv-1" {
 			t.Fatalf("x-grok-conv-id = %q, want conv-1", got)
 		}
-		if got := req.Header.Get(xaiauth.CLITokenAuthHeader); got != xaiauth.CLITokenAuthValue {
-			t.Fatalf("%s = %q, want %q", xaiauth.CLITokenAuthHeader, got, xaiauth.CLITokenAuthValue)
+		if got := req.Header.Get(xaiTokenAuthHeader); got != xaiTokenAuthValue {
+			t.Fatalf("%s = %q, want %q", xaiTokenAuthHeader, got, xaiTokenAuthValue)
 		}
-		if got := req.Header.Get(xaiauth.CLIClientVersionHeader); got != xaiauth.CLIClientVersion {
-			t.Fatalf("%s = %q, want %q", xaiauth.CLIClientVersionHeader, got, xaiauth.CLIClientVersion)
+		if got := req.Header.Get(xaiClientVersionHeader); got != xaiClientVersionValue {
+			t.Fatalf("%s = %q, want %q", xaiClientVersionHeader, got, xaiClientVersionValue)
 		}
-		if got := req.Header.Get(xaiauth.CLIClientIdentifierHeader); got != xaiauth.CLIClientIdentifier {
-			t.Fatalf("%s = %q, want %q", xaiauth.CLIClientIdentifierHeader, got, xaiauth.CLIClientIdentifier)
+		if got := req.Header.Get(xaiClientIdentifierHeader); got != xaiClientIdentifierValue {
+			t.Fatalf("%s = %q, want %q", xaiClientIdentifierHeader, got, xaiClientIdentifierValue)
 		}
-		if got := req.Header.Get(xaiauth.CLIAuthenticateResponseHeader); got != xaiauth.CLIAuthenticateResponse {
-			t.Fatalf("%s = %q, want %q", xaiauth.CLIAuthenticateResponseHeader, got, xaiauth.CLIAuthenticateResponse)
+		if got := req.Header.Get(xaiAuthenticateResponseHeader); got != xaiAuthenticateResponseValue {
+			t.Fatalf("%s = %q, want %q", xaiAuthenticateResponseHeader, got, xaiAuthenticateResponseValue)
 		}
-		if got := req.Header.Get("User-Agent"); got != "xai-grok-workspace/"+xaiauth.CLIClientVersion {
-			t.Fatalf("User-Agent = %q, want xai-grok-workspace/%s", got, xaiauth.CLIClientVersion)
-		}
-	})
-
-	t.Run("environment override uses cli headers despite credential using_api", func(t *testing.T) {
-		t.Setenv(xaiauth.CLIChatProxyBaseURLEnv, "https://configured-cli-proxy.example/v1")
-		req := httptest.NewRequest(http.MethodPost, "https://configured-cli-proxy.example/v1/responses", nil)
-		auth := &cliproxyauth.Auth{
-			Attributes: map[string]string{
-				"base_url":      "https://credential-proxy.example/v1",
-				xaiUsingAPIAttr: "true",
-			},
-		}
-		applyXAIChatHeaders(req, auth, "xai-token", true, "")
-
-		if got := req.Header.Get(xaiauth.CLITokenAuthHeader); got != xaiauth.CLITokenAuthValue {
-			t.Fatalf("%s = %q, want %q", xaiauth.CLITokenAuthHeader, got, xaiauth.CLITokenAuthValue)
-		}
-		if got := req.Header.Get(xaiauth.CLIClientVersionHeader); got != xaiauth.CLIClientVersion {
-			t.Fatalf("%s = %q, want %q", xaiauth.CLIClientVersionHeader, got, xaiauth.CLIClientVersion)
-		}
-		if got := req.Header.Get(xaiauth.CLIClientIdentifierHeader); got != xaiauth.CLIClientIdentifier {
-			t.Fatalf("%s = %q, want %q", xaiauth.CLIClientIdentifierHeader, got, xaiauth.CLIClientIdentifier)
-		}
-		if got := req.Header.Get(xaiauth.CLIAuthenticateResponseHeader); got != xaiauth.CLIAuthenticateResponse {
-			t.Fatalf("%s = %q, want %q", xaiauth.CLIAuthenticateResponseHeader, got, xaiauth.CLIAuthenticateResponse)
+		if got := req.Header.Get("User-Agent"); got != "xai-grok-workspace/"+xaiClientVersionValue {
+			t.Fatalf("User-Agent = %q, want xai-grok-workspace/%s", got, xaiClientVersionValue)
 		}
 	})
 
@@ -5385,13 +5292,13 @@ func TestApplyXAIChatHeaders(t *testing.T) {
 		}
 		applyXAIChatHeaders(req, auth, "xai-token", false, "")
 
-		if got := req.Header.Get(xaiauth.CLITokenAuthHeader); got != "" {
-			t.Fatalf("%s = %q, want empty for custom gateway", xaiauth.CLITokenAuthHeader, got)
+		if got := req.Header.Get(xaiTokenAuthHeader); got != "" {
+			t.Fatalf("%s = %q, want empty for custom gateway", xaiTokenAuthHeader, got)
 		}
-		if got := req.Header.Get(xaiauth.CLIClientVersionHeader); got != "" {
-			t.Fatalf("%s = %q, want empty for custom gateway", xaiauth.CLIClientVersionHeader, got)
+		if got := req.Header.Get(xaiClientVersionHeader); got != "" {
+			t.Fatalf("%s = %q, want empty for custom gateway", xaiClientVersionHeader, got)
 		}
-		for _, header := range []string{xaiauth.CLIClientIdentifierHeader, xaiauth.CLIAuthenticateResponseHeader} {
+		for _, header := range []string{xaiClientIdentifierHeader, xaiAuthenticateResponseHeader} {
 			if got := req.Header.Get(header); got != "" {
 				t.Fatalf("%s = %q, want empty for custom gateway", header, got)
 			}
@@ -5405,27 +5312,27 @@ func TestApplyXAIChatHeaders(t *testing.T) {
 		req := httptest.NewRequest(http.MethodPost, xaiauth.CLIChatProxyBaseURL+"/responses", nil)
 		auth := &cliproxyauth.Auth{
 			Attributes: map[string]string{
-				"base_url":                                        xaiauth.CLIChatProxyBaseURL,
-				xaiUsingAPIAttr:                                   "false",
-				"header:" + xaiauth.CLITokenAuthHeader:            "custom-token-auth",
-				"header:" + xaiauth.CLIClientVersionHeader:        "custom-client-version",
-				"header:" + xaiauth.CLIClientIdentifierHeader:     "custom-client-identifier",
-				"header:" + xaiauth.CLIAuthenticateResponseHeader: "custom-authenticate-response",
+				"base_url":                                xaiauth.CLIChatProxyBaseURL,
+				xaiUsingAPIAttr:                           "false",
+				"header:" + xaiTokenAuthHeader:            "custom-token-auth",
+				"header:" + xaiClientVersionHeader:        "custom-client-version",
+				"header:" + xaiClientIdentifierHeader:     "custom-client-identifier",
+				"header:" + xaiAuthenticateResponseHeader: "custom-authenticate-response",
 			},
 		}
 		applyXAIChatHeaders(req, auth, "xai-token", true, "")
 
-		if got := req.Header.Get(xaiauth.CLITokenAuthHeader); got != "custom-token-auth" {
-			t.Fatalf("%s = %q, want custom-token-auth", xaiauth.CLITokenAuthHeader, got)
+		if got := req.Header.Get(xaiTokenAuthHeader); got != "custom-token-auth" {
+			t.Fatalf("%s = %q, want custom-token-auth", xaiTokenAuthHeader, got)
 		}
-		if got := req.Header.Get(xaiauth.CLIClientVersionHeader); got != "custom-client-version" {
-			t.Fatalf("%s = %q, want custom-client-version", xaiauth.CLIClientVersionHeader, got)
+		if got := req.Header.Get(xaiClientVersionHeader); got != "custom-client-version" {
+			t.Fatalf("%s = %q, want custom-client-version", xaiClientVersionHeader, got)
 		}
-		if got := req.Header.Get(xaiauth.CLIClientIdentifierHeader); got != "custom-client-identifier" {
-			t.Fatalf("%s = %q, want custom-client-identifier", xaiauth.CLIClientIdentifierHeader, got)
+		if got := req.Header.Get(xaiClientIdentifierHeader); got != "custom-client-identifier" {
+			t.Fatalf("%s = %q, want custom-client-identifier", xaiClientIdentifierHeader, got)
 		}
-		if got := req.Header.Get(xaiauth.CLIAuthenticateResponseHeader); got != "custom-authenticate-response" {
-			t.Fatalf("%s = %q, want custom-authenticate-response", xaiauth.CLIAuthenticateResponseHeader, got)
+		if got := req.Header.Get(xaiAuthenticateResponseHeader); got != "custom-authenticate-response" {
+			t.Fatalf("%s = %q, want custom-authenticate-response", xaiAuthenticateResponseHeader, got)
 		}
 	})
 
@@ -5439,11 +5346,11 @@ func TestApplyXAIChatHeaders(t *testing.T) {
 		}
 		applyXAIChatHeaders(req, auth, "xai-token", true, "")
 
-		if got := req.Header.Get(xaiauth.CLITokenAuthHeader); got != xaiauth.CLITokenAuthValue {
-			t.Fatalf("%s = %q, want %q", xaiauth.CLITokenAuthHeader, got, xaiauth.CLITokenAuthValue)
+		if got := req.Header.Get(xaiTokenAuthHeader); got != xaiTokenAuthValue {
+			t.Fatalf("%s = %q, want %q", xaiTokenAuthHeader, got, xaiTokenAuthValue)
 		}
-		if got := req.Header.Get(xaiauth.CLIClientVersionHeader); got != xaiauth.CLIClientVersion {
-			t.Fatalf("%s = %q, want %q", xaiauth.CLIClientVersionHeader, got, xaiauth.CLIClientVersion)
+		if got := req.Header.Get(xaiClientVersionHeader); got != xaiClientVersionValue {
+			t.Fatalf("%s = %q, want %q", xaiClientVersionHeader, got, xaiClientVersionValue)
 		}
 	})
 }
@@ -5452,8 +5359,8 @@ func TestXAIExecutorExecuteChatUsesProxyHeadersOnlyForChatProxy(t *testing.T) {
 	var gotTokenAuth string
 	var gotClientVersion string
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		gotTokenAuth = r.Header.Get(xaiauth.CLITokenAuthHeader)
-		gotClientVersion = r.Header.Get(xaiauth.CLIClientVersionHeader)
+		gotTokenAuth = r.Header.Get(xaiTokenAuthHeader)
+		gotClientVersion = r.Header.Get(xaiClientVersionHeader)
 		w.Header().Set("Content-Type", "text/event-stream")
 		_, _ = w.Write([]byte("data: {\"type\":\"response.completed\",\"response\":{\"id\":\"resp_1\",\"object\":\"response\",\"created_at\":0,\"status\":\"completed\",\"model\":\"grok-4.3\",\"output\":[{\"type\":\"message\",\"role\":\"assistant\",\"content\":[{\"type\":\"output_text\",\"text\":\"ok\"}]}],\"usage\":{\"input_tokens\":1,\"output_tokens\":1,\"total_tokens\":2}}}\n\n"))
 	}))
@@ -5479,10 +5386,10 @@ func TestXAIExecutorExecuteChatUsesProxyHeadersOnlyForChatProxy(t *testing.T) {
 		t.Fatalf("Execute() error = %v", err)
 	}
 	if gotTokenAuth != "" {
-		t.Fatalf("%s = %q, want empty for custom chat gateway", xaiauth.CLITokenAuthHeader, gotTokenAuth)
+		t.Fatalf("%s = %q, want empty for custom chat gateway", xaiTokenAuthHeader, gotTokenAuth)
 	}
 	if gotClientVersion != "" {
-		t.Fatalf("%s = %q, want empty for custom chat gateway", xaiauth.CLIClientVersionHeader, gotClientVersion)
+		t.Fatalf("%s = %q, want empty for custom chat gateway", xaiClientVersionHeader, gotClientVersion)
 	}
 }
 

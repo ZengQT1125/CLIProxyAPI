@@ -24,38 +24,6 @@ type XAIAuth struct {
 
 var xaiRefreshGroup singleflight.Group
 
-type oauthTokenError struct {
-	status      int
-	code        string
-	description string
-	body        string
-}
-
-func (e *oauthTokenError) Error() string {
-	if e == nil {
-		return ""
-	}
-	detail := strings.TrimSpace(e.body)
-	if detail == "" {
-		detail = strings.TrimSpace(e.description)
-	}
-	return fmt.Sprintf("xai token request failed with status %d: %s", e.status, detail)
-}
-
-func (e *oauthTokenError) StatusCode() int {
-	if e == nil {
-		return 0
-	}
-	return e.status
-}
-
-func (e *oauthTokenError) OAuthErrorCode() string {
-	if e == nil {
-		return ""
-	}
-	return e.code
-}
-
 // NewXAIAuth creates an xAI OAuth helper using config proxy settings.
 func NewXAIAuth(cfg *config.Config) *XAIAuth {
 	return NewXAIAuthWithProxyURL(cfg, "")
@@ -423,17 +391,7 @@ func (a *XAIAuth) postTokenForm(ctx context.Context, tokenEndpoint string, form 
 		return nil, fmt.Errorf("xai token response: read body: %w", err)
 	}
 	if resp.StatusCode != http.StatusOK {
-		var payload struct {
-			Error            string `json:"error"`
-			ErrorDescription string `json:"error_description"`
-		}
-		_ = json.Unmarshal(body, &payload)
-		return nil, &oauthTokenError{
-			status:      resp.StatusCode,
-			code:        strings.TrimSpace(payload.Error),
-			description: strings.TrimSpace(payload.ErrorDescription),
-			body:        strings.TrimSpace(string(body)),
-		}
+		return nil, fmt.Errorf("xai token request failed with status %d: %s", resp.StatusCode, strings.TrimSpace(string(body)))
 	}
 	var payload struct {
 		AccessToken  string `json:"access_token"`

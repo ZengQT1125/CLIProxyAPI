@@ -207,31 +207,21 @@ func xaiUsingAPI(auth *cliproxyauth.Auth) bool {
 			}
 		}
 	}
-	return !xaiIsOAuthAuth(auth)
-}
-
-func xaiIsOAuthAuth(auth *cliproxyauth.Auth) bool {
-	if auth == nil {
-		return false
-	}
 	if raw := strings.TrimSpace(auth.Attributes["auth_kind"]); raw != "" {
-		return strings.EqualFold(raw, "oauth")
+		return !strings.EqualFold(raw, "oauth")
 	}
-	return strings.EqualFold(xaiMetadataString(auth.Metadata, "auth_kind"), "oauth")
+	return !strings.EqualFold(xaiMetadataString(auth.Metadata, "auth_kind"), "oauth")
 }
 
 // xaiChatBaseURL returns the base URL for non-image/video xAI HTTP chat requests.
-// An environment override has highest priority. Otherwise, when auth using_api
-// is true, the official API base URL logic is used. When it is false (including
-// its OAuth default), empty or official default base_url is rewritten to the CLI
-// chat-proxy endpoint; an explicit non-default base_url is still honored.
+// When auth using_api is true, the official API base URL logic is used. When it
+// is false (including its OAuth default), empty or official default base_url is
+// rewritten to the CLI chat-proxy endpoint; an explicit non-default base_url is
+// still honored.
 // Websocket and compact transports intentionally do not use this helper:
 // cli-chat-proxy only accepts HTTP POST chat and does not implement
 // /responses/compact (404) or websocket upgrades (405).
 func xaiChatBaseURL(auth *cliproxyauth.Auth) string {
-	if baseURLOverride := xaiauth.CLIChatProxyBaseURLOverride(); baseURLOverride != "" {
-		return baseURLOverride
-	}
 	_, baseURL := xaiCreds(auth)
 	if xaiUsingAPI(auth) {
 		if baseURL == "" {
@@ -266,9 +256,7 @@ func xaiIsDefaultAPIBaseURL(baseURL string) bool {
 }
 
 func xaiIsCLIChatProxyBaseURL(baseURL string) bool {
-	normalized := xaiNormalizeBaseURL(baseURL)
-	return normalized == xaiNormalizeBaseURL(xaiauth.CLIChatProxyBaseURLFromEnv()) ||
-		normalized == xaiNormalizeBaseURL(xaiauth.CLIChatProxyBaseURL)
+	return xaiNormalizeBaseURL(baseURL) == xaiNormalizeBaseURL(xaiauth.CLIChatProxyBaseURL)
 }
 
 // xaiBaseURLSource classifies a resolved xAI base URL for logging.
@@ -318,19 +306,23 @@ func applyXAICustomHeaders(r *http.Request, auth *cliproxyauth.Auth) {
 }
 
 // applyXAIChatHeaders applies standard xAI headers for non-image/video chat
-// requests. CLI chat-proxy identity headers are selected from the resolved URL,
-// so the environment override remains authoritative over credential settings.
+// requests. When using_api is true, this matches the standard
+// applyXAIHeaders behavior. CLI chat-proxy identity headers are only attached
+// when using_api is false and the resolved chat base URL is the official CLI
+// chat-proxy endpoint.
 func applyXAIChatHeaders(r *http.Request, auth *cliproxyauth.Auth, token string, stream bool, sessionID string) {
-	if !xaiIsCLIChatProxyBaseURL(xaiChatBaseURL(auth)) {
+	if xaiUsingAPI(auth) {
 		applyXAIHeaders(r, auth, token, stream, sessionID)
 		return
 	}
 	applyXAIDefaultHeaders(r, token, stream, sessionID)
-	r.Header.Set(xaiauth.CLITokenAuthHeader, xaiauth.CLITokenAuthValue)
-	r.Header.Set(xaiauth.CLIClientVersionHeader, xaiauth.CLIClientVersion)
-	r.Header.Set("User-Agent", xaiauth.CLIUserAgent)
-	r.Header.Set(xaiauth.CLIClientIdentifierHeader, xaiauth.CLIClientIdentifier)
-	r.Header.Set(xaiauth.CLIAuthenticateResponseHeader, xaiauth.CLIAuthenticateResponse)
+	if xaiIsCLIChatProxyBaseURL(xaiChatBaseURL(auth)) {
+		r.Header.Set(xaiTokenAuthHeader, xaiTokenAuthValue)
+		r.Header.Set(xaiClientVersionHeader, xaiClientVersionValue)
+		r.Header.Set("User-Agent", "xai-grok-workspace/"+xaiClientVersionValue)
+		r.Header.Set(xaiClientIdentifierHeader, xaiClientIdentifierValue)
+		r.Header.Set(xaiAuthenticateResponseHeader, xaiAuthenticateResponseValue)
+	}
 	applyXAICustomHeaders(r, auth)
 }
 
@@ -372,127 +364,6 @@ func xaiExecutionSessionID(req cliproxyexecutor.Request, opts cliproxyexecutor.O
 		}
 	}
 	return helps.DerivedSessionUUID("xai", opts.Metadata, req.Metadata)
-}
-
-func ensureXAIChatProxyWebSearch(auth *cliproxyauth.Auth, baseURL string, body []byte) []byte {
-	if !xaiIsOAuthAuth(auth) || !xaiIsCLIChatProxyBaseURL(baseURL) || !gjson.ValidBytes(body) {
-		return body
-	}
-
-	tools := gjson.GetBytes(body, "tools")
-	if tools.Exists() && !tools.IsArray() {
-		return body
-	}
-	toolItems := tools.Array()
-	keptTools := make([]string, 0, len(toolItems)+1)
-	hasNativeWebSearch := false
-	changed := false
-	for _, tool := range toolItems {
-		toolType := tool.Get("type").String()
-		if toolType == xaiWebSearchToolType {
-			if hasNativeWebSearch {
-				changed = true
-				continue
-			}
-			hasNativeWebSearch = true
-			keptTools = append(keptTools, tool.Raw)
-			continue
-		}
-		if xaiIsNamedWebSearchTool(tool) {
-			changed = true
-			continue
-		}
-		keptTools = append(keptTools, tool.Raw)
-	}
-
-	updatedTools := []byte(`[]`)
-	if !hasNativeWebSearch {
-		changed = true
-		updatedTools = []byte(`[{"type":"web_search"}]`)
-	}
-	if !changed {
-		return normalizeXAIChatProxyWebSearchToolChoice(body)
-	}
-	for _, tool := range keptTools {
-		var errSet error
-		updatedTools, errSet = sjson.SetRawBytes(updatedTools, "-1", []byte(tool))
-		if errSet != nil {
-			return body
-		}
-	}
-	updated, errSet := sjson.SetRawBytes(body, "tools", updatedTools)
-	if errSet != nil {
-		return body
-	}
-	return normalizeXAIChatProxyWebSearchToolChoice(updated)
-}
-
-func normalizeXAIChatProxyWebSearchToolChoice(body []byte) []byte {
-	choice := gjson.GetBytes(body, "tool_choice")
-	if !choice.Exists() {
-		return body
-	}
-	if xaiIsNamedWebSearchTool(choice) {
-		updated, errDelete := sjson.DeleteBytes(body, "tool_choice")
-		if errDelete != nil {
-			return body
-		}
-		return updated
-	}
-	if choice.Get("type").String() != "allowed_tools" {
-		return body
-	}
-
-	allowedTools := choice.Get("tools")
-	if !allowedTools.Exists() || !allowedTools.IsArray() {
-		return body
-	}
-	keptTools := make([]string, 0, len(allowedTools.Array()))
-	hasNativeWebSearch := false
-	changed := false
-	for _, tool := range allowedTools.Array() {
-		if tool.Get("type").String() == xaiWebSearchToolType {
-			if hasNativeWebSearch {
-				changed = true
-				continue
-			}
-			hasNativeWebSearch = true
-			keptTools = append(keptTools, tool.Raw)
-			continue
-		}
-		if xaiIsNamedWebSearchTool(tool) {
-			changed = true
-			continue
-		}
-		keptTools = append(keptTools, tool.Raw)
-	}
-	if !hasNativeWebSearch {
-		changed = true
-		keptTools = append(keptTools, `{"type":"web_search"}`)
-	}
-	if !changed {
-		return body
-	}
-
-	updatedTools := []byte(`[]`)
-	for _, tool := range keptTools {
-		var errSet error
-		updatedTools, errSet = sjson.SetRawBytes(updatedTools, "-1", []byte(tool))
-		if errSet != nil {
-			return body
-		}
-	}
-	updated, errSet := sjson.SetRawBytes(body, "tool_choice.tools", updatedTools)
-	if errSet != nil {
-		return body
-	}
-	return updated
-}
-
-func xaiIsNamedWebSearchTool(tool gjson.Result) bool {
-	toolType := tool.Get("type").String()
-	return (toolType == xaiFunctionToolType || toolType == xaiCustomToolType) &&
-		strings.EqualFold(strings.TrimSpace(tool.Get("name").String()), xaiWebSearchToolType)
 }
 
 func xaiRequiresIsolatedConversation(model string) bool {

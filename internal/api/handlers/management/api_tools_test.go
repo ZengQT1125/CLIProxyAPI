@@ -21,12 +21,103 @@ import (
 	"time"
 
 	"github.com/gin-gonic/gin"
-	xaiauth "github.com/router-for-me/CLIProxyAPI/v7/internal/auth/xai"
 	"github.com/router-for-me/CLIProxyAPI/v7/internal/config"
 	runtimeexecutor "github.com/router-for-me/CLIProxyAPI/v7/internal/runtime/executor"
 	coreauth "github.com/router-for-me/CLIProxyAPI/v7/sdk/cliproxy/auth"
 	sdkconfig "github.com/router-for-me/CLIProxyAPI/v7/sdk/config"
 )
+
+func TestAPICallUsesRequestProxyURL(t *testing.T) {
+	t.Parallel()
+
+	proxyServer := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		w.WriteHeader(http.StatusCreated)
+		_, _ = w.Write([]byte("proxied"))
+	}))
+	defer proxyServer.Close()
+
+	h := &Handler{
+		cfg: &config.Config{
+			SDKConfig: sdkconfig.SDKConfig{ProxyURL: "http://127.0.0.1:1"},
+		},
+	}
+	router := gin.New()
+	router.POST("/", h.APICall)
+
+	body := `{"method":"GET","url":"http://upstream.invalid/test","proxy_url":"` + proxyServer.URL + `"}`
+	recorder := httptest.NewRecorder()
+	req := httptest.NewRequest(http.MethodPost, "/", strings.NewReader(body))
+	req.Header.Set("Content-Type", "application/json")
+	router.ServeHTTP(recorder, req)
+
+	if recorder.Code != http.StatusOK {
+		t.Fatalf("status code = %d, want %d; body = %s", recorder.Code, http.StatusOK, recorder.Body.String())
+	}
+
+	var response apiCallResponse
+	if errDecode := json.NewDecoder(recorder.Body).Decode(&response); errDecode != nil {
+		t.Fatalf("decode response: %v", errDecode)
+	}
+	if response.StatusCode != http.StatusCreated {
+		t.Fatalf("upstream status code = %d, want %d", response.StatusCode, http.StatusCreated)
+	}
+	if response.Body != "proxied" {
+		t.Fatalf("upstream body = %q, want %q", response.Body, "proxied")
+	}
+}
+
+func TestAPICallUsesRequestProxyURLWithProviderAuthentication(t *testing.T) {
+	t.Parallel()
+
+	proxyServer := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if got := r.Header.Get("Authorization"); got != "Bearer request-token" {
+			t.Errorf("Authorization = %q, want %q", got, "Bearer request-token")
+		}
+		w.WriteHeader(http.StatusCreated)
+		_, _ = w.Write([]byte("authenticated proxy"))
+	}))
+	defer proxyServer.Close()
+
+	cfg := &config.Config{SDKConfig: sdkconfig.SDKConfig{ProxyURL: "http://127.0.0.1:1"}}
+	manager := coreauth.NewManager(nil, nil, nil)
+	manager.RegisterExecutor(runtimeexecutor.NewCodexExecutor(cfg))
+	auth := &coreauth.Auth{
+		ID:       "request-proxy-auth",
+		Index:    "request-proxy-index",
+		Provider: "codex",
+		Status:   coreauth.StatusActive,
+		ProxyURL: "http://127.0.0.1:2",
+		Metadata: map[string]any{"access_token": "request-token"},
+	}
+	if _, errRegister := manager.Register(context.Background(), auth); errRegister != nil {
+		t.Fatalf("register auth: %v", errRegister)
+	}
+
+	h := NewHandlerWithoutConfigFilePath(cfg, manager)
+	router := gin.New()
+	router.POST("/", h.APICall)
+
+	body := `{"auth_index":"request-proxy-index","method":"GET","url":"http://upstream.invalid/test","proxy_url":"` + proxyServer.URL + `"}`
+	recorder := httptest.NewRecorder()
+	req := httptest.NewRequest(http.MethodPost, "/", strings.NewReader(body))
+	req.Header.Set("Content-Type", "application/json")
+	router.ServeHTTP(recorder, req)
+
+	if recorder.Code != http.StatusOK {
+		t.Fatalf("status code = %d, want %d; body = %s", recorder.Code, http.StatusOK, recorder.Body.String())
+	}
+
+	var response apiCallResponse
+	if errDecode := json.NewDecoder(recorder.Body).Decode(&response); errDecode != nil {
+		t.Fatalf("decode response: %v", errDecode)
+	}
+	if response.StatusCode != http.StatusCreated {
+		t.Fatalf("upstream status code = %d, want %d", response.StatusCode, http.StatusCreated)
+	}
+	if response.Body != "authenticated proxy" {
+		t.Fatalf("upstream body = %q, want %q", response.Body, "authenticated proxy")
+	}
+}
 
 func TestAPICallTransportDirectBypassesGlobalProxy(t *testing.T) {
 	t.Parallel()
@@ -37,7 +128,7 @@ func TestAPICallTransportDirectBypassesGlobalProxy(t *testing.T) {
 		},
 	}
 
-	transport := h.apiCallTransport(&coreauth.Auth{ProxyURL: "direct"})
+	transport := h.apiCallTransport(&coreauth.Auth{ProxyURL: "direct"}, "")
 	httpTransport, ok := transport.(*http.Transport)
 	if !ok {
 		t.Fatalf("transport type = %T, want *http.Transport", transport)
@@ -553,422 +644,30 @@ func TestCleanupCodexAuthVerifiesCredentialsConcurrently(t *testing.T) {
 	}
 }
 
-func TestCleanupXAIAuthDeletesUnauthorizedOnly(t *testing.T) {
-	cases := []struct {
-		name       string
-		statusCode int
-		wantDelete bool
-	}{
-		{name: "unauthorized", statusCode: http.StatusUnauthorized, wantDelete: true},
-		{name: "forbidden", statusCode: http.StatusForbidden, wantDelete: false},
-		{name: "quota_exhausted", statusCode: http.StatusTooManyRequests, wantDelete: false},
-		{name: "server_error", statusCode: http.StatusInternalServerError, wantDelete: false},
-	}
+func TestCleanupAuthRejectsUnsupportedProvider(t *testing.T) {
+	h := NewHandlerWithoutConfigFilePath(&config.Config{AuthDir: t.TempDir()}, coreauth.NewManager(nil, nil, nil))
 
-	for _, tc := range cases {
-		t.Run(tc.name, func(t *testing.T) {
-			authDir := t.TempDir()
-			fileName := "xai-" + tc.name + ".json"
-			filePath := filepath.Join(authDir, fileName)
-			if err := os.WriteFile(filePath, []byte(`{"type":"xai"}`), 0o600); err != nil {
-				t.Fatalf("write auth file: %v", err)
-			}
-
-			var verifyRequests atomic.Int32
-			verifyServer := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-				verifyRequests.Add(1)
-				if got := r.Method; got != http.MethodGet {
-					t.Errorf("verify method = %q, want GET", got)
-				}
-				if got := r.URL.Path; got != "/v1/billing" {
-					t.Errorf("verify path = %q, want /v1/billing", got)
-				}
-				if got := r.Header.Get("Authorization"); got != "Bearer xai-token" {
-					t.Errorf("authorization header = %q, want Bearer xai-token", got)
-				}
-				if got := r.Header.Get("X-XAI-Token-Auth"); got != "xai-grok-cli" {
-					t.Errorf("X-XAI-Token-Auth = %q, want xai-grok-cli", got)
-				}
-				if got := r.Header.Get("x-grok-client-version"); got == "" {
-					t.Error("x-grok-client-version is empty")
-				}
-				if got := r.Header.Get("X-Cleanup-Test"); got != "custom" {
-					t.Errorf("custom header = %q, want custom", got)
-				}
-				w.WriteHeader(tc.statusCode)
-				_, _ = w.Write([]byte(`{}`))
-			}))
-			defer verifyServer.Close()
-
-			manager := coreauth.NewManager(nil, nil, nil)
-			auth := &coreauth.Auth{
-				ID:       "cleanup-xai-" + tc.name,
-				FileName: fileName,
-				Provider: "xai",
-				Status:   coreauth.StatusActive,
-				Attributes: map[string]string{
-					"path":                  filePath,
-					"base_url":              verifyServer.URL + "/v1",
-					"header:X-Cleanup-Test": "custom",
-				},
-				Metadata: map[string]any{
-					"access_token": "xai-token",
-				},
-			}
-			if _, err := manager.Register(context.Background(), auth); err != nil {
-				t.Fatalf("register auth: %v", err)
-			}
-
-			h := NewHandlerWithoutConfigFilePath(&config.Config{AuthDir: authDir}, manager)
-			h.tokenStore = &memoryAuthStore{}
-
+	for _, provider := range []string{"qwen", "xai"} {
+		t.Run(provider, func(t *testing.T) {
 			gin.SetMode(gin.TestMode)
 			recorder := httptest.NewRecorder()
 			c, _ := gin.CreateTestContext(recorder)
 			c.Request = httptest.NewRequest(
 				http.MethodPost,
 				"/v0/management/custom/codex-cleanup",
-				strings.NewReader(`{"provider":"xai"}`),
+				strings.NewReader(`{"provider":"`+provider+`"}`),
 			)
 			c.Request.Header.Set("Content-Type", "application/json")
 
 			h.CleanupCodexAuth(c)
 
-			if recorder.Code != http.StatusOK {
-				t.Fatalf("cleanup status = %d, want %d; body=%s", recorder.Code, http.StatusOK, recorder.Body.String())
+			if recorder.Code != http.StatusBadRequest {
+				t.Fatalf("cleanup status = %d, want %d; body=%s", recorder.Code, http.StatusBadRequest, recorder.Body.String())
 			}
-			if got := verifyRequests.Load(); got != 1 {
-				t.Fatalf("verify requests = %d, want 1", got)
-			}
-			_, statErr := os.Stat(filePath)
-			_, stillRegistered := manager.GetByID(auth.ID)
-			if tc.wantDelete {
-				if !os.IsNotExist(statErr) {
-					t.Fatalf("expected 401 auth file to be removed, stat err: %v", statErr)
-				}
-				if stillRegistered {
-					t.Fatalf("expected runtime auth %q to be removed", auth.ID)
-				}
-				return
-			}
-			if statErr != nil {
-				t.Fatalf("expected non-401 auth file to remain, stat err: %v", statErr)
-			}
-			if !stillRegistered {
-				t.Fatalf("expected runtime auth %q to remain", auth.ID)
+			if !strings.Contains(recorder.Body.String(), "unsupported cleanup provider: "+provider) {
+				t.Fatalf("expected unsupported provider message, body=%s", recorder.Body.String())
 			}
 		})
-	}
-}
-
-func TestCleanupXAIAuthUsesConfiguredCLIBillingBaseURL(t *testing.T) {
-	t.Setenv(xaiauth.CLIChatProxyBaseURLEnv, "https://configured-cli-proxy.example/v1")
-	authDir := t.TempDir()
-	fileName := "xai-default-base.json"
-	filePath := filepath.Join(authDir, fileName)
-	if err := os.WriteFile(filePath, []byte(`{"type":"xai"}`), 0o600); err != nil {
-		t.Fatalf("write auth file: %v", err)
-	}
-
-	var verifyRequests atomic.Int32
-	verifyServer := httptest.NewTLSServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		verifyRequests.Add(1)
-		if got := r.Host; got != "configured-cli-proxy.example" {
-			t.Errorf("verify host = %q, want configured-cli-proxy.example", got)
-		}
-		if got := r.URL.Path; got != "/v1/billing" {
-			t.Errorf("verify path = %q, want /v1/billing", got)
-		}
-		w.WriteHeader(http.StatusOK)
-		_, _ = w.Write([]byte(`{}`))
-	}))
-	defer verifyServer.Close()
-
-	oldTransport := http.DefaultTransport
-	http.DefaultTransport = &http.Transport{
-		DialContext: func(ctx context.Context, network, _ string) (net.Conn, error) {
-			var dialer net.Dialer
-			return dialer.DialContext(ctx, network, verifyServer.Listener.Addr().String())
-		},
-		TLSClientConfig: &tls.Config{InsecureSkipVerify: true},
-	}
-	t.Cleanup(func() {
-		http.DefaultTransport = oldTransport
-	})
-
-	manager := coreauth.NewManager(nil, nil, nil)
-	auth := &coreauth.Auth{
-		ID:       "cleanup-xai-default-base",
-		FileName: fileName,
-		Provider: "xai",
-		Status:   coreauth.StatusActive,
-		Attributes: map[string]string{
-			"path":      filePath,
-			"base_url":  "https://credential-cli-proxy.example/v1",
-			"auth_kind": "oauth",
-		},
-		Metadata: map[string]any{
-			"access_token": "xai-token",
-		},
-	}
-	if _, err := manager.Register(context.Background(), auth); err != nil {
-		t.Fatalf("register auth: %v", err)
-	}
-
-	h := NewHandlerWithoutConfigFilePath(&config.Config{AuthDir: authDir}, manager)
-	h.tokenStore = &memoryAuthStore{}
-
-	gin.SetMode(gin.TestMode)
-	recorder := httptest.NewRecorder()
-	c, _ := gin.CreateTestContext(recorder)
-	c.Request = httptest.NewRequest(http.MethodPost, "/v0/management/custom/codex-cleanup?provider=xai", nil)
-
-	h.CleanupCodexAuth(c)
-
-	if recorder.Code != http.StatusOK {
-		t.Fatalf("cleanup status = %d, want %d; body=%s", recorder.Code, http.StatusOK, recorder.Body.String())
-	}
-	if got := verifyRequests.Load(); got != 1 {
-		t.Fatalf("verify requests = %d, want 1", got)
-	}
-	if _, err := os.Stat(filePath); err != nil {
-		t.Fatalf("expected successful xai auth file to remain, stat err: %v", err)
-	}
-	if _, ok := manager.GetByID(auth.ID); !ok {
-		t.Fatalf("expected successful xai runtime auth to remain")
-	}
-}
-
-func TestCleanupXAIAuthSkipsConfigAPIKeys(t *testing.T) {
-	authDir := t.TempDir()
-	sentinelPath := filepath.Join(authDir, "sentinel")
-	if err := os.WriteFile(sentinelPath, []byte("keep"), 0o600); err != nil {
-		t.Fatalf("write sentinel: %v", err)
-	}
-
-	var verifyRequests atomic.Int32
-	verifyServer := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
-		verifyRequests.Add(1)
-		w.WriteHeader(http.StatusUnauthorized)
-	}))
-	defer verifyServer.Close()
-
-	manager := coreauth.NewManager(nil, nil, nil)
-	auth := &coreauth.Auth{
-		ID:       "xai-config-api-key",
-		Provider: "xai",
-		Status:   coreauth.StatusActive,
-		Attributes: map[string]string{
-			"source":    "config:xai[test]",
-			"api_key":   "xai-api-key",
-			"auth_kind": "apikey",
-			"base_url":  verifyServer.URL + "/v1",
-		},
-	}
-	if _, err := manager.Register(context.Background(), auth); err != nil {
-		t.Fatalf("register auth: %v", err)
-	}
-
-	h := NewHandlerWithoutConfigFilePath(&config.Config{AuthDir: authDir}, manager)
-	h.tokenStore = &memoryAuthStore{}
-
-	gin.SetMode(gin.TestMode)
-	recorder := httptest.NewRecorder()
-	c, _ := gin.CreateTestContext(recorder)
-	c.Request = httptest.NewRequest(http.MethodPost, "/v0/management/custom/codex-cleanup?provider=xai", nil)
-
-	h.CleanupCodexAuth(c)
-
-	if recorder.Code != http.StatusOK {
-		t.Fatalf("cleanup status = %d, want %d; body=%s", recorder.Code, http.StatusOK, recorder.Body.String())
-	}
-	if got := verifyRequests.Load(); got != 0 {
-		t.Fatalf("verify requests = %d, want 0 for config API key", got)
-	}
-	if _, err := os.Stat(sentinelPath); err != nil {
-		t.Fatalf("expected auth directory contents to remain, stat err: %v", err)
-	}
-	if _, ok := manager.GetByID(auth.ID); !ok {
-		t.Fatalf("expected config xai API key to remain registered")
-	}
-}
-
-func TestCleanupXAIAuthSkipsFileBackedAPIKeys(t *testing.T) {
-	authDir := t.TempDir()
-	fileName := "xai-api-key.json"
-	filePath := filepath.Join(authDir, fileName)
-	if err := os.WriteFile(filePath, []byte(`{"type":"xai","auth_kind":"apikey"}`), 0o600); err != nil {
-		t.Fatalf("write auth file: %v", err)
-	}
-
-	var verifyRequests atomic.Int32
-	verifyServer := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
-		verifyRequests.Add(1)
-		w.WriteHeader(http.StatusUnauthorized)
-	}))
-	defer verifyServer.Close()
-
-	manager := coreauth.NewManager(nil, nil, nil)
-	auth := &coreauth.Auth{
-		ID:       "xai-file-api-key",
-		FileName: fileName,
-		Provider: "xai",
-		Status:   coreauth.StatusActive,
-		Attributes: map[string]string{
-			"path":      filePath,
-			"api_key":   "xai-api-key",
-			"auth_kind": "apikey",
-			"base_url":  verifyServer.URL + "/v1",
-		},
-	}
-	if _, err := manager.Register(context.Background(), auth); err != nil {
-		t.Fatalf("register auth: %v", err)
-	}
-
-	h := NewHandlerWithoutConfigFilePath(&config.Config{AuthDir: authDir}, manager)
-	h.tokenStore = &memoryAuthStore{}
-
-	gin.SetMode(gin.TestMode)
-	recorder := httptest.NewRecorder()
-	c, _ := gin.CreateTestContext(recorder)
-	c.Request = httptest.NewRequest(http.MethodPost, "/v0/management/custom/codex-cleanup?provider=xai", nil)
-
-	h.CleanupCodexAuth(c)
-
-	if recorder.Code != http.StatusOK {
-		t.Fatalf("cleanup status = %d, want %d; body=%s", recorder.Code, http.StatusOK, recorder.Body.String())
-	}
-	if got := verifyRequests.Load(); got != 0 {
-		t.Fatalf("verify requests = %d, want 0 for file-backed API key", got)
-	}
-	if _, err := os.Stat(filePath); err != nil {
-		t.Fatalf("expected xai API key file to remain, stat err: %v", err)
-	}
-	if _, ok := manager.GetByID(auth.ID); !ok {
-		t.Fatalf("expected file-backed xai API key to remain registered")
-	}
-}
-
-func TestCleanupXAIAuthDoesNotDeleteReplacementCredential(t *testing.T) {
-	authDir := t.TempDir()
-	oldFileName := "xai-old.json"
-	oldFilePath := filepath.Join(authDir, oldFileName)
-	if err := os.WriteFile(oldFilePath, []byte(`{"type":"xai","auth_kind":"oauth"}`), 0o600); err != nil {
-		t.Fatalf("write old auth file: %v", err)
-	}
-	newFileName := "xai-new.json"
-	newFilePath := filepath.Join(authDir, newFileName)
-	if err := os.WriteFile(newFilePath, []byte(`{"type":"xai","auth_kind":"oauth"}`), 0o600); err != nil {
-		t.Fatalf("write replacement auth file: %v", err)
-	}
-
-	verifyStarted := make(chan struct{})
-	releaseVerify := make(chan struct{})
-	verifyServer := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
-		close(verifyStarted)
-		<-releaseVerify
-		w.WriteHeader(http.StatusUnauthorized)
-	}))
-	defer verifyServer.Close()
-
-	manager := coreauth.NewManager(nil, nil, nil)
-	original := &coreauth.Auth{
-		ID:       "xai-replaced-during-cleanup",
-		FileName: oldFileName,
-		Provider: "xai",
-		Status:   coreauth.StatusActive,
-		Attributes: map[string]string{
-			"path":      oldFilePath,
-			"base_url":  verifyServer.URL + "/v1",
-			"auth_kind": "oauth",
-		},
-		Metadata: map[string]any{"access_token": "old-token"},
-	}
-	if _, err := manager.Register(context.Background(), original); err != nil {
-		t.Fatalf("register original auth: %v", err)
-	}
-
-	h := NewHandlerWithoutConfigFilePath(&config.Config{AuthDir: authDir}, manager)
-	h.tokenStore = &memoryAuthStore{}
-
-	gin.SetMode(gin.TestMode)
-	recorder := httptest.NewRecorder()
-	c, _ := gin.CreateTestContext(recorder)
-	c.Request = httptest.NewRequest(http.MethodPost, "/v0/management/custom/codex-cleanup?provider=xai", nil)
-
-	done := make(chan struct{})
-	go func() {
-		defer close(done)
-		h.CleanupCodexAuth(c)
-	}()
-
-	select {
-	case <-verifyStarted:
-	case <-time.After(5 * time.Second):
-		t.Fatal("timed out waiting for xai billing verification")
-	}
-
-	replacement := &coreauth.Auth{
-		ID:       original.ID,
-		FileName: newFileName,
-		Provider: "xai",
-		Status:   coreauth.StatusActive,
-		Attributes: map[string]string{
-			"path":      newFilePath,
-			"base_url":  verifyServer.URL + "/v1",
-			"auth_kind": "oauth",
-		},
-		Metadata: map[string]any{"access_token": "new-token"},
-	}
-	if _, err := manager.Register(coreauth.WithSkipPersist(context.Background()), replacement); err != nil {
-		t.Fatalf("register replacement auth: %v", err)
-	}
-	close(releaseVerify)
-
-	select {
-	case <-done:
-	case <-time.After(5 * time.Second):
-		t.Fatal("timed out waiting for cleanup to finish")
-	}
-
-	if recorder.Code != http.StatusOK {
-		t.Fatalf("cleanup status = %d, want %d; body=%s", recorder.Code, http.StatusOK, recorder.Body.String())
-	}
-	if _, err := os.Stat(oldFilePath); err != nil {
-		t.Fatalf("expected stale auth file to remain after replacement, stat err: %v", err)
-	}
-	if _, err := os.Stat(newFilePath); err != nil {
-		t.Fatalf("expected replacement auth file to remain, stat err: %v", err)
-	}
-	current, ok := manager.GetByID(original.ID)
-	if !ok {
-		t.Fatalf("expected replacement auth to remain registered")
-	}
-	if got := current.Metadata["access_token"]; got != "new-token" {
-		t.Fatalf("replacement access token = %#v, want new-token", got)
-	}
-}
-
-func TestCleanupAuthRejectsUnsupportedProvider(t *testing.T) {
-	h := NewHandlerWithoutConfigFilePath(&config.Config{AuthDir: t.TempDir()}, coreauth.NewManager(nil, nil, nil))
-
-	gin.SetMode(gin.TestMode)
-	recorder := httptest.NewRecorder()
-	c, _ := gin.CreateTestContext(recorder)
-	c.Request = httptest.NewRequest(
-		http.MethodPost,
-		"/v0/management/custom/codex-cleanup",
-		strings.NewReader(`{"provider":"qwen"}`),
-	)
-	c.Request.Header.Set("Content-Type", "application/json")
-
-	h.CleanupCodexAuth(c)
-
-	if recorder.Code != http.StatusBadRequest {
-		t.Fatalf("cleanup status = %d, want %d; body=%s", recorder.Code, http.StatusBadRequest, recorder.Body.String())
-	}
-	if !strings.Contains(recorder.Body.String(), "unsupported cleanup provider: qwen") {
-		t.Fatalf("expected unsupported provider message, body=%s", recorder.Body.String())
 	}
 }
 
@@ -981,7 +680,7 @@ func TestAPICallTransportInvalidAuthFallsBackToGlobalProxy(t *testing.T) {
 		},
 	}
 
-	transport := h.apiCallTransport(&coreauth.Auth{ProxyURL: "bad-value"})
+	transport := h.apiCallTransport(&coreauth.Auth{ProxyURL: "bad-value"}, "")
 	httpTransport, ok := transport.(*http.Transport)
 	if !ok {
 		t.Fatalf("transport type = %T, want *http.Transport", transport)
@@ -998,6 +697,56 @@ func TestAPICallTransportInvalidAuthFallsBackToGlobalProxy(t *testing.T) {
 	}
 	if proxyURL == nil || proxyURL.String() != "http://global-proxy.example.com:8080" {
 		t.Fatalf("proxy URL = %v, want http://global-proxy.example.com:8080", proxyURL)
+	}
+}
+
+func TestAPICallTransportRequestProxyOverridesCredentialAndGlobalProxy(t *testing.T) {
+	t.Parallel()
+
+	h := &Handler{
+		cfg: &config.Config{
+			SDKConfig: sdkconfig.SDKConfig{ProxyURL: "http://global-proxy.example.com:8080"},
+		},
+	}
+	auth := &coreauth.Auth{ProxyURL: "http://credential-proxy.example.com:8080"}
+
+	transport := h.apiCallTransport(auth, " http://request-proxy.example.com:8080 ")
+	httpTransport, ok := transport.(*http.Transport)
+	if !ok {
+		t.Fatalf("transport type = %T, want *http.Transport", transport)
+	}
+
+	req, errRequest := http.NewRequest(http.MethodGet, "https://example.com", nil)
+	if errRequest != nil {
+		t.Fatalf("http.NewRequest returned error: %v", errRequest)
+	}
+
+	proxyURL, errProxy := httpTransport.Proxy(req)
+	if errProxy != nil {
+		t.Fatalf("httpTransport.Proxy returned error: %v", errProxy)
+	}
+	if proxyURL == nil || proxyURL.String() != "http://request-proxy.example.com:8080" {
+		t.Fatalf("proxy URL = %v, want http://request-proxy.example.com:8080", proxyURL)
+	}
+}
+
+func TestAPICallTransportInvalidRequestProxyDoesNotFallBack(t *testing.T) {
+	t.Parallel()
+
+	h := &Handler{
+		cfg: &config.Config{
+			SDKConfig: sdkconfig.SDKConfig{ProxyURL: "http://global-proxy.example.com:8080"},
+		},
+	}
+	auth := &coreauth.Auth{ProxyURL: "http://credential-proxy.example.com:8080"}
+
+	transport := h.apiCallTransport(auth, "bad-value")
+	httpTransport, ok := transport.(*http.Transport)
+	if !ok {
+		t.Fatalf("transport type = %T, want *http.Transport", transport)
+	}
+	if httpTransport.Proxy != nil {
+		t.Fatal("expected invalid request proxy to avoid lower-priority proxy settings")
 	}
 }
 
@@ -1090,7 +839,7 @@ func TestAPICallTransportAPIKeyAuthFallsBackToConfigProxyURL(t *testing.T) {
 		t.Run(tc.name, func(t *testing.T) {
 			t.Parallel()
 
-			transport := h.apiCallTransport(tc.auth)
+			transport := h.apiCallTransport(tc.auth, "")
 			httpTransport, ok := transport.(*http.Transport)
 			if !ok {
 				t.Fatalf("transport type = %T, want *http.Transport", transport)

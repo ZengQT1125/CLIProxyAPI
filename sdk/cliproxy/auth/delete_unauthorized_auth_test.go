@@ -4,12 +4,12 @@ import (
 	"context"
 	"fmt"
 	"net/http"
+	"strings"
 	"sync"
 	"sync/atomic"
 	"testing"
 	"time"
 
-	"github.com/router-for-me/CLIProxyAPI/v7/internal/registry"
 	internalusage "github.com/router-for-me/CLIProxyAPI/v7/internal/usage"
 	cliproxyexecutor "github.com/router-for-me/CLIProxyAPI/v7/sdk/cliproxy/executor"
 	coreusage "github.com/router-for-me/CLIProxyAPI/v7/sdk/cliproxy/usage"
@@ -101,22 +101,6 @@ type oauthRefreshFailureExecutor struct {
 func (e *oauthRefreshFailureExecutor) Refresh(context.Context, *Auth) (*Auth, error) {
 	e.calls.Add(1)
 	return nil, e.err
-}
-
-type probingOAuthRefreshFailureExecutor struct {
-	*oauthRefreshFailureExecutor
-	executeErr error
-	probeErr   error
-	probeCalls atomic.Int32
-}
-
-func (e *probingOAuthRefreshFailureExecutor) Execute(context.Context, *Auth, cliproxyexecutor.Request, cliproxyexecutor.Options) (cliproxyexecutor.Response, error) {
-	return cliproxyexecutor.Response{}, e.executeErr
-}
-
-func (e *probingOAuthRefreshFailureExecutor) ProbeCredential(context.Context, *Auth) error {
-	e.probeCalls.Add(1)
-	return e.probeErr
 }
 
 func registerExpiredRefreshAuth(t *testing.T, manager *Manager, id, provider string) {
@@ -254,46 +238,46 @@ func TestManagerMarkResultDeletesUsageForUnauthorizedAuth(t *testing.T) {
 	}
 }
 
-func TestManagerMarkResultDeletesXAIPermissionDeniedWithoutConversationProbe(t *testing.T) {
+func TestManagerMarkResultKeepsXAICredentialFailures(t *testing.T) {
 	SetDeleteUnauthorizedAuth(true)
 	t.Cleanup(func() { SetDeleteUnauthorizedAuth(false) })
 
-	store := &deleteTrackingStore{}
-	manager := NewManager(store, nil, nil)
-	executor := &probingOAuthRefreshFailureExecutor{
-		oauthRefreshFailureExecutor: &oauthRefreshFailureExecutor{
-			schedulerProviderTestExecutor: schedulerProviderTestExecutor{provider: "xai"},
-		},
-	}
-	manager.RegisterExecutor(executor)
-	auth := &Auth{
-		ID:       "xai-permission-denied",
-		Provider: "xai",
-		Metadata: map[string]any{"type": "xai"},
-	}
-	if _, errRegister := manager.Register(WithSkipPersist(context.Background()), auth); errRegister != nil {
-		t.Fatalf("register auth: %v", errRegister)
-	}
+	for _, tc := range []struct {
+		name       string
+		statusCode int
+		message    string
+	}{
+		{name: "permission denied", statusCode: http.StatusForbidden, message: `{"code":"permission-denied","error":"Access denied."}`},
+		{name: "unauthorized", statusCode: http.StatusUnauthorized, message: "unauthorized"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			store := &deleteTrackingStore{}
+			manager := NewManager(store, nil, nil)
+			manager.RegisterExecutor(schedulerProviderTestExecutor{provider: "xai"})
+			auth := &Auth{
+				ID:       "xai-" + strings.ReplaceAll(tc.name, " ", "-"),
+				Provider: "xai",
+				Metadata: map[string]any{"type": "xai", "refresh_token": "refresh-token"},
+			}
+			if _, errRegister := manager.Register(WithSkipPersist(context.Background()), auth); errRegister != nil {
+				t.Fatalf("register auth: %v", errRegister)
+			}
 
-	manager.MarkResult(context.Background(), Result{
-		AuthID:   auth.ID,
-		Provider: "xai",
-		Model:    "grok-4.5",
-		Success:  false,
-		Error: &Error{
-			HTTPStatus: http.StatusForbidden,
-			Message:    `{"code":"permission-denied","error":"Access to the chat endpoint is denied."}`,
-		},
-	})
+			manager.MarkResult(context.Background(), Result{
+				AuthID:   auth.ID,
+				Provider: "xai",
+				Model:    "grok-4.5",
+				Success:  false,
+				Error:    &Error{HTTPStatus: tc.statusCode, Message: tc.message},
+			})
 
-	if _, ok := manager.GetByID(auth.ID); ok {
-		t.Fatal("expected permission-denied xai auth to be removed from manager")
-	}
-	if got := store.deleted(); len(got) != 1 || got[0] != auth.ID {
-		t.Fatalf("deleted auths = %v, want [%s]", got, auth.ID)
-	}
-	if got := executor.probeCalls.Load(); got != 0 {
-		t.Fatalf("conversation probe calls = %d, want 0", got)
+			if _, ok := manager.GetByID(auth.ID); !ok {
+				t.Fatal("expected xai OAuth auth to remain registered")
+			}
+			if got := store.deleted(); len(got) != 0 {
+				t.Fatalf("deleted auths = %v, want none", got)
+			}
+		})
 	}
 }
 
@@ -365,159 +349,15 @@ func TestManagerMarkResultKeepsXAIPermissionDeniedWhenDeleteDisabled(t *testing.
 	}
 }
 
-func TestManagerAutoRefreshKeepsInvalidGrantWhenConversationProbeSucceeds(t *testing.T) {
+func TestManagerAutoRefreshKeepsXAIInvalidGrantWithUpstreamLifecycle(t *testing.T) {
 	SetDeleteUnauthorizedAuth(true)
-	t.Cleanup(func() { SetDeleteUnauthorizedAuth(false) })
-
-	store := &deleteTrackingStore{}
-	manager := NewManager(store, nil, nil)
-	executor := &probingOAuthRefreshFailureExecutor{
-		oauthRefreshFailureExecutor: &oauthRefreshFailureExecutor{
-			schedulerProviderTestExecutor: schedulerProviderTestExecutor{provider: "xai"},
-			err:                           &refreshOAuthError{status: http.StatusBadRequest, code: "invalid_grant", message: "Refresh token has been revoked"},
-		},
-	}
-	manager.RegisterExecutor(executor)
-	registerExpiredRefreshAuth(t, manager, "xai-access-token-valid", "xai")
-
-	manager.StartAutoRefresh(context.Background(), time.Millisecond)
-	t.Cleanup(manager.StopAutoRefresh)
-	waitForAuthCondition(t, func() bool { return executor.probeCalls.Load() == 1 }, "credential conversation probe")
-
-	retained, ok := manager.GetByID("xai-access-token-valid")
-	if !ok || retained == nil {
-		t.Fatal("expected auth with working access token to remain registered")
-	}
-	if retained.Unavailable || retained.Status != StatusActive {
-		t.Fatalf("retained auth state = unavailable:%v status:%s, want active", retained.Unavailable, retained.Status)
-	}
-	if retained.LastError == nil || retained.LastError.Code != "invalid_grant" {
-		t.Fatalf("retained LastError = %#v, want invalid_grant refresh failure", retained.LastError)
-	}
-	if got := store.deleted(); len(got) != 0 {
-		t.Fatalf("deleted auths = %v, want none", got)
-	}
-}
-
-func TestManagerAutoRefreshDeletesInvalidGrantWhenConversationProbeIsUnauthorized(t *testing.T) {
-	SetDeleteUnauthorizedAuth(true)
-	t.Cleanup(func() { SetDeleteUnauthorizedAuth(false) })
-
-	store := &deleteTrackingStore{}
-	manager := NewManager(store, nil, nil)
-	executor := &probingOAuthRefreshFailureExecutor{
-		oauthRefreshFailureExecutor: &oauthRefreshFailureExecutor{
-			schedulerProviderTestExecutor: schedulerProviderTestExecutor{provider: "xai"},
-			err:                           &refreshOAuthError{status: http.StatusBadRequest, code: "invalid_grant", message: "Refresh token has been revoked"},
-		},
-		probeErr: &refreshOAuthError{status: http.StatusUnauthorized, message: "access token rejected"},
-	}
-	manager.RegisterExecutor(executor)
-	registerExpiredRefreshAuth(t, manager, "xai-revoked", "xai")
-
-	manager.StartAutoRefresh(context.Background(), time.Millisecond)
-	t.Cleanup(manager.StopAutoRefresh)
-	waitForAuthCondition(t, func() bool { return len(store.deleted()) == 1 }, "revoked auth deletion")
-
-	if _, ok := manager.GetByID("xai-revoked"); ok {
-		t.Fatal("expected revoked auth to be removed from manager")
-	}
-	if got := store.deleted(); len(got) != 1 || got[0] != "xai-revoked" {
-		t.Fatalf("deleted auths = %v, want [xai-revoked]", got)
-	}
-	if got := executor.probeCalls.Load(); got != 1 {
-		t.Fatalf("conversation probe calls = %d, want 1", got)
-	}
-}
-
-func TestManagerAutoRefreshKeepsInvalidGrantWhenConversationProbeIsInconclusive(t *testing.T) {
-	SetDeleteUnauthorizedAuth(true)
-	t.Cleanup(func() { SetDeleteUnauthorizedAuth(false) })
-
-	store := &deleteTrackingStore{}
-	manager := NewManager(store, nil, nil)
-	executor := &probingOAuthRefreshFailureExecutor{
-		oauthRefreshFailureExecutor: &oauthRefreshFailureExecutor{
-			schedulerProviderTestExecutor: schedulerProviderTestExecutor{provider: "xai"},
-			err:                           &refreshOAuthError{status: http.StatusBadRequest, code: "invalid_grant", message: "Refresh token has been revoked"},
-		},
-		probeErr: &refreshOAuthError{status: http.StatusServiceUnavailable, message: "temporary upstream failure"},
-	}
-	manager.RegisterExecutor(executor)
-	registerExpiredRefreshAuth(t, manager, "xai-probe-inconclusive", "xai")
-
-	manager.StartAutoRefresh(context.Background(), time.Millisecond)
-	t.Cleanup(manager.StopAutoRefresh)
-	waitForAuthCondition(t, func() bool { return executor.probeCalls.Load() == 1 }, "inconclusive credential conversation probe")
-
-	retained, ok := manager.GetByID("xai-probe-inconclusive")
-	if !ok || retained == nil {
-		t.Fatal("expected auth to remain after inconclusive probe")
-	}
-	if !retained.Unavailable || retained.Status != StatusError {
-		t.Fatalf("retained auth state = unavailable:%v status:%s, want terminal error", retained.Unavailable, retained.Status)
-	}
-	if got := store.deleted(); len(got) != 0 {
-		t.Fatalf("deleted auths = %v, want none", got)
-	}
-}
-
-func TestManagerRequestUnauthorizedDoesNotRunDuplicateConversationProbe(t *testing.T) {
-	SetDeleteUnauthorizedAuth(true)
-	t.Cleanup(func() { SetDeleteUnauthorizedAuth(false) })
-
-	store := &deleteTrackingStore{}
-	manager := NewManager(store, nil, nil)
-	executor := &probingOAuthRefreshFailureExecutor{
-		oauthRefreshFailureExecutor: &oauthRefreshFailureExecutor{
-			schedulerProviderTestExecutor: schedulerProviderTestExecutor{provider: "xai"},
-			err:                           &refreshOAuthError{status: http.StatusBadRequest, code: "invalid_grant", message: "Refresh token has been revoked"},
-		},
-		executeErr: &refreshOAuthError{status: http.StatusUnauthorized, message: "access token rejected"},
-	}
-	manager.RegisterExecutor(executor)
-	auth := &Auth{
-		ID:       "xai-request-unauthorized",
-		Provider: "xai",
-		Metadata: map[string]any{
-			"access_token":  "rejected-access-token",
-			"refresh_token": "revoked-refresh-token",
-		},
-	}
-	if _, errRegister := manager.Register(context.Background(), auth); errRegister != nil {
-		t.Fatalf("register auth: %v", errRegister)
-	}
-	registry.GetGlobalRegistry().RegisterClient(auth.ID, "xai", []*registry.ModelInfo{{ID: "grok-4.5"}})
-	t.Cleanup(func() { registry.GetGlobalRegistry().UnregisterClient(auth.ID) })
-	manager.RefreshSchedulerEntry(auth.ID)
-
-	_, errExecute := manager.Execute(context.Background(), []string{"xai"}, cliproxyexecutor.Request{
-		Model:   "grok-4.5",
-		Payload: []byte(`{"model":"grok-4.5","input":"hello"}`),
-	}, cliproxyexecutor.Options{})
-	if errExecute == nil {
-		t.Fatal("Execute() error = nil, want unauthorized")
-	}
-	if got := executor.probeCalls.Load(); got != 0 {
-		t.Fatalf("conversation probe calls = %d, want 0 after a real conversation already returned 401", got)
-	}
-	if _, ok := manager.GetByID(auth.ID); ok {
-		t.Fatal("expected unauthorized auth to be removed")
-	}
-	if got := store.deleted(); len(got) != 1 || got[0] != auth.ID {
-		t.Fatalf("deleted auths = %v, want [%s]", got, auth.ID)
-	}
-}
-
-func TestManagerAutoRefreshRetainsInvalidGrantWhenDisabled(t *testing.T) {
-	SetDeleteUnauthorizedAuth(false)
 	t.Cleanup(func() { SetDeleteUnauthorizedAuth(false) })
 
 	store := &deleteTrackingStore{}
 	manager := NewManager(store, nil, nil)
 	executor := &oauthRefreshFailureExecutor{
 		schedulerProviderTestExecutor: schedulerProviderTestExecutor{provider: "xai"},
-		err:                           &refreshOAuthError{status: http.StatusBadRequest, code: "invalid_grant", message: "Refresh token has been revoked"},
+		err:                           fmt.Errorf(`xai token request failed with status 400: {"error":"invalid_grant"}`),
 	}
 	manager.RegisterExecutor(executor)
 	registerExpiredRefreshAuth(t, manager, "xai-retained", "xai")
@@ -526,27 +366,24 @@ func TestManagerAutoRefreshRetainsInvalidGrantWhenDisabled(t *testing.T) {
 	t.Cleanup(manager.StopAutoRefresh)
 	waitForAuthCondition(t, func() bool {
 		auth, ok := manager.GetByID("xai-retained")
-		return ok && auth.LastError != nil && auth.LastError.Code == "invalid_grant"
-	}, "retained invalid_grant state")
+		return ok && auth.LastError != nil && !auth.NextRefreshAfter.IsZero()
+	}, "xai invalid_grant backoff")
 
 	retained, ok := manager.GetByID("xai-retained")
 	if !ok || retained == nil {
 		t.Fatal("expected invalid auth to remain registered")
 	}
-	if !retained.Unavailable || retained.Status != StatusError {
-		t.Fatalf("retained auth state = unavailable:%v status:%s", retained.Unavailable, retained.Status)
+	if retained.Unavailable || retained.Status == StatusError {
+		t.Fatalf("retained auth state = unavailable:%v status:%s, want upstream non-terminal backoff", retained.Unavailable, retained.Status)
 	}
-	if !retained.NextRefreshAfter.IsZero() {
-		t.Fatalf("NextRefreshAfter = %s, want zero terminal state", retained.NextRefreshAfter)
+	if retained.LastError.Code != "" || retained.LastError.HTTPStatus != 0 {
+		t.Fatalf("LastError = %#v, want unclassified upstream refresh error", retained.LastError)
+	}
+	if _, shouldSchedule := nextRefreshCheckAt(time.Now(), retained, time.Second); !shouldSchedule {
+		t.Fatal("expected xai invalid_grant to remain on the upstream refresh schedule")
 	}
 	if got := store.deleted(); len(got) != 0 {
 		t.Fatalf("deleted auths = %v, want none", got)
-	}
-
-	calls := executor.calls.Load()
-	time.Sleep(20 * time.Millisecond)
-	if got := executor.calls.Load(); got != calls {
-		t.Fatalf("refresh calls = %d after terminal failure, want %d", got, calls)
 	}
 }
 
@@ -557,11 +394,11 @@ func TestManagerAutoRefreshKeepsNonInvalidGrantBadRequest(t *testing.T) {
 	store := &deleteTrackingStore{}
 	manager := NewManager(store, nil, nil)
 	executor := &oauthRefreshFailureExecutor{
-		schedulerProviderTestExecutor: schedulerProviderTestExecutor{provider: "xai"},
+		schedulerProviderTestExecutor: schedulerProviderTestExecutor{provider: "refresh-test"},
 		err:                           &refreshOAuthError{status: http.StatusBadRequest, code: "invalid_request", message: "malformed request"},
 	}
 	manager.RegisterExecutor(executor)
-	registerExpiredRefreshAuth(t, manager, "xai-bad-request", "xai")
+	registerExpiredRefreshAuth(t, manager, "xai-bad-request", "refresh-test")
 
 	refreshStartedAt := time.Now()
 	manager.StartAutoRefresh(context.Background(), time.Millisecond)
@@ -592,11 +429,11 @@ func TestManagerAutoRefreshKeepsStructuredBadRequestContainingUnauthorizedText(t
 			store := &deleteTrackingStore{}
 			manager := NewManager(store, nil, nil)
 			executor := &oauthRefreshFailureExecutor{
-				schedulerProviderTestExecutor: schedulerProviderTestExecutor{provider: "xai"},
+				schedulerProviderTestExecutor: schedulerProviderTestExecutor{provider: "refresh-test"},
 				err:                           &refreshOAuthError{status: http.StatusBadRequest, code: "invalid_request", message: message},
 			}
 			manager.RegisterExecutor(executor)
-			registerExpiredRefreshAuth(t, manager, "xai-structured-bad-request", "xai")
+			registerExpiredRefreshAuth(t, manager, "xai-structured-bad-request", "refresh-test")
 
 			refreshStartedAt := time.Now()
 			manager.StartAutoRefresh(context.Background(), time.Millisecond)
@@ -627,11 +464,11 @@ func TestManagerAutoRefreshDeletesUnauthorizedWhenEnabled(t *testing.T) {
 	store := &deleteTrackingStore{}
 	manager := NewManager(store, nil, nil)
 	executor := &oauthRefreshFailureExecutor{
-		schedulerProviderTestExecutor: schedulerProviderTestExecutor{provider: "xai"},
+		schedulerProviderTestExecutor: schedulerProviderTestExecutor{provider: "refresh-test"},
 		err:                           &refreshOAuthError{status: http.StatusUnauthorized, message: "expired credentials"},
 	}
 	manager.RegisterExecutor(executor)
-	registerExpiredRefreshAuth(t, manager, "xai-unauthorized-delete", "xai")
+	registerExpiredRefreshAuth(t, manager, "xai-unauthorized-delete", "refresh-test")
 
 	manager.StartAutoRefresh(context.Background(), time.Millisecond)
 	t.Cleanup(manager.StopAutoRefresh)
@@ -642,8 +479,8 @@ func TestManagerAutoRefreshDeletesUnauthorizedWhenEnabled(t *testing.T) {
 	}
 }
 
-func TestManagerAutoRefreshRetainsUnauthorizedWhenDisabled(t *testing.T) {
-	SetDeleteUnauthorizedAuth(false)
+func TestManagerAutoRefreshKeepsXAIUnauthorizedWithUpstreamLifecycle(t *testing.T) {
+	SetDeleteUnauthorizedAuth(true)
 	t.Cleanup(func() { SetDeleteUnauthorizedAuth(false) })
 
 	store := &deleteTrackingStore{}
@@ -671,6 +508,35 @@ func TestManagerAutoRefreshRetainsUnauthorizedWhenDisabled(t *testing.T) {
 	}
 }
 
+func TestManagerAutoRefreshUsesUpstreamXAIUnauthorizedTextDetection(t *testing.T) {
+	SetDeleteUnauthorizedAuth(true)
+	t.Cleanup(func() { SetDeleteUnauthorizedAuth(false) })
+
+	store := &deleteTrackingStore{}
+	manager := NewManager(store, nil, nil)
+	executor := &oauthRefreshFailureExecutor{
+		schedulerProviderTestExecutor: schedulerProviderTestExecutor{provider: "xai"},
+		err:                           &refreshOAuthError{status: http.StatusBadRequest, code: "invalid_request", message: "upstream status 401"},
+	}
+	manager.RegisterExecutor(executor)
+	registerExpiredRefreshAuth(t, manager, "xai-unauthorized-text", "xai")
+
+	manager.StartAutoRefresh(context.Background(), time.Millisecond)
+	t.Cleanup(manager.StopAutoRefresh)
+	waitForAuthCondition(t, func() bool {
+		auth, ok := manager.GetByID("xai-unauthorized-text")
+		return ok && auth.Unavailable && auth.Status == StatusError
+	}, "upstream xai unauthorized text state")
+
+	retained, ok := manager.GetByID("xai-unauthorized-text")
+	if !ok || retained.StatusMessage != "unauthorized" {
+		t.Fatalf("retained auth = %#v, want upstream unauthorized state", retained)
+	}
+	if got := store.deleted(); len(got) != 0 {
+		t.Fatalf("deleted auths = %v, want none", got)
+	}
+}
+
 func TestManagerAutoRefreshDeleteDoesNotRemoveReplacementAuth(t *testing.T) {
 	SetDeleteUnauthorizedAuth(true)
 	t.Cleanup(func() { SetDeleteUnauthorizedAuth(false) })
@@ -678,11 +544,11 @@ func TestManagerAutoRefreshDeleteDoesNotRemoveReplacementAuth(t *testing.T) {
 	store := newBlockingDeleteStore()
 	manager := NewManager(store, nil, nil)
 	executor := &oauthRefreshFailureExecutor{
-		schedulerProviderTestExecutor: schedulerProviderTestExecutor{provider: "xai"},
+		schedulerProviderTestExecutor: schedulerProviderTestExecutor{provider: "refresh-test"},
 		err:                           &refreshOAuthError{status: http.StatusBadRequest, code: "invalid_grant", message: "revoked"},
 	}
 	manager.RegisterExecutor(executor)
-	registerExpiredRefreshAuth(t, manager, "xai-replaced", "xai")
+	registerExpiredRefreshAuth(t, manager, "xai-replaced", "refresh-test")
 
 	manager.StartAutoRefresh(context.Background(), time.Millisecond)
 	t.Cleanup(manager.StopAutoRefresh)
@@ -694,7 +560,7 @@ func TestManagerAutoRefreshDeleteDoesNotRemoveReplacementAuth(t *testing.T) {
 
 	replacement := &Auth{
 		ID:       "xai-replaced",
-		Provider: "xai",
+		Provider: "refresh-test",
 		Metadata: map[string]any{
 			"access_token":  "replacement-access-token",
 			"refresh_token": "replacement-refresh-token",
@@ -724,7 +590,7 @@ func TestManagerAutoRefreshDeleteDoesNotRemoveReplacementAuth(t *testing.T) {
 	if !ok || authAccessToken(persisted) != "replacement-access-token" {
 		t.Fatalf("stored auth = %#v, want replacement", persisted)
 	}
-	selected, errSelect := manager.SelectAuth(context.Background(), "xai", "", cliproxyexecutor.Options{})
+	selected, errSelect := manager.SelectAuth(context.Background(), "refresh-test", "", cliproxyexecutor.Options{})
 	if errSelect != nil || selected == nil || selected.ID != "xai-replaced" {
 		t.Fatalf("selected auth = %#v, err = %v", selected, errSelect)
 	}
@@ -736,10 +602,10 @@ func TestManagerMarkResultDeleteDoesNotRemoveReplacementAuth(t *testing.T) {
 
 	store := newBlockingDeleteStore()
 	manager := NewManager(store, nil, nil)
-	manager.RegisterExecutor(schedulerProviderTestExecutor{provider: "xai"})
+	manager.RegisterExecutor(schedulerProviderTestExecutor{provider: "refresh-test"})
 	initial := &Auth{
 		ID:       "xai-result-replaced",
-		Provider: "xai",
+		Provider: "refresh-test",
 		Metadata: map[string]any{"access_token": "initial-access-token", "refresh_token": "initial-refresh-token"},
 	}
 	if _, errRegister := manager.Register(context.Background(), initial); errRegister != nil {
@@ -749,9 +615,10 @@ func TestManagerMarkResultDeleteDoesNotRemoveReplacementAuth(t *testing.T) {
 	resultDone := make(chan struct{})
 	go func() {
 		manager.MarkResult(context.Background(), Result{
-			AuthID:  initial.ID,
-			Success: false,
-			Error:   &Error{HTTPStatus: http.StatusUnauthorized, Message: "unauthorized"},
+			AuthID:   initial.ID,
+			Provider: "refresh-test",
+			Success:  false,
+			Error:    &Error{HTTPStatus: http.StatusUnauthorized, Message: "unauthorized"},
 		})
 		close(resultDone)
 	}()
@@ -763,7 +630,7 @@ func TestManagerMarkResultDeleteDoesNotRemoveReplacementAuth(t *testing.T) {
 
 	replacement := &Auth{
 		ID:       initial.ID,
-		Provider: "xai",
+		Provider: "refresh-test",
 		Metadata: map[string]any{"access_token": "replacement-access-token", "refresh_token": "replacement-refresh-token"},
 	}
 	registered := make(chan error, 1)
@@ -791,7 +658,7 @@ func TestManagerMarkResultDeleteDoesNotRemoveReplacementAuth(t *testing.T) {
 	if !ok || authAccessToken(persisted) != "replacement-access-token" {
 		t.Fatalf("stored auth = %#v, want replacement", persisted)
 	}
-	selected, errSelect := manager.SelectAuth(context.Background(), "xai", "", cliproxyexecutor.Options{})
+	selected, errSelect := manager.SelectAuth(context.Background(), "refresh-test", "", cliproxyexecutor.Options{})
 	if errSelect != nil || selected == nil || selected.ID != initial.ID {
 		t.Fatalf("selected auth = %#v, err = %v", selected, errSelect)
 	}
