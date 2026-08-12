@@ -3,6 +3,7 @@ package helps
 import (
 	"context"
 	cryptotls "crypto/tls"
+	"errors"
 	"fmt"
 	"net"
 	"net/http"
@@ -193,13 +194,36 @@ func (t *utlsRoundTripper) removeConnIfUnusable(host string, target *http2.Clien
 	pool.cond.Broadcast()
 }
 
-func (t *utlsRoundTripper) getOrCreateConnection(host, addr string) (*http2.ClientConn, error) {
+// waitForPoolChange waits on pool.cond while still allowing request cancellation.
+// The caller must hold t.mu. context.AfterFunc broadcasts under the same lock, so
+// cancellation cannot race between checking the context and entering Cond.Wait.
+func (t *utlsRoundTripper) waitForPoolChange(ctx context.Context, pool *utlsH2HostPool) error {
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	stopBroadcast := context.AfterFunc(ctx, func() {
+		t.mu.Lock()
+		pool.cond.Broadcast()
+		t.mu.Unlock()
+	})
+	pool.cond.Wait()
+	stopBroadcast()
+	return ctx.Err()
+}
+
+func (t *utlsRoundTripper) getOrCreateConnection(ctx context.Context, host, addr string) (*http2.ClientConn, error) {
+	if ctx == nil {
+		ctx = context.Background()
+	}
 	maxConns := t.maxConns()
 
 	t.mu.Lock()
 	defer t.mu.Unlock()
 
 	for {
+		if errCtx := ctx.Err(); errCtx != nil {
+			return nil, errCtx
+		}
 		pool := t.hostPool(host)
 		if conn := t.pickReadyConn(pool); conn != nil {
 			return conn, nil
@@ -208,7 +232,7 @@ func (t *utlsRoundTripper) getOrCreateConnection(host, addr string) (*http2.Clie
 		if len(pool.conns)+pool.dialing < maxConns {
 			pool.dialing++
 			t.mu.Unlock()
-			conn, err := t.createConnection(host, addr)
+			conn, err := t.createConnection(ctx, host, addr)
 			t.mu.Lock()
 			pool.dialing--
 			if err != nil {
@@ -220,10 +244,17 @@ func (t *utlsRoundTripper) getOrCreateConnection(host, addr string) (*http2.Clie
 					return open, nil
 				}
 				if pool.dialing > 0 {
-					pool.cond.Wait()
+					if errWait := t.waitForPoolChange(ctx, pool); errWait != nil {
+						return nil, errWait
+					}
 					continue
 				}
 				return nil, err
+			}
+			if errCtx := ctx.Err(); errCtx != nil {
+				_ = conn.Close()
+				pool.cond.Broadcast()
+				return nil, errCtx
 			}
 			if !conn.ReserveNewRequest() {
 				_ = conn.Close()
@@ -241,21 +272,27 @@ func (t *utlsRoundTripper) getOrCreateConnection(host, addr string) (*http2.Clie
 			return conn, nil
 		}
 		if pool.dialing > 0 {
-			pool.cond.Wait()
+			if errWait := t.waitForPoolChange(ctx, pool); errWait != nil {
+				return nil, errWait
+			}
 			continue
 		}
 		return nil, fmt.Errorf("utls HTTP/2: no connection available for host %s", host)
 	}
 }
 
-func (t *utlsRoundTripper) createConnection(host, addr string) (*http2.ClientConn, error) {
+func (t *utlsRoundTripper) createConnection(ctx context.Context, host, addr string) (*http2.ClientConn, error) {
 	if t != nil && t.newClientConn != nil {
 		return t.newClientConn(host, addr)
 	}
 
-	conn, err := t.dialer.Dial("tcp", addr)
-	if err != nil {
-		return nil, err
+	contextDialer, ok := t.dialer.(proxy.ContextDialer)
+	if !ok {
+		return nil, fmt.Errorf("utls: dialer does not support context cancellation")
+	}
+	conn, errDial := contextDialer.DialContext(ctx, "tcp", addr)
+	if errDial != nil {
+		return nil, fmt.Errorf("utls: dial upstream: %w", errDial)
 	}
 
 	tlsConfig := &tls.Config{ServerName: host}
@@ -274,9 +311,14 @@ func (t *utlsRoundTripper) createConnection(host, addr string) (*http2.ClientCon
 		return nil, errApply
 	}
 
-	if err := tlsConn.Handshake(); err != nil {
-		conn.Close()
-		return nil, err
+	if errHandshake := tlsConn.HandshakeContext(ctx); errHandshake != nil {
+		if errors.Is(errHandshake, context.Canceled) || errors.Is(errHandshake, context.DeadlineExceeded) {
+			return nil, fmt.Errorf("utls: TLS handshake: %w", errHandshake)
+		}
+		if errClose := conn.Close(); errClose != nil {
+			return nil, fmt.Errorf("utls: TLS handshake: %w; close connection: %v", errHandshake, errClose)
+		}
+		return nil, fmt.Errorf("utls: TLS handshake: %w", errHandshake)
 	}
 	if negotiated := tlsConn.ConnectionState().NegotiatedProtocol; negotiated != "h2" {
 		if errClose := tlsConn.Close(); errClose != nil {
@@ -286,10 +328,12 @@ func (t *utlsRoundTripper) createConnection(host, addr string) (*http2.ClientCon
 	}
 
 	tr := &http2.Transport{StrictMaxConcurrentStreams: true}
-	h2Conn, err := tr.NewClientConn(tlsConn)
-	if err != nil {
-		tlsConn.Close()
-		return nil, err
+	h2Conn, errClientConn := tr.NewClientConn(tlsConn)
+	if errClientConn != nil {
+		if errClose := tlsConn.Close(); errClose != nil {
+			return nil, fmt.Errorf("utls: initialize HTTP/2 connection: %w; close TLS connection: %v", errClientConn, errClose)
+		}
+		return nil, fmt.Errorf("utls: initialize HTTP/2 connection: %w", errClientConn)
 	}
 
 	return h2Conn, nil
@@ -303,7 +347,7 @@ func (t *utlsRoundTripper) RoundTrip(req *http.Request) (*http.Response, error) 
 	}
 	addr := net.JoinHostPort(hostname, port)
 
-	h2Conn, err := t.getOrCreateConnection(hostname, addr)
+	h2Conn, err := t.getOrCreateConnection(req.Context(), hostname, addr)
 	if err != nil {
 		return nil, err
 	}
@@ -313,7 +357,13 @@ func (t *utlsRoundTripper) RoundTrip(req *http.Request) (*http.Response, error) 
 		t.removeConnIfUnusable(hostname, h2Conn)
 		return nil, err
 	}
-
+	if resp == nil {
+		t.removeConnIfUnusable(hostname, h2Conn)
+		return nil, fmt.Errorf("utls: upstream returned an empty response")
+	}
+	if resp.Body == nil {
+		resp.Body = http.NoBody
+	}
 	return resp, nil
 }
 

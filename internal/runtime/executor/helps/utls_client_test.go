@@ -33,6 +33,219 @@ func (f utlsClientRoundTripFunc) RoundTrip(req *http.Request) (*http.Response, e
 	return f(req)
 }
 
+type contextDialerFunc func(context.Context, string, string) (net.Conn, error)
+
+func (f contextDialerFunc) Dial(network, addr string) (net.Conn, error) {
+	return f(context.Background(), network, addr)
+}
+
+func (f contextDialerFunc) DialContext(ctx context.Context, network, addr string) (net.Conn, error) {
+	return f(ctx, network, addr)
+}
+
+type trackedNetConn struct {
+	net.Conn
+	closeCount atomic.Int32
+}
+
+func (c *trackedNetConn) Close() error {
+	c.closeCount.Add(1)
+	return c.Conn.Close()
+}
+
+type observedCancelContext struct {
+	done         chan struct{}
+	doneObserved chan struct{}
+	observeOnce  sync.Once
+	cancelOnce   sync.Once
+	canceled     atomic.Bool
+}
+
+func newObservedCancelContext() *observedCancelContext {
+	return &observedCancelContext{
+		done:         make(chan struct{}),
+		doneObserved: make(chan struct{}),
+	}
+}
+
+func (c *observedCancelContext) Deadline() (time.Time, bool) { return time.Time{}, false }
+
+func (c *observedCancelContext) Done() <-chan struct{} {
+	c.observeOnce.Do(func() { close(c.doneObserved) })
+	return c.done
+}
+
+func (c *observedCancelContext) Err() error {
+	if c.canceled.Load() {
+		return context.Canceled
+	}
+	return nil
+}
+
+func (c *observedCancelContext) Value(any) any { return nil }
+
+func (c *observedCancelContext) Cancel() {
+	c.cancelOnce.Do(func() {
+		c.canceled.Store(true)
+		close(c.done)
+	})
+}
+
+func TestUtlsRoundTripperDialUsesRequestContext(t *testing.T) {
+	dialStarted := make(chan struct{})
+	roundTripper := &utlsRoundTripper{
+		pools: make(map[string]*utlsH2HostPool),
+		dialer: contextDialerFunc(func(ctx context.Context, _, _ string) (net.Conn, error) {
+			close(dialStarted)
+			<-ctx.Done()
+			return nil, ctx.Err()
+		}),
+		maxConnsPerHost: 1,
+	}
+	ctx, cancel := context.WithCancel(t.Context())
+	req, errRequest := http.NewRequestWithContext(ctx, http.MethodGet, "https://chatgpt.com/backend-api/codex/responses", nil)
+	if errRequest != nil {
+		t.Fatal(errRequest)
+	}
+	roundTripDone := make(chan error, 1)
+	go func() {
+		resp, errRoundTrip := roundTripper.RoundTrip(req)
+		if resp != nil && resp.Body != nil {
+			errRoundTrip = errors.Join(errRoundTrip, resp.Body.Close())
+		}
+		roundTripDone <- errRoundTrip
+	}()
+
+	select {
+	case <-dialStarted:
+	case <-time.After(time.Second):
+		t.Fatal("dial did not start")
+	}
+	cancel()
+	select {
+	case errRoundTrip := <-roundTripDone:
+		if !errors.Is(errRoundTrip, context.Canceled) {
+			t.Fatalf("RoundTrip error = %v, want context canceled", errRoundTrip)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("RoundTrip did not stop after context cancellation")
+	}
+}
+
+func TestUtlsRoundTripperHandshakeUsesRequestContext(t *testing.T) {
+	clientConn, serverConn := net.Pipe()
+	t.Cleanup(func() {
+		if errClose := clientConn.Close(); errClose != nil && !errors.Is(errClose, net.ErrClosed) && !errors.Is(errClose, io.ErrClosedPipe) {
+			t.Errorf("close client connection: %v", errClose)
+		}
+		if errClose := serverConn.Close(); errClose != nil && !errors.Is(errClose, net.ErrClosed) && !errors.Is(errClose, io.ErrClosedPipe) {
+			t.Errorf("close server connection: %v", errClose)
+		}
+	})
+
+	trackedConn := &trackedNetConn{Conn: clientConn}
+	dialDone := make(chan struct{})
+	roundTripper := &utlsRoundTripper{dialer: contextDialerFunc(func(context.Context, string, string) (net.Conn, error) {
+		close(dialDone)
+		return trackedConn, nil
+	})}
+	ctx, cancel := context.WithCancel(t.Context())
+	connectionDone := make(chan error, 1)
+	go func() {
+		h2Conn, errConnect := roundTripper.createConnection(ctx, "chatgpt.com", "chatgpt.com:443")
+		if h2Conn != nil {
+			errConnect = errors.Join(errConnect, h2Conn.Close())
+		}
+		connectionDone <- errConnect
+	}()
+
+	select {
+	case <-dialDone:
+	case <-time.After(time.Second):
+		t.Fatal("dial did not complete")
+	}
+	cancel()
+	select {
+	case errConnect := <-connectionDone:
+		if !errors.Is(errConnect, context.Canceled) {
+			t.Fatalf("createConnection error = %v, want context canceled", errConnect)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("TLS handshake did not stop after context cancellation")
+	}
+	if got := trackedConn.closeCount.Load(); got != 1 {
+		t.Fatalf("connection close count = %d, want 1", got)
+	}
+}
+
+func TestUtlsRoundTripperWaitForDialHonorsRequestContext(t *testing.T) {
+	dialStarted := make(chan struct{})
+	releaseDial := make(chan struct{})
+	dialErr := errors.New("dial failed")
+	roundTripper := &utlsRoundTripper{
+		pools:           make(map[string]*utlsH2HostPool),
+		maxConnsPerHost: 1,
+		newClientConn: func(string, string) (*http2.ClientConn, error) {
+			close(dialStarted)
+			<-releaseDial
+			return nil, dialErr
+		},
+	}
+
+	firstDone := make(chan error, 1)
+	go func() {
+		req, errRequest := http.NewRequest(http.MethodGet, "https://chatgpt.com/backend-api/codex/responses", nil)
+		if errRequest != nil {
+			firstDone <- errRequest
+			return
+		}
+		_, errRoundTrip := roundTripper.RoundTrip(req)
+		firstDone <- errRoundTrip
+	}()
+	select {
+	case <-dialStarted:
+	case <-time.After(time.Second):
+		t.Fatal("first dial did not start")
+	}
+
+	waitCtx := newObservedCancelContext()
+	t.Cleanup(waitCtx.Cancel)
+	waitDone := make(chan error, 1)
+	go func() {
+		req, errRequest := http.NewRequestWithContext(waitCtx, http.MethodGet, "https://chatgpt.com/backend-api/codex/responses", nil)
+		if errRequest != nil {
+			waitDone <- errRequest
+			return
+		}
+		_, errRoundTrip := roundTripper.RoundTrip(req)
+		waitDone <- errRoundTrip
+	}()
+	select {
+	case <-waitCtx.doneObserved:
+	case <-time.After(time.Second):
+		t.Fatal("waiting RoundTrip did not register for cancellation")
+	}
+	waitCtx.Cancel()
+	select {
+	case errWait := <-waitDone:
+		if !errors.Is(errWait, context.Canceled) {
+			t.Fatalf("waiting RoundTrip error = %v, want context canceled", errWait)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("waiting RoundTrip did not stop after context cancellation")
+	}
+
+	close(releaseDial)
+	select {
+	case errFirst := <-firstDone:
+		if !errors.Is(errFirst, dialErr) {
+			t.Fatalf("first RoundTrip error = %v, want %v", errFirst, dialErr)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("first RoundTrip did not finish")
+	}
+}
+
 func resetUtlsH2DegradeCacheForTest(t *testing.T, now func() time.Time) {
 	t.Helper()
 

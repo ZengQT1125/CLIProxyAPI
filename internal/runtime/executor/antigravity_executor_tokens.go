@@ -99,6 +99,7 @@ func (e *AntigravityExecutor) CountTokens(ctx context.Context, auth *cliproxyaut
 		if errReq != nil {
 			return cliproxyexecutor.Response{}, errReq
 		}
+		// No httpReq.Close: keep the shared Antigravity connection pool usable.
 		httpReq.Header.Set("Content-Type", "application/json")
 		httpReq.Header.Set("Authorization", "Bearer "+token)
 		httpReq.Header.Set("User-Agent", resolveUserAgent(auth))
