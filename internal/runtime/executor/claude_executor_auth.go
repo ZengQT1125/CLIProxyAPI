@@ -117,9 +117,13 @@ func (e *ClaudeExecutor) Refresh(ctx context.Context, auth *cliproxyauth.Auth) (
 }
 
 func (e *ClaudeExecutor) claudeStatusErr(ctx context.Context, httpClient *http.Client, apiKey, baseURL string, code int, headers http.Header, body []byte) error {
-	classified := classifyClaudeUpstreamError(code, body)
+	classified := classifyClaudeUpstreamError(code, headers, body)
 	var requestScoped interface{ IsRequestScoped() bool }
 	if errors.As(classified, &requestScoped) && requestScoped.IsRequestScoped() {
+		return classified
+	}
+	var credentialScoped interface{ IsCredentialScoped() bool }
+	if errors.As(classified, &credentialScoped) && credentialScoped.IsCredentialScoped() {
 		return classified
 	}
 	now := time.Now()

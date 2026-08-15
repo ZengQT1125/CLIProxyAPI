@@ -236,7 +236,8 @@ func (e *ClaudeExecutor) ExecuteStream(ctx context.Context, auth *cliproxyauth.A
 				log.Errorf("response body close error: %v", errClose)
 			}
 			if fastRequest {
-				return nil, wrapClaudeFastRequestError(true, httpResp.StatusCode, statusErr{code: httpResp.StatusCode, msg: msg})
+				errClassified := classifyClaudeUpstreamError(httpResp.StatusCode, httpResp.Header, []byte(msg))
+				return nil, wrapClaudeFastRequestError(true, httpResp.StatusCode, errClassified)
 			}
 			return nil, e.claudeStatusErr(ctx, rawHTTPClient, apiKey, baseURL, httpResp.StatusCode, httpResp.Header, []byte(msg))
 		}
@@ -388,6 +389,11 @@ func (e *ClaudeExecutor) ExecuteStream(ctx context.Context, auth *cliproxyauth.A
 				bytes.Clone(line),
 				&param,
 			)
+			if responseFormat == sdktranslator.FormatOpenAIResponse {
+				for i, chunk := range chunks {
+					chunks[i] = helps.EnsureResponsesUsageDetails(chunk)
+				}
+			}
 			for i := range chunks {
 				select {
 				case out <- cliproxyexecutor.StreamChunk{Payload: chunks[i]}:
