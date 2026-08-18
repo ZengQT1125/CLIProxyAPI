@@ -198,6 +198,7 @@ func decoratePluginFileAuths(ctx *SynthesisContext, fullPath string, metadata ma
 		coreauth.SetOAuthModelAliasesAttribute(auth, perAccountModelAliases)
 		ApplyAuthExcludedModelsMeta(auth, ctx.Config, perAccountExcluded, "oauth")
 		coreauth.ApplyCustomHeadersFromMetadata(auth)
+		applyFingerprintProfileAttribute(auth, metadata)
 	}
 	return auths, nil
 }
@@ -291,6 +292,7 @@ func synthesizeNativeFileAuths(ctx *SynthesisContext, fullPath string, metadata 
 	coreauth.SetOAuthModelAliasesAttribute(a, perAccountModelAliases)
 	authKind := resolveFileAuthKind(metadata)
 	ApplyAuthExcludedModelsMeta(a, cfg, perAccountExcluded, authKind)
+	applyFingerprintProfileAttribute(a, metadata)
 	// Prefer the signed JWT claim, then fall back to explicit metadata for imports
 	// that do not carry an ID token.
 	if provider == "codex" {

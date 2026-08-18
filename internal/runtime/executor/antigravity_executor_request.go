@@ -211,9 +211,8 @@ func sanitizeAntigravityToolSchemaDocument(payloadStr string, useAntigravitySche
 		payloadStr = renamed
 	}
 
-	toolSchemaCleaner := util.CleanJSONSchemaForGemini
-	if useAntigravitySchema {
-		toolSchemaCleaner = util.CleanJSONSchemaForAntigravity
+	toolSchemaCleaner := func(schema string) string {
+		return util.CleanJSONSchemaForAntigravityTool(schema, useAntigravitySchema)
 	}
 	cleanNestedToolSchema := func(schemaRaw string) string {
 		return cleanNestedSchema(toolSchemaCleaner, schemaRaw)

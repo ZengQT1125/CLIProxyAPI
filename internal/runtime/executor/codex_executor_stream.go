@@ -81,7 +81,7 @@ func (e *CodexExecutor) ExecuteStream(ctx context.Context, auth *cliproxyauth.Au
 	if err != nil {
 		return nil, err
 	}
-	if err = applyCodexHeaders(httpReq, auth, apiKey, true, e.cfg); err != nil {
+	if err = applyCodexHeaders(httpReq, auth, apiKey, true, e.cfg, opts.Headers); err != nil {
 		return nil, err
 	}
 	applyModelHeaderOverrides(httpReq.Header, baseModel)
