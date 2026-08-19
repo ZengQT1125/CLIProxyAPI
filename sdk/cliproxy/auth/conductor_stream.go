@@ -127,6 +127,7 @@ func (m *Manager) wrapStreamResult(ctx context.Context, auth *Auth, provider, re
 			if chunk.Err != nil && !failed {
 				failed = true
 				rerr := resultErrorFromError(chunk.Err)
+				action, okAction := matchRequestScopedErrorAction(auth, chunk.Err, m.runtimeConfigSnapshot())
 				result := Result{
 					AuthID:     auth.ID,
 					Provider:   provider,
@@ -136,6 +137,7 @@ func (m *Manager) wrapStreamResult(ctx context.Context, auth *Auth, provider, re
 					RetryAfter: retryAfterFromError(chunk.Err),
 					Options:    opts,
 				}
+				applyRequestScopedActionToResult(action, okAction, &result)
 				m.recordExecutionResult(ctx, result, auth, ephemeralResult)
 			}
 			if !forward {
@@ -275,12 +277,24 @@ func (m *Manager) executeStreamWithModelPool(ctx context.Context, executor Provi
 		streamResult, errStream = validateStreamResult(streamResult, errStream)
 		if errStream != nil {
 			rerr := resultErrorFromError(errStream)
+			action, okAction := matchRequestScopedErrorAction(auth, errStream, m.runtimeConfigSnapshot())
 			result := Result{AuthID: auth.ID, Provider: provider, Model: resultModel, Success: false, Error: rerr, Options: execOpts}
 			result.RetryAfter = retryAfterFromError(errStream)
 			if isCredentialScopedError(errStream) {
 				result.CredentialScope = true
 			}
+			applyRequestScopedActionToResult(action, okAction, &result)
 			m.recordExecutionResult(ctx, result, auth, ephemeralResult)
+			if okAction {
+				if isRequestScopedStop(action, okAction) {
+					return nil, wrapRequestStopError(errStream)
+				}
+				lastErr = errStream
+				if result.CredentialScope {
+					return nil, errStream
+				}
+				continue
+			}
 			if isRequestInvalidError(errStream) {
 				return nil, errStream
 			}
@@ -339,6 +353,26 @@ func (m *Manager) executeStreamWithModelPool(ctx context.Context, executor Provi
 			}
 		}
 		if bootstrapErr != nil {
+			action, okAction := matchRequestScopedErrorAction(auth, bootstrapErr, m.runtimeConfigSnapshot())
+			if okAction {
+				rerr := resultErrorFromError(bootstrapErr)
+				result := Result{AuthID: auth.ID, Provider: provider, Model: resultModel, Success: false, Error: rerr, Options: execOpts}
+				result.RetryAfter = retryAfterFromError(bootstrapErr)
+				if isCredentialScopedError(bootstrapErr) {
+					result.CredentialScope = true
+				}
+				applyRequestScopedActionToResult(action, okAction, &result)
+				m.recordExecutionResult(ctx, result, auth, ephemeralResult)
+				discardStreamChunks(streamResult.Chunks)
+				if isRequestScopedStop(action, okAction) {
+					return nil, wrapRequestStopError(bootstrapErr)
+				}
+				lastErr = bootstrapErr
+				if result.CredentialScope {
+					return nil, newStreamBootstrapError(bootstrapErr, streamResult.Headers)
+				}
+				continue
+			}
 			if isRequestInvalidError(bootstrapErr) {
 				rerr := resultErrorFromError(bootstrapErr)
 				result := Result{AuthID: auth.ID, Provider: provider, Model: resultModel, Success: false, Error: rerr, Options: execOpts}
