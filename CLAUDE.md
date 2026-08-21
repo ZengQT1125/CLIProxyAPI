@@ -8,7 +8,7 @@ AI 工作指南。**必读 Fork-Specific 部分**——合并上游或重构时�
 
 - Module: `github.com/router-for-me/CLIProxyAPI/v7`
 - Go 1.26.0
-- 上游 `router-for-me/CLIProxyAPI`（远程 `upstream`），当前基于 v7.2.88
+- 上游 `router-for-me/CLIProxyAPI`（远程 `upstream`），当前基于 v7.2.138
 - Fork 增量: SF routing · 冷却状态持久化 · 渐进式凭证加载 · usage 持久化 · 管理中心 · 管理面板资源管理 · provider/protocol 修复
 - Fork tag 命名: `fork/v*`（如 `fork/v8.20.1`），与上游 `v7.x.x` tag 共存
 
@@ -135,7 +135,7 @@ go test -count=1 ./internal/usage/                         # 禁用缓存
 ## Config
 
 - `config.yaml`（template: `config.example.yaml`）；`auths/*.json`；`.env`
-- 主要 sections: `tls` `remote-management` `routing` `proxy-url` `request-retry` `quota-exceeded` `payload` `oauth-model-alias` `oauth-excluded-models` `ws-auth` `usage-persistence-enabled` `delete-unauthorized-auth` `auth-load-workers` `local-model` `claude-header-defaults` `codex.strip-intermediary-updates` `cloak` `passthrough-headers` `streaming` `home` `save-cooldown-status`
+- 主要 sections: `tls` `remote-management` `routing` `proxy-url` `request-retry` `quota-exceeded` `payload` `oauth-model-alias` `oauth-excluded-models` `oauth-request-scoped-errors` `ws-auth` `usage-persistence-enabled` `delete-unauthorized-auth` `auth-load-workers` `local-model` `claude-header-defaults` `codex.strip-intermediary-updates` `cloak` `passthrough-headers` `streaming` `home` `save-cooldown-status`
 - Token store env: 默认本地 file；`PGSTORE_*` / `GITSTORE_*` / `OBJECTSTORE_*`
 - `MANAGEMENT_STATIC_PATH`: 覆盖管理面板磁盘升级目录；默认使用 writable path 下的 `static/`，否则回退到 config 所在目录的 `static/`
 - `MANAGEMENT_PANEL_DEV_PATH`: 显式开发面板覆盖；设置后直接使用该文件并跳过自动更新

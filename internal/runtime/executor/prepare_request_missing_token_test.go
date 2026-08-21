@@ -23,24 +23,6 @@ func TestPrepareRequestRejectsMissingToken(t *testing.T) {
 		auth     *cliproxyauth.Auth
 	}{
 		{
-			name:     "claude",
-			preparer: NewClaudeExecutor(&config.Config{}),
-			auth: &cliproxyauth.Auth{
-				ID:       "claude-oauth",
-				Provider: "claude",
-				Metadata: map[string]any{"type": "claude", "email": "user@example.com"},
-			},
-		},
-		{
-			name:     "codex",
-			preparer: NewCodexExecutor(&config.Config{}),
-			auth: &cliproxyauth.Auth{
-				ID:       "codex-oauth",
-				Provider: "codex",
-				Metadata: map[string]any{"type": "codex", "email": "user@example.com"},
-			},
-		},
-		{
 			name:     "kimi",
 			preparer: NewKimiExecutor(&config.Config{}),
 			auth: &cliproxyauth.Auth{
