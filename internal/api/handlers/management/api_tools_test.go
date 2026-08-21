@@ -186,6 +186,56 @@ func TestAPICallRejectsCredentialWithoutToken(t *testing.T) {
 	}
 }
 
+func TestAPICallAllowsEmptyAPIKeyCredential(t *testing.T) {
+	var upstreamCalls atomic.Int32
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		upstreamCalls.Add(1)
+		if got := r.Header.Get("Authorization"); got != "" {
+			t.Errorf("Authorization = %q, want empty for empty API key", got)
+		}
+		if got := r.Header.Get("Custom-Token"); got != "custom-secret" {
+			t.Errorf("Custom-Token = %q, want custom-secret", got)
+		}
+		w.WriteHeader(http.StatusNoContent)
+	}))
+	defer upstream.Close()
+
+	manager := coreauth.NewManager(nil, nil, nil)
+	manager.RegisterExecutor(runtimeexecutor.NewClaudeExecutor(&config.Config{}))
+	auth := &coreauth.Auth{
+		ID:       "claude-apikey",
+		Index:    "claude-apikey-index",
+		Provider: "claude",
+		Status:   coreauth.StatusActive,
+		Attributes: map[string]string{
+			coreauth.AttributeAuthKind: coreauth.AuthKindAPIKey,
+			"base_url":                 upstream.URL,
+			"header:Custom-Token":      "custom-secret",
+		},
+	}
+	if _, errRegister := manager.Register(context.Background(), auth); errRegister != nil {
+		t.Fatalf("register auth: %v", errRegister)
+	}
+
+	h := NewHandlerWithoutConfigFilePath(&config.Config{}, manager)
+
+	payload := fmt.Sprintf(`{"authIndex":"claude-apikey-index","method":"POST","url":%q,"header":{"Authorization":"Bearer $TOKEN$"},"data":"{}"}`, upstream.URL)
+	gin.SetMode(gin.TestMode)
+	recorder := httptest.NewRecorder()
+	c, _ := gin.CreateTestContext(recorder)
+	c.Request = httptest.NewRequest(http.MethodPost, "/v0/management/api-call", strings.NewReader(payload))
+	c.Request.Header.Set("Content-Type", "application/json")
+
+	h.APICall(c)
+
+	if recorder.Code != http.StatusOK {
+		t.Fatalf("APICall status = %d, want %d; body=%s", recorder.Code, http.StatusOK, recorder.Body.String())
+	}
+	if got := upstreamCalls.Load(); got != 1 {
+		t.Fatalf("upstream calls = %d, want 1 for base_URL-only API key", got)
+	}
+}
+
 func TestAPICallUsesProviderAuthenticationForAgentIdentity(t *testing.T) {
 	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		if got := r.Header.Get("Authorization"); !strings.HasPrefix(got, "AgentAssertion ") {

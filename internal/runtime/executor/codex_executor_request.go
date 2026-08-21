@@ -65,10 +65,11 @@ func (e *CodexExecutor) PrepareRequest(req *http.Request, auth *cliproxyauth.Aut
 		}
 	} else {
 		apiKey, _ := codexCreds(auth)
-		if strings.TrimSpace(apiKey) == "" {
-			return statusErr{code: http.StatusUnauthorized, msg: "missing access token"}
+		if strings.TrimSpace(apiKey) != "" {
+			req.Header.Set("Authorization", "Bearer "+apiKey)
+		} else {
+			req.Header.Del("Authorization")
 		}
-		req.Header.Set("Authorization", "Bearer "+apiKey)
 	}
 	var attrs map[string]string
 	if auth != nil {
@@ -340,8 +341,10 @@ func applyCodexHeadersFromSources(r *http.Request, auth *cliproxyauth.Auth, toke
 		if accountID := agentIdentityAccountID(auth); accountID != "" {
 			r.Header.Set("Chatgpt-Account-Id", accountID)
 		}
-	} else {
+	} else if strings.TrimSpace(token) != "" {
 		r.Header.Set("Authorization", "Bearer "+token)
+	} else {
+		r.Header.Del("Authorization")
 	}
 
 	if ginHeaders != nil && ginHeaders.Get("X-Codex-Beta-Features") != "" {
@@ -365,12 +368,7 @@ func applyCodexHeadersFromSources(r *http.Request, auth *cliproxyauth.Auth, toke
 	}
 	r.Header.Set("Connection", "Keep-Alive")
 
-	isAPIKey := false
-	if auth != nil && auth.Attributes != nil {
-		if v := strings.TrimSpace(auth.Attributes["api_key"]); v != "" {
-			isAPIKey = true
-		}
-	}
+	isAPIKey := codexAuthUsesAPIKey(auth)
 	if originator := strings.TrimSpace(ginHeaders.Get("Originator")); originator != "" {
 		r.Header.Set("Originator", originator)
 	} else if !isAPIKey {
