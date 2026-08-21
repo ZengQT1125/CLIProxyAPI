@@ -381,7 +381,7 @@ type ClaudeKey struct {
 	DisableCooling *bool `yaml:"disable-cooling,omitempty" json:"disable-cooling,omitempty"`
 
 	// RequestRetry optionally overrides the global request-retry for this credential.
-	// Nil or a negative value means "use the global request-retry". 0 disables retries.
+	// Nil or a negative value means "use the global request-retry". 0 disables additional retry rounds.
 	RequestRetry *int `yaml:"request-retry,omitempty" json:"request-retry,omitempty"`
 
 	// RequestScopedErrors configures custom classification rules for upstream errors.
@@ -499,7 +499,7 @@ type CodexKey struct {
 	DisableCooling *bool `yaml:"disable-cooling,omitempty" json:"disable-cooling,omitempty"`
 
 	// RequestRetry optionally overrides the global request-retry for this credential.
-	// Nil or a negative value means "use the global request-retry". 0 disables retries.
+	// Nil or a negative value means "use the global request-retry". 0 disables additional retry rounds.
 	RequestRetry *int `yaml:"request-retry,omitempty" json:"request-retry,omitempty"`
 
 	// RequestScopedErrors configures custom classification rules for upstream errors.
@@ -596,7 +596,7 @@ type GeminiKey struct {
 	DisableCooling *bool `yaml:"disable-cooling,omitempty" json:"disable-cooling,omitempty"`
 
 	// RequestRetry optionally overrides the global request-retry for this credential.
-	// Nil or a negative value means "use the global request-retry". 0 disables retries.
+	// Nil or a negative value means "use the global request-retry". 0 disables additional retry rounds.
 	RequestRetry *int `yaml:"request-retry,omitempty" json:"request-retry,omitempty"`
 
 	// RequestScopedErrors configures custom classification rules for upstream errors.
@@ -683,7 +683,7 @@ type OpenAICompatibility struct {
 	DisableCooling *bool `yaml:"disable-cooling,omitempty" json:"disable-cooling,omitempty"`
 
 	// RequestRetry optionally overrides the global request-retry for this provider.
-	// Nil or a negative value means "use the global request-retry". 0 disables retries.
+	// Nil or a negative value means "use the global request-retry". 0 disables additional retry rounds.
 	RequestRetry *int `yaml:"request-retry,omitempty" json:"request-retry,omitempty"`
 
 	// RequestScopedErrors configures custom classification rules for upstream errors.
