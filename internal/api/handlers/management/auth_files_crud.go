@@ -1255,6 +1255,7 @@ func (h *Handler) buildAuthFromFileData(path string, data []byte) (*coreauth.Aut
 	if errDecode != nil {
 		return nil, errDecode
 	}
+	coreauth.NormalizeCredentialMetadata(metadata)
 	provider, _ := metadata["type"].(string)
 	if provider == "" {
 		provider = "unknown"
