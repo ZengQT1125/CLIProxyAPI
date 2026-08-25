@@ -248,7 +248,6 @@ attemptLoop:
 			reporter.EnsurePublished(ctx)
 			return resp, nil
 		}
-
 		switch {
 		case lastStatus != 0:
 			err = newAntigravityStatusErr(lastStatus, lastBody)
@@ -554,7 +553,6 @@ attemptLoop:
 
 			return resp, nil
 		}
-
 		switch {
 		case lastStatus != 0:
 			err = newAntigravityStatusErr(lastStatus, lastBody)

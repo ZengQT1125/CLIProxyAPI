@@ -267,6 +267,51 @@ func TestGetLatestReleaseReadsManifestOnly(t *testing.T) {
 		t.Fatalf("release version = %q, want v9.8.7", release.Version)
 	}
 }
+func TestFetchLatestManifestSetsGitHubAuthorization(t *testing.T) {
+	t.Setenv("GITHUB_TOKEN", "asset-token")
+	t.Setenv("github_token", "")
+	t.Setenv("GITSTORE_GIT_TOKEN", "")
+	t.Setenv("GITSTORE_GIT_URL", "")
+
+	var authorization string
+	releaseServer := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		authorization = r.Header.Get("Authorization")
+		writeTestManifestResponse(t, w, Manifest{Version: "v9.8.7", SHA256: testSHA256("panel"), Asset: ManagementFileName})
+	}))
+	defer releaseServer.Close()
+
+	release, err := getLatestRelease(context.Background(), releaseServer.Client(), releaseServer.URL)
+	if err != nil {
+		t.Fatalf("getLatestRelease() error = %v", err)
+	}
+	if authorization != "Bearer asset-token" {
+		t.Fatalf("Authorization = %q, want %q", authorization, "Bearer asset-token")
+	}
+	if release.Version != "v9.8.7" {
+		t.Fatalf("release version = %q, want v9.8.7", release.Version)
+	}
+}
+
+func TestFetchLatestManifestOmitsAuthorizationWithoutToken(t *testing.T) {
+	t.Setenv("GITHUB_TOKEN", "")
+	t.Setenv("github_token", "")
+	t.Setenv("GITSTORE_GIT_TOKEN", "")
+	t.Setenv("GITSTORE_GIT_URL", "")
+
+	var authorization string
+	releaseServer := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		authorization = r.Header.Get("Authorization")
+		writeTestManifestResponse(t, w, Manifest{Version: "v9.8.7", SHA256: testSHA256("panel"), Asset: ManagementFileName})
+	}))
+	defer releaseServer.Close()
+
+	if _, err := getLatestRelease(context.Background(), releaseServer.Client(), releaseServer.URL); err != nil {
+		t.Fatalf("getLatestRelease() error = %v", err)
+	}
+	if authorization != "" {
+		t.Fatalf("Authorization = %q, want empty", authorization)
+	}
+}
 
 func TestUpdateLatestManagementHTMLSkipsAssetDownloadWhenVersionMatches(t *testing.T) {
 	staticDir := t.TempDir()

@@ -525,6 +525,10 @@ func (e *AntigravityExecutor) updateAntigravityCreditsBalance(ctx context.Contex
 		return
 	}
 }
+func antigravityShouldBypassShortCooldown(ctx context.Context, cfg *config.Config) bool {
+	return cliproxyauth.AntigravityCreditsRequested(ctx) && antigravityCreditsRetryEnabled(cfg)
+}
+
 func antigravityShouldRetryNoCapacity(statusCode int, body []byte) bool {
 	if statusCode != http.StatusServiceUnavailable {
 		return false
@@ -559,10 +563,6 @@ func antigravityShouldRetrySoftRateLimit(statusCode int, body []byte) bool {
 		return false
 	}
 	return decideAntigravity429(body).kind == antigravity429DecisionSoftRetry
-}
-
-func antigravityShouldBypassShortCooldown(ctx context.Context, cfg *config.Config) bool {
-	return cliproxyauth.AntigravityCreditsRequested(ctx) && antigravityCreditsRetryEnabled(cfg)
 }
 
 func antigravitySoftRateLimitDelay(attempt int) time.Duration {
@@ -724,13 +724,6 @@ func storeAntigravityCreditsBalanceBestEffort(authID string, bal antigravityCred
 	antigravityCreditsBalanceByAuth.Store(authID, bal)
 }
 
-func homeKVUnavailableStatusErr(cause error) statusErr {
-	if cause == nil {
-		return statusErr{code: http.StatusServiceUnavailable, msg: "home kv store unavailable"}
-	}
-	return statusErr{code: http.StatusServiceUnavailable, msg: fmt.Sprintf("home kv store unavailable: %v", cause)}
-}
-
 func antigravityNoCapacityRetryDelay(attempt int) time.Duration {
 	if attempt < 0 {
 		attempt = 0
@@ -772,4 +765,11 @@ func antigravityWait(ctx context.Context, wait time.Duration) error {
 	case <-timer.C:
 		return nil
 	}
+}
+
+func homeKVUnavailableStatusErr(cause error) statusErr {
+	if cause == nil {
+		return statusErr{code: http.StatusServiceUnavailable, msg: "home kv store unavailable"}
+	}
+	return statusErr{code: http.StatusServiceUnavailable, msg: fmt.Sprintf("home kv store unavailable: %v", cause)}
 }
