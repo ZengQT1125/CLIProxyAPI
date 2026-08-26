@@ -278,11 +278,15 @@ func fetchLatestManifest(ctx context.Context, client *http.Client, repositoryURL
 	if ctx == nil {
 		ctx = context.Background()
 	}
+	headers := map[string]string{"Accept": "application/json", "User-Agent": httpUserAgent}
+	if token := util.ResolveGitHubToken(); token != "" {
+		headers["Authorization"] = "Bearer " + token
+	}
 	data, err := httpfetch.GetBytes(
 		ctx,
 		client,
 		managementLatestManifestURL(repositoryURL),
-		map[string]string{"Accept": "application/json", "User-Agent": httpUserAgent},
+		headers,
 		maxManifestDownloadSize,
 	)
 	if err != nil {
