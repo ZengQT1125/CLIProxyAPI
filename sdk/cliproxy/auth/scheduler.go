@@ -2,7 +2,6 @@ package auth
 
 import (
 	"context"
-	"math/rand/v2"
 	"sort"
 	"strings"
 	"sync"
@@ -20,8 +19,7 @@ const (
 	schedulerStrategyCustom             schedulerStrategy = 0
 	schedulerStrategyRoundRobin         schedulerStrategy = 1
 	schedulerStrategyFillFirst          schedulerStrategy = 2
-	schedulerStrategySequentialFill     schedulerStrategy = 3
-	schedulerStrategyWeightedRoundRobin schedulerStrategy = 4
+	schedulerStrategyWeightedRoundRobin schedulerStrategy = 3
 )
 
 // scheduledState describes how an auth currently participates in a model shard.
@@ -41,7 +39,6 @@ type authScheduler struct {
 	providers           map[string]*providerScheduler
 	authProviders       map[string]string
 	mixedCursors        map[string]int
-	stickyProviders     map[string]string // model -> sticky provider for sequential-fill mixed routing
 	mixedWeightedStates map[string]*smoothWeightedState
 }
 
@@ -69,10 +66,6 @@ type modelScheduler struct {
 	priorityOrder   []int
 	readyByPriority map[int]*readyBucket
 	blocked         cooldownQueue
-	// stickyID is the sequential-fill sticky credential for this provider/model shard.
-	// It is process-local: first pick randomizes, later picks stick until the auth is
-	// truly unavailable. Request-scoped tried IDs must not burn it.
-	stickyID string
 }
 
 // scheduledAuth stores the runtime scheduling state for a single auth inside a model shard.
@@ -154,7 +147,6 @@ func newAuthScheduler(selector Selector) *authScheduler {
 		providers:           make(map[string]*providerScheduler),
 		authProviders:       make(map[string]string),
 		mixedCursors:        make(map[string]int),
-		stickyProviders:     make(map[string]string),
 		mixedWeightedStates: make(map[string]*smoothWeightedState),
 	}
 }
@@ -164,8 +156,6 @@ func selectorStrategy(selector Selector) schedulerStrategy {
 	switch selector.(type) {
 	case *FillFirstSelector:
 		return schedulerStrategyFillFirst
-	case *SequentialFillSelector:
-		return schedulerStrategySequentialFill
 	case *WeightedRoundRobinSelector:
 		return schedulerStrategyWeightedRoundRobin
 	case nil, *RoundRobinSelector:
@@ -184,25 +174,11 @@ func (s *authScheduler) setSelector(selector Selector) {
 	defer s.mu.Unlock()
 	s.strategy = selectorStrategy(selector)
 	clear(s.mixedCursors)
-	clear(s.stickyProviders)
 	clear(s.mixedWeightedStates)
-	// Sticky credential pointers live on model shards; drop them so a strategy switch
-	// does not inherit another policy's selection state.
-	for _, providerState := range s.providers {
-		if providerState == nil {
-			continue
-		}
-		for _, shard := range providerState.modelShards {
-			if shard != nil {
-				shard.stickyID = ""
-			}
-		}
-	}
 }
 
 // rebuild recreates the complete scheduler state from an auth snapshot.
-// Mixed round-robin cursors, mixed sticky providers, and per-shard sequential-fill
-// sticky IDs are preserved so a sync/retry rebuild does not reset routing progress.
+// Mixed round-robin cursors are preserved so a sync/retry rebuild does not reset routing progress.
 func (s *authScheduler) rebuild(auths []*Auth) {
 	if s == nil {
 		return
@@ -211,19 +187,6 @@ func (s *authScheduler) rebuild(auths []*Auth) {
 	defer s.mu.Unlock()
 
 	preservedMixedCursors := s.mixedCursors
-	preservedStickyProviders := s.stickyProviders
-	preservedStickyIDs := make(map[string]string)
-	for providerKey, providerState := range s.providers {
-		if providerState == nil {
-			continue
-		}
-		for modelKey, shard := range providerState.modelShards {
-			if shard == nil || shard.stickyID == "" {
-				continue
-			}
-			preservedStickyIDs[providerKey+"\x00"+modelKey] = shard.stickyID
-		}
-	}
 
 	s.providers = make(map[string]*providerScheduler)
 	s.authProviders = make(map[string]string)
@@ -232,32 +195,10 @@ func (s *authScheduler) rebuild(auths []*Auth) {
 	} else {
 		s.mixedCursors = preservedMixedCursors
 	}
-	if preservedStickyProviders == nil {
-		s.stickyProviders = make(map[string]string)
-	} else {
-		s.stickyProviders = preservedStickyProviders
-	}
 	s.mixedWeightedStates = make(map[string]*smoothWeightedState)
 	now := time.Now()
 	for _, auth := range auths {
 		s.upsertAuthLocked(auth, now)
-	}
-	for key, stickyID := range preservedStickyIDs {
-		providerKey, modelKey, ok := strings.Cut(key, "\x00")
-		if !ok {
-			continue
-		}
-		providerState := s.providers[providerKey]
-		if providerState == nil {
-			continue
-		}
-		shard := providerState.ensureModelLocked(modelKey, now)
-		if shard == nil {
-			continue
-		}
-		// Keep the prior ID as the sequential cursor even when that auth disappeared.
-		// The next pick will advance by ID without jumping back or re-randomizing.
-		shard.stickyID = stickyID
 	}
 }
 
@@ -417,98 +358,6 @@ func (s *authScheduler) pickMixedWithStrategy(ctx context.Context, providers []s
 			}
 			picked := shard.pickReadyAtPriorityLocked(false, bestPriority, strategy, predicate)
 			if picked != nil {
-				return picked, providerKey, nil
-			}
-		}
-		return nil, "", s.mixedUnavailableErrorLocked(normalized, model, predicate)
-	}
-
-	if strategy == schedulerStrategySequentialFill {
-		if s.stickyProviders == nil {
-			s.stickyProviders = make(map[string]string)
-		}
-		// Only providers that still have ready credentials at the shared highest
-		// priority may own sticky state permanently. Request-scoped tried filters
-		// use temporary failover without advancing stickyProviders.
-		readyProviders := make([]string, 0, len(normalized))
-		for providerIndex, providerKey := range normalized {
-			shard := candidateShards[providerIndex]
-			if shard == nil {
-				continue
-			}
-			if shard.readyCountAtPriorityLocked(false, bestPriority, nil) == 0 {
-				continue
-			}
-			readyProviders = append(readyProviders, providerKey)
-		}
-		if len(readyProviders) == 0 {
-			return nil, "", s.mixedUnavailableErrorLocked(normalized, model, predicate)
-		}
-
-		pickFromProvider := func(providerKey string) *Auth {
-			for providerIndex, candidate := range normalized {
-				if candidate != providerKey {
-					continue
-				}
-				shard := candidateShards[providerIndex]
-				if shard == nil {
-					return nil
-				}
-				return shard.pickReadyAtPriorityLocked(false, bestPriority, strategy, predicate)
-			}
-			return nil
-		}
-
-		if sticky := strings.TrimSpace(s.stickyProviders[modelKey]); sticky != "" {
-			if containsProvider(readyProviders, sticky) {
-				if picked := pickFromProvider(sticky); picked != nil {
-					return picked, sticky, nil
-				}
-				// Sticky provider still ready, but only request-tried credentials remain:
-				// temporary failover without leaving the sticky provider permanently.
-				for _, providerKey := range readyProviders {
-					if providerKey == sticky {
-						continue
-					}
-					if picked := pickFromProvider(providerKey); picked != nil {
-						return picked, providerKey, nil
-					}
-				}
-				return nil, "", s.mixedUnavailableErrorLocked(normalized, model, predicate)
-			}
-			// Sticky provider exhausted: advance to the next ready provider by name.
-			next := readyProviders[0]
-			for _, providerKey := range readyProviders {
-				if providerKey > sticky {
-					next = providerKey
-					break
-				}
-			}
-			s.stickyProviders[modelKey] = next
-			if picked := pickFromProvider(next); picked != nil {
-				return picked, next, nil
-			}
-			for _, providerKey := range readyProviders {
-				if providerKey == next {
-					continue
-				}
-				if picked := pickFromProvider(providerKey); picked != nil {
-					return picked, providerKey, nil
-				}
-			}
-			return nil, "", s.mixedUnavailableErrorLocked(normalized, model, predicate)
-		}
-
-		firstProvider := readyProviders[0]
-		s.stickyProviders[modelKey] = firstProvider
-		if picked := pickFromProvider(firstProvider); picked != nil {
-			return picked, firstProvider, nil
-		}
-		for _, providerKey := range readyProviders {
-			if providerKey == firstProvider {
-				continue
-			}
-			if picked := pickFromProvider(providerKey); picked != nil {
 				return picked, providerKey, nil
 			}
 		}
@@ -999,8 +848,6 @@ func (m *modelScheduler) pickReadyAtPriorityLocked(preferWebsocket bool, priorit
 	switch strategy {
 	case schedulerStrategyFillFirst:
 		picked = view.pickFirst(predicate)
-	case schedulerStrategySequentialFill:
-		picked = view.pickSequentialFill(m, predicate)
 	case schedulerStrategyWeightedRoundRobin:
 		picked = view.pickWeighted(predicate)
 	default:
@@ -1189,87 +1036,6 @@ func (v *readyView) pickRoundRobin(predicate func(*scheduledAuth) bool) *schedul
 			continue
 		}
 		v.lastPicked = entry.auth.ID
-		return entry
-	}
-	return nil
-}
-
-// pickSequentialFill implements SequentialFill sticky selection on a ready view.
-// ready entries (v.flat) control permanent sticky state. predicate filters the
-// request-scoped selectable subset (for example tried auth IDs).
-func (v *readyView) pickSequentialFill(shard *modelScheduler, predicate func(*scheduledAuth) bool) *scheduledAuth {
-	if shard == nil || len(v.flat) == 0 {
-		return nil
-	}
-
-	// First access: random sticky start among ready credentials.
-	if shard.stickyID == "" {
-		start := rand.IntN(len(v.flat))
-		current := v.flat[start]
-		if current == nil || current.auth == nil {
-			return nil
-		}
-		shard.stickyID = current.auth.ID
-		if predicate == nil || predicate(current) {
-			return current
-		}
-		return v.nextAfter(current.auth.ID, predicate)
-	}
-
-	// Sticky credential still ready: request-scoped failover must not burn sticky.
-	if entry := v.findByID(shard.stickyID); entry != nil {
-		if predicate == nil || predicate(entry) {
-			return entry
-		}
-		return v.nextAfter(shard.stickyID, predicate)
-	}
-
-	// Sticky credential is truly unavailable: advance permanently among ready IDs.
-	advance := v.nextAfter(shard.stickyID, nil)
-	if advance == nil || advance.auth == nil {
-		return nil
-	}
-	shard.stickyID = advance.auth.ID
-	if predicate == nil || predicate(advance) {
-		return advance
-	}
-	return v.nextAfter(advance.auth.ID, predicate)
-}
-
-func (v *readyView) findByID(id string) *scheduledAuth {
-	if id == "" {
-		return nil
-	}
-	for _, entry := range v.flat {
-		if entry != nil && entry.auth != nil && entry.auth.ID == id {
-			return entry
-		}
-	}
-	return nil
-}
-
-// nextAfter returns the first ready entry with ID greater than currentID that
-// satisfies predicate, wrapping around when needed. flat is sorted by auth ID.
-func (v *readyView) nextAfter(currentID string, predicate func(*scheduledAuth) bool) *scheduledAuth {
-	if len(v.flat) == 0 {
-		return nil
-	}
-	for _, entry := range v.flat {
-		if entry == nil || entry.auth == nil || entry.auth.ID <= currentID {
-			continue
-		}
-		if predicate != nil && !predicate(entry) {
-			continue
-		}
-		return entry
-	}
-	for _, entry := range v.flat {
-		if entry == nil || entry.auth == nil {
-			continue
-		}
-		if predicate != nil && !predicate(entry) {
-			continue
-		}
 		return entry
 	}
 	return nil

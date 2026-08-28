@@ -67,20 +67,6 @@ Configuration:
 auth-load-workers: 16
 ```
 
-### Sequential Fill (SF) Routing Strategy
-
-A sticky credential selection strategy (`sf` or `sequential-fill`) that optimizes credential usage:
-- Sticks to the current credential until it becomes unavailable
-- Random starting point for initial selection to balance load across credentials
-- Sequential advancement without jumping back to recovered credentials
-- Honors the normal `request-retry` and `max-retry-credentials` settings
-
-Configuration:
-```yaml
-routing:
-  strategy: "sf"  # or "sequential-fill"
-```
-
 ### Usage Statistics Persistence
 
 Control database persistence for usage statistics:

@@ -15,9 +15,8 @@ func TestNormalizeRoutingStrategy(t *testing.T) {
 		{name: "round robin alias", input: "rr", want: "round-robin", wantOK: true},
 		{name: "weighted round robin alias", input: "wrr", want: "weighted-round-robin", wantOK: true},
 		{name: "fill first alias", input: "ff", want: "fill-first", wantOK: true},
-		{name: "sequential fill alias", input: "sf", want: "sequential-fill", wantOK: true},
-		{name: "sequential fill canonical", input: "sequential-fill", want: "sequential-fill", wantOK: true},
 		{name: "invalid", input: "bogus", want: "", wantOK: false},
+		{name: "sf no longer recognized", input: "sf", want: "", wantOK: false},
 	}
 
 	for _, tt := range tests {
@@ -47,8 +46,8 @@ func TestSelectorForRoutingStrategy(t *testing.T) {
 		{name: "default empty", input: "", wantType: &RoundRobinSelector{}},
 		{name: "weighted round robin alias", input: "wrr", wantType: &WeightedRoundRobinSelector{}},
 		{name: "fill first alias", input: "ff", wantType: &FillFirstSelector{}},
-		{name: "sequential fill alias", input: "sf", wantType: &SequentialFillSelector{}},
 		{name: "invalid defaults round robin", input: "bogus", wantType: &RoundRobinSelector{}},
+		{name: "sf falls back round robin", input: "sf", wantType: &RoundRobinSelector{}},
 	}
 
 	for _, tt := range tests {
@@ -69,10 +68,6 @@ func TestSelectorForRoutingStrategy(t *testing.T) {
 			case *FillFirstSelector:
 				if _, ok := got.(*FillFirstSelector); !ok {
 					t.Fatalf("SelectorForRoutingStrategy(%q) = %T, want *FillFirstSelector", tt.input, got)
-				}
-			case *SequentialFillSelector:
-				if _, ok := got.(*SequentialFillSelector); !ok {
-					t.Fatalf("SelectorForRoutingStrategy(%q) = %T, want *SequentialFillSelector", tt.input, got)
 				}
 			default:
 				t.Fatalf("unexpected wantType %T", tt.wantType)
