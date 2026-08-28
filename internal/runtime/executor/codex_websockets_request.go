@@ -2,7 +2,6 @@ package executor
 
 import (
 	"context"
-	"fmt"
 	"net/http"
 	"strings"
 
@@ -69,14 +68,7 @@ func applyCodexWebsocketHeaders(ctx context.Context, headers http.Header, auth *
 	if headers == nil {
 		headers = http.Header{}
 	}
-	if isAgentIdentityAuth(auth) {
-		// Validate material early, but do not publish Authorization here.
-		// dialCodexWebsocket mints a fresh AgentAssertion immediately before each DialContext.
-		if _, err := generateAgentAssertion(auth); err != nil {
-			return nil, fmt.Errorf("codex websocket executor: generate agent assertion: %w", err)
-		}
-		headers.Del("Authorization")
-	} else if strings.TrimSpace(token) != "" {
+	if strings.TrimSpace(token) != "" {
 		headers.Set("Authorization", "Bearer "+token)
 	} else {
 		headers.Del("Authorization")
@@ -127,9 +119,6 @@ func applyCodexWebsocketHeaders(ctx context.Context, headers http.Header, auth *
 			if v, ok := auth.Metadata["account_id"].(string); ok {
 				accountID = strings.TrimSpace(v)
 			}
-		}
-		if accountID == "" {
-			accountID = agentIdentityAccountID(auth)
 		}
 		if accountID != "" {
 			setHeaderCasePreserved(headers, "ChatGPT-Account-ID", accountID)

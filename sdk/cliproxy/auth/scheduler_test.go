@@ -4,7 +4,6 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
-	"fmt"
 	"net/http"
 	"testing"
 	"time"
@@ -377,210 +376,6 @@ func TestSchedulerPick_FillFirstSticksToFirstReady(t *testing.T) {
 	}
 }
 
-func TestSchedulerPick_SequentialFillStickyBehavior(t *testing.T) {
-	t.Parallel()
-
-	scheduler := newSchedulerForTest(
-		&SequentialFillSelector{},
-		&Auth{ID: "b", Provider: "gemini"},
-		&Auth{ID: "a", Provider: "gemini"},
-		&Auth{ID: "c", Provider: "gemini"},
-	)
-
-	first, errPick := scheduler.pickSingle(context.Background(), "gemini", "", cliproxyexecutor.Options{}, nil)
-	if errPick != nil {
-		t.Fatalf("pickSingle() #1 error = %v", errPick)
-	}
-	if first == nil {
-		t.Fatalf("pickSingle() #1 auth = nil")
-	}
-	valid := map[string]bool{"a": true, "b": true, "c": true}
-	if !valid[first.ID] {
-		t.Fatalf("pickSingle() #1 auth.ID = %q, want one of a/b/c", first.ID)
-	}
-
-	for index := 2; index <= 5; index++ {
-		got, errPick := scheduler.pickSingle(context.Background(), "gemini", "", cliproxyexecutor.Options{}, nil)
-		if errPick != nil {
-			t.Fatalf("pickSingle() #%d error = %v", index, errPick)
-		}
-		if got == nil {
-			t.Fatalf("pickSingle() #%d auth = nil", index)
-		}
-		if got.ID != first.ID {
-			t.Fatalf("pickSingle() #%d auth.ID = %q, want sticky %q", index, got.ID, first.ID)
-		}
-	}
-}
-
-func TestSchedulerPick_SequentialFillRandomStartNotAlwaysSmallestID(t *testing.T) {
-	t.Parallel()
-
-	auths := []*Auth{
-		{ID: "a", Provider: "gemini"},
-		{ID: "b", Provider: "gemini"},
-		{ID: "c", Provider: "gemini"},
-	}
-	counts := make(map[string]int, 3)
-	const trials = 90
-	for i := 0; i < trials; i++ {
-		scheduler := newSchedulerForTest(&SequentialFillSelector{}, auths...)
-		got, errPick := scheduler.pickSingle(context.Background(), "gemini", "", cliproxyexecutor.Options{}, nil)
-		if errPick != nil {
-			t.Fatalf("pickSingle() trial %d error = %v", i, errPick)
-		}
-		if got == nil {
-			t.Fatalf("pickSingle() trial %d auth = nil", i)
-		}
-		counts[got.ID]++
-	}
-	if counts["a"] == trials {
-		t.Fatalf("SequentialFill always started on smallest ID %q across %d trials; still behaving like FillFirst", "a", trials)
-	}
-	if len(counts) < 2 {
-		t.Fatalf("SequentialFill first picks = %#v, want multiple start IDs across trials", counts)
-	}
-}
-
-func TestSchedulerPick_SequentialFillAdvanceOnUnavailable(t *testing.T) {
-	t.Parallel()
-
-	model := "gemini-2.5-pro"
-	registerSchedulerModels(t, "gemini", model, "a", "b", "c")
-
-	scheduler := newSchedulerForTest(
-		&SequentialFillSelector{},
-		&Auth{ID: "a", Provider: "gemini"},
-		&Auth{ID: "b", Provider: "gemini"},
-		&Auth{ID: "c", Provider: "gemini"},
-	)
-
-	first, errPick := scheduler.pickSingle(context.Background(), "gemini", model, cliproxyexecutor.Options{}, nil)
-	if errPick != nil {
-		t.Fatalf("pickSingle() #1 error = %v", errPick)
-	}
-	if first == nil {
-		t.Fatalf("pickSingle() #1 auth = nil")
-	}
-
-	// Burn the sticky credential into cooldown, then the scheduler must advance permanently.
-	scheduler.upsertAuth(&Auth{
-		ID:       first.ID,
-		Provider: "gemini",
-		ModelStates: map[string]*ModelState{
-			model: {
-				Status:         StatusError,
-				Unavailable:    true,
-				NextRetryAfter: time.Now().Add(time.Hour),
-				Quota:          QuotaState{Exceeded: true, NextRecoverAt: time.Now().Add(time.Hour)},
-			},
-		},
-	})
-
-	second, errPick := scheduler.pickSingle(context.Background(), "gemini", model, cliproxyexecutor.Options{}, nil)
-	if errPick != nil {
-		t.Fatalf("pickSingle() after cooldown error = %v", errPick)
-	}
-	if second == nil {
-		t.Fatalf("pickSingle() after cooldown auth = nil")
-	}
-	if second.ID == first.ID {
-		t.Fatalf("pickSingle() after cooldown stayed on %q, want advance", first.ID)
-	}
-
-	third, errPick := scheduler.pickSingle(context.Background(), "gemini", model, cliproxyexecutor.Options{}, nil)
-	if errPick != nil {
-		t.Fatalf("pickSingle() sticky after advance error = %v", errPick)
-	}
-	if third == nil || third.ID != second.ID {
-		t.Fatalf("pickSingle() sticky after advance = %v, want %q", third, second.ID)
-	}
-}
-
-func TestSchedulerPick_SequentialFillTriedDoesNotBurnSticky(t *testing.T) {
-	t.Parallel()
-
-	scheduler := newSchedulerForTest(
-		&SequentialFillSelector{},
-		&Auth{ID: "a", Provider: "gemini"},
-		&Auth{ID: "b", Provider: "gemini"},
-		&Auth{ID: "c", Provider: "gemini"},
-	)
-
-	first, errPick := scheduler.pickSingle(context.Background(), "gemini", "", cliproxyexecutor.Options{}, nil)
-	if errPick != nil {
-		t.Fatalf("pickSingle() #1 error = %v", errPick)
-	}
-	if first == nil {
-		t.Fatalf("pickSingle() #1 auth = nil")
-	}
-
-	tried := map[string]struct{}{first.ID: {}}
-	failover, errPick := scheduler.pickSingle(context.Background(), "gemini", "", cliproxyexecutor.Options{}, tried)
-	if errPick != nil {
-		t.Fatalf("pickSingle() failover error = %v", errPick)
-	}
-	if failover == nil {
-		t.Fatalf("pickSingle() failover auth = nil")
-	}
-	if failover.ID == first.ID {
-		t.Fatalf("pickSingle() failover returned sticky %q, want temporary other auth", first.ID)
-	}
-
-	restored, errPick := scheduler.pickSingle(context.Background(), "gemini", "", cliproxyexecutor.Options{}, nil)
-	if errPick != nil {
-		t.Fatalf("pickSingle() restore error = %v", errPick)
-	}
-	if restored == nil || restored.ID != first.ID {
-		t.Fatalf("pickSingle() restore = %v, want sticky %q", restored, first.ID)
-	}
-}
-
-func TestManagerExecute_SequentialFillLoadPreservesSticky(t *testing.T) {
-	t.Parallel()
-
-	const (
-		provider     = "gemini"
-		authCount    = 64
-		rebuildCount = 8
-	)
-	auths := make([]*Auth, 0, authCount)
-	for index := 0; index < authCount; index++ {
-		auths = append(auths, &Auth{
-			ID:       fmt.Sprintf("auth-%02d", index),
-			Provider: provider,
-		})
-	}
-	manager := NewManager(&schedulerSnapshotStore{auths: auths}, &SequentialFillSelector{}, nil)
-	manager.RegisterExecutor(&authFallbackExecutor{id: provider})
-
-	ctx := context.Background()
-	if errLoad := manager.Load(ctx); errLoad != nil {
-		t.Fatalf("Load() initial error = %v", errLoad)
-	}
-	first, errExecute := manager.Execute(ctx, []string{provider}, cliproxyexecutor.Request{}, cliproxyexecutor.Options{})
-	if errExecute != nil {
-		t.Fatalf("Execute() initial error = %v", errExecute)
-	}
-	firstID := string(first.Payload)
-	if firstID == "" {
-		t.Fatalf("Execute() initial payload is empty")
-	}
-
-	for rebuild := 0; rebuild < rebuildCount; rebuild++ {
-		if errLoad := manager.Load(ctx); errLoad != nil {
-			t.Fatalf("Load() #%d error = %v", rebuild+1, errLoad)
-		}
-		response, errExecute := manager.Execute(ctx, []string{provider}, cliproxyexecutor.Request{}, cliproxyexecutor.Options{})
-		if errExecute != nil {
-			t.Fatalf("Execute() after Load() #%d error = %v", rebuild+1, errExecute)
-		}
-		if got := string(response.Payload); got != firstID {
-			t.Fatalf("Execute() after Load() #%d auth = %q, want sticky %q", rebuild+1, got, firstID)
-		}
-	}
-}
-
 func TestSchedulerPick_PromotesExpiredCooldownBeforePick(t *testing.T) {
 	t.Parallel()
 
@@ -808,6 +603,254 @@ func TestSchedulerPickMixed_RetryTriedFilterPreservesSmoothWeightedDistribution(
 	}
 }
 
+func TestReadyViewRoundRobinPreservesSuccessorAcrossRebuild(t *testing.T) {
+	t.Parallel()
+
+	entry := func(id string) *scheduledAuth {
+		return &scheduledAuth{auth: &Auth{ID: id}}
+	}
+
+	t.Run("a cooling resumes at b", func(t *testing.T) {
+		original := readyView{
+			flat: []*scheduledAuth{entry("A"), entry("B"), entry("C")},
+		}
+		if got := original.pickRoundRobin(nil); got == nil || got.auth.ID != "A" {
+			t.Fatalf("first pick = %v, want A", got)
+		}
+
+		state := snapshotReadyViewCursors(original)
+		rebuilt := readyView{
+			flat: []*scheduledAuth{entry("B"), entry("C")},
+		}
+		restoreReadyViewCursors(&rebuilt, state)
+
+		got := rebuilt.pickRoundRobin(nil)
+		if got == nil || got.auth.ID != "B" {
+			t.Fatalf("pick after A cooldown = %v, want B", got)
+		}
+	})
+
+	t.Run("b cooling resumes at c", func(t *testing.T) {
+		original := readyView{
+			flat: []*scheduledAuth{entry("A"), entry("B"), entry("C")},
+		}
+		// Pick A, then B
+		if got := original.pickRoundRobin(nil); got == nil || got.auth.ID != "A" {
+			t.Fatalf("first pick = %v, want A", got)
+		}
+		if got := original.pickRoundRobin(nil); got == nil || got.auth.ID != "B" {
+			t.Fatalf("second pick = %v, want B", got)
+		}
+
+		state := snapshotReadyViewCursors(original)
+		rebuilt := readyView{
+			flat: []*scheduledAuth{entry("A"), entry("C")},
+		}
+		restoreReadyViewCursors(&rebuilt, state)
+
+		got := rebuilt.pickRoundRobin(nil)
+		if got == nil || got.auth.ID != "C" {
+			t.Fatalf("pick after B cooldown = %v, want C", got)
+		}
+	})
+
+	t.Run("c cooling wraps to a", func(t *testing.T) {
+		original := readyView{
+			flat: []*scheduledAuth{entry("A"), entry("B"), entry("C")},
+		}
+		// Pick A, B, C
+		for _, want := range []string{"A", "B", "C"} {
+			if got := original.pickRoundRobin(nil); got == nil || got.auth.ID != want {
+				t.Fatalf("pick = %v, want %s", got, want)
+			}
+		}
+
+		state := snapshotReadyViewCursors(original)
+		rebuilt := readyView{
+			flat: []*scheduledAuth{entry("A"), entry("B")},
+		}
+		restoreReadyViewCursors(&rebuilt, state)
+
+		got := rebuilt.pickRoundRobin(nil)
+		if got == nil || got.auth.ID != "A" {
+			t.Fatalf("pick after C cooldown = %v, want A", got)
+		}
+	})
+
+	t.Run("recovery preserves successor", func(t *testing.T) {
+		original := readyView{
+			flat: []*scheduledAuth{entry("B"), entry("C")},
+		}
+		if got := original.pickRoundRobin(nil); got == nil || got.auth.ID != "B" {
+			t.Fatalf("first pick = %v, want B", got)
+		}
+
+		state := snapshotReadyViewCursors(original)
+		// A recovered and is prepended back
+		rebuilt := readyView{
+			flat: []*scheduledAuth{entry("A"), entry("B"), entry("C")},
+		}
+		restoreReadyViewCursors(&rebuilt, state)
+
+		got := rebuilt.pickRoundRobin(nil)
+		if got == nil || got.auth.ID != "C" {
+			t.Fatalf("pick after A recovery = %v, want C", got)
+		}
+	})
+
+	t.Run("retry exclusion resumes without rebuild", func(t *testing.T) {
+		view := readyView{
+			flat: []*scheduledAuth{entry("A"), entry("B"), entry("C")},
+		}
+		if got := view.pickRoundRobin(nil); got == nil || got.auth.ID != "A" {
+			t.Fatalf("first pick = %v, want A", got)
+		}
+		got := view.pickRoundRobin(func(candidate *scheduledAuth) bool {
+			return candidate.auth.ID != "B"
+		})
+		if got == nil || got.auth.ID != "C" {
+			t.Fatalf("pick after excluding B = %v, want C", got)
+		}
+	})
+
+	t.Run("multiple cooldown skips to first surviving successor", func(t *testing.T) {
+		original := readyView{
+			flat: []*scheduledAuth{entry("A"), entry("B"), entry("C"), entry("D")},
+		}
+		if got := original.pickRoundRobin(nil); got == nil || got.auth.ID != "A" {
+			t.Fatalf("first pick = %v, want A", got)
+		}
+
+		state := snapshotReadyViewCursors(original)
+		rebuilt := readyView{
+			flat: []*scheduledAuth{entry("C"), entry("D")},
+		}
+		restoreReadyViewCursors(&rebuilt, state)
+
+		got := rebuilt.pickRoundRobin(nil)
+		if got == nil || got.auth.ID != "C" {
+			t.Fatalf("pick after A and B cooldown = %v, want C", got)
+		}
+	})
+}
+
+func TestScheduledSuccessorIndex_WrapsAndSkipsFilteredCandidates(t *testing.T) {
+	t.Parallel()
+
+	entries := []*scheduledAuth{
+		{auth: &Auth{ID: "aaa"}},
+		{auth: &Auth{ID: "ccc"}},
+		{auth: &Auth{ID: "eee"}},
+	}
+	tests := []struct {
+		name   string
+		lastID string
+		want   int
+	}{
+		{name: "no previous pick starts at head", lastID: "", want: 0},
+		{name: "resumes after previous pick", lastID: "aaa", want: 1},
+		{name: "resumes after filtered-out pick", lastID: "bbb", want: 1},
+		{name: "wraps at the end of the ring", lastID: "eee", want: 0},
+		{name: "wraps for removed trailing pick", lastID: "zzz", want: 0},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			if got := scheduledSuccessorIndex(entries, tt.lastID); got != tt.want {
+				t.Fatalf("scheduledSuccessorIndex(%q) = %d, want %d", tt.lastID, got, tt.want)
+			}
+		})
+	}
+	if got := scheduledSuccessorIndex(nil, "aaa"); got != 0 {
+		t.Fatalf("scheduledSuccessorIndex(nil, aaa) = %d, want 0", got)
+	}
+}
+
+func TestManagerRoundRobinPreservesSuccessorAcrossCooldown(t *testing.T) {
+	t.Parallel()
+
+	manager := NewManager(nil, &RoundRobinSelector{}, nil)
+	model := "test-successor-model"
+	authIDs := []string{"successor-auth-a", "successor-auth-b", "successor-auth-c"}
+	registerSchedulerModels(t, "gemini", model, authIDs...)
+
+	for _, id := range authIDs {
+		if _, errRegister := manager.Register(context.Background(), &Auth{ID: id, Provider: "gemini"}); errRegister != nil {
+			t.Fatalf("Register(%s) error = %v", id, errRegister)
+		}
+	}
+
+	got, errPick := manager.scheduler.pickSingle(context.Background(), "gemini", model, cliproxyexecutor.Options{}, nil)
+	if errPick != nil {
+		t.Fatalf("pickSingle #1 error = %v", errPick)
+	}
+	if got == nil || got.ID != "successor-auth-a" {
+		t.Fatalf("pickSingle #1 = %v, want successor-auth-a", got)
+	}
+
+	manager.MarkResult(context.Background(), Result{
+		AuthID:   "successor-auth-a",
+		Provider: "gemini",
+		Model:    model,
+		Success:  false,
+		Error:    &Error{HTTPStatus: 429, Message: "rate limit"},
+	})
+
+	got, errPick = manager.scheduler.pickSingle(context.Background(), "gemini", model, cliproxyexecutor.Options{}, nil)
+	if errPick != nil {
+		t.Fatalf("pickSingle #2 after successor-auth-a cooldown error = %v", errPick)
+	}
+	if got == nil || got.ID != "successor-auth-b" {
+		t.Fatalf("pickSingle #2 after successor-auth-a cooldown = %v, want successor-auth-b", got)
+	}
+
+	manager.MarkResult(context.Background(), Result{
+		AuthID:   "successor-auth-b",
+		Provider: "gemini",
+		Model:    model,
+		Success:  false,
+		Error:    &Error{HTTPStatus: 429, Message: "rate limit"},
+	})
+
+	got, errPick = manager.scheduler.pickSingle(context.Background(), "gemini", model, cliproxyexecutor.Options{}, nil)
+	if errPick != nil {
+		t.Fatalf("pickSingle #3 after successor-auth-b cooldown error = %v", errPick)
+	}
+	if got == nil || got.ID != "successor-auth-c" {
+		t.Fatalf("pickSingle #3 after successor-auth-b cooldown = %v, want successor-auth-c", got)
+	}
+}
+
+func TestSchedulerPick_RoundRobinPreservesWebsocketSuccessorAcrossCooldown(t *testing.T) {
+	t.Parallel()
+
+	wsA := &Auth{ID: "codex-ws-a", Provider: "codex", Attributes: map[string]string{"websockets": "true"}}
+	wsB := &Auth{ID: "codex-ws-b", Provider: "codex", Attributes: map[string]string{"websockets": "true"}}
+	wsC := &Auth{ID: "codex-ws-c", Provider: "codex", Attributes: map[string]string{"websockets": "true"}}
+	httpOnly := &Auth{ID: "codex-http", Provider: "codex"}
+	scheduler := newSchedulerForTest(&RoundRobinSelector{}, httpOnly, wsA, wsB, wsC)
+
+	ctx := cliproxyexecutor.WithDownstreamWebsocket(context.Background())
+	got, errPick := scheduler.pickSingle(ctx, "codex", "", cliproxyexecutor.Options{}, nil)
+	if errPick != nil {
+		t.Fatalf("pickSingle() first error = %v", errPick)
+	}
+	if got == nil || got.ID != "codex-ws-a" {
+		t.Fatalf("pickSingle() first = %v, want codex-ws-a", got)
+	}
+
+	wsA.Unavailable = true
+	wsA.NextRetryAfter = time.Now().Add(time.Hour)
+	scheduler.upsertAuth(wsA)
+
+	got, errPick = scheduler.pickSingle(ctx, "codex", "", cliproxyexecutor.Options{}, nil)
+	if errPick != nil {
+		t.Fatalf("pickSingle() after ws-a cooldown error = %v", errPick)
+	}
+	if got == nil || got.ID != "codex-ws-b" {
+		t.Fatalf("pickSingle() after ws-a cooldown = %v, want codex-ws-b", got)
+	}
+}
+
 func TestSchedulerPick_MixedProvidersPrefersHighestPriorityTier(t *testing.T) {
 	t.Parallel()
 
@@ -946,68 +989,6 @@ func TestManagerPluginSchedulerSelectsAuthID(t *testing.T) {
 	if !scheduler.requests[0].Stream {
 		t.Fatalf("scheduler request Stream = false, want true")
 	}
-}
-
-func TestManagerExecutePluginSchedulerExcludesTriedSequentialFillCandidates(t *testing.T) {
-	prev := quotaCooldownDisabled.Load()
-	quotaCooldownDisabled.Store(false)
-	t.Cleanup(func() { quotaCooldownDisabled.Store(prev) })
-
-	const (
-		provider = "gemini"
-		model    = "plugin-scheduler-sequential-fill-retry-model"
-		firstID  = "plugin-scheduler-retry-a"
-		secondID = "plugin-scheduler-retry-b"
-	)
-
-	manager := NewManager(nil, &SequentialFillSelector{}, nil)
-	manager.SetRetryConfig(0, 0, 2)
-	executor := &authFallbackExecutor{
-		id: provider,
-		executeErrors: map[string]error{
-			firstID: &Error{HTTPStatus: http.StatusInternalServerError, Message: "boom"},
-		},
-		executeErrorBudget: map[string]int{firstID: 1},
-	}
-	manager.RegisterExecutor(executor)
-
-	auths := []*Auth{
-		{ID: firstID, Provider: provider, Metadata: map[string]any{"disable_cooling": true}},
-		{ID: secondID, Provider: provider},
-	}
-	registryRef := registry.GetGlobalRegistry()
-	for _, auth := range auths {
-		registryRef.RegisterClient(auth.ID, provider, []*registry.ModelInfo{{ID: model}})
-		if _, errRegister := manager.Register(context.Background(), auth); errRegister != nil {
-			t.Fatalf("Register(%s) error = %v", auth.ID, errRegister)
-		}
-	}
-	t.Cleanup(func() {
-		for _, auth := range auths {
-			registryRef.UnregisterClient(auth.ID)
-		}
-	})
-
-	scheduler := &fakePluginScheduler{pick: func(_ context.Context, req pluginapi.SchedulerPickRequest) (pluginapi.SchedulerPickResponse, bool, error) {
-		if len(req.Candidates) == 0 {
-			return pluginapi.SchedulerPickResponse{}, true, errors.New("scheduler received no candidates")
-		}
-		return pluginapi.SchedulerPickResponse{Handled: true, AuthID: req.Candidates[0].ID}, true, nil
-	}}
-	manager.SetPluginScheduler(scheduler)
-
-	resp, errExecute := manager.Execute(context.Background(), []string{provider}, cliproxyexecutor.Request{Model: model}, cliproxyexecutor.Options{})
-	if errExecute != nil {
-		t.Fatalf("Execute() error = %v", errExecute)
-	}
-	if got := string(resp.Payload); got != secondID {
-		t.Fatalf("Execute() payload = %q, want %q", got, secondID)
-	}
-	if len(scheduler.requests) != 2 {
-		t.Fatalf("scheduler request count = %d, want 2", len(scheduler.requests))
-	}
-	assertSchedulerCandidateIDs(t, scheduler.requests[0], []string{firstID, secondID})
-	assertSchedulerCandidateIDs(t, scheduler.requests[1], []string{secondID})
 }
 
 func assertSchedulerCandidateIDs(t *testing.T, request pluginapi.SchedulerPickRequest, want []string) {
@@ -1242,39 +1223,6 @@ func TestManagerSelectAuthByKindRejectsInvalidKind(t *testing.T) {
 	var authErr *Error
 	if !errors.As(errSelect, &authErr) || authErr.Code != "invalid_auth_kind" || authErr.HTTPStatus != http.StatusBadRequest {
 		t.Fatalf("SelectAuthByKind() error = %#v, want invalid_auth_kind", errSelect)
-	}
-}
-
-func TestManagerSelectAuthByKindExcludesAgentIdentity(t *testing.T) {
-	manager := NewManager(nil, &RoundRobinSelector{}, nil)
-	manager.executors["codex"] = schedulerTestExecutor{}
-	for _, candidate := range []*Auth{
-		{
-			ID:         "codex-agent",
-			Provider:   "codex",
-			Attributes: map[string]string{AttributeAuthKind: AuthKindAgentIdentity},
-			Metadata: map[string]any{
-				"auth_kind":         AuthKindAgentIdentity,
-				"email":             "agent@example.com",
-				"refresh_token":     "stale-refresh",
-				"agent_runtime_id":  "agent-1",
-				"task_id":           "task-1",
-				"agent_private_key": "cHJpdmF0ZQ==",
-			},
-		},
-		{ID: "codex-oauth", Provider: "codex", Metadata: map[string]any{"access_token": "test-token"}},
-	} {
-		if _, errRegister := manager.Register(context.Background(), candidate); errRegister != nil {
-			t.Fatalf("Register(%s) error = %v", candidate.ID, errRegister)
-		}
-	}
-
-	selected, errSelect := manager.SelectAuthByKind(context.Background(), "codex", "", AuthKindOAuth, cliproxyexecutor.Options{})
-	if errSelect != nil {
-		t.Fatalf("SelectAuthByKind() error = %v", errSelect)
-	}
-	if selected == nil || selected.ID != "codex-oauth" {
-		t.Fatalf("SelectAuthByKind() auth = %#v, want codex-oauth", selected)
 	}
 }
 
@@ -1949,11 +1897,6 @@ func TestManager_InitializesSchedulerForBuiltInSelector(t *testing.T) {
 	manager.SetSelector(&FillFirstSelector{})
 	if manager.scheduler.strategy != schedulerStrategyFillFirst {
 		t.Fatalf("manager.scheduler.strategy = %v, want %v", manager.scheduler.strategy, schedulerStrategyFillFirst)
-	}
-
-	manager.SetSelector(&SequentialFillSelector{})
-	if manager.scheduler.strategy != schedulerStrategySequentialFill {
-		t.Fatalf("manager.scheduler.strategy after SF = %v, want %v", manager.scheduler.strategy, schedulerStrategySequentialFill)
 	}
 }
 

@@ -9,8 +9,6 @@ const (
 	RoutingStrategyWeightedRoundRobin = "weighted-round-robin"
 	// RoutingStrategyFillFirst burns the first ready credential before moving on.
 	RoutingStrategyFillFirst = "fill-first"
-	// RoutingStrategySequentialFill sticks to the current credential until it becomes unavailable.
-	RoutingStrategySequentialFill = "sequential-fill"
 )
 
 // NormalizeRoutingStrategy canonicalizes supported routing strategy names and aliases.
@@ -22,8 +20,6 @@ func NormalizeRoutingStrategy(strategy string) (string, bool) {
 		return RoutingStrategyWeightedRoundRobin, true
 	case RoutingStrategyFillFirst, "fillfirst", "ff":
 		return RoutingStrategyFillFirst, true
-	case RoutingStrategySequentialFill, "sequentialfill", "sf":
-		return RoutingStrategySequentialFill, true
 	default:
 		return "", false
 	}
@@ -41,8 +37,6 @@ func SelectorForRoutingStrategy(strategy string) Selector {
 		return &WeightedRoundRobinSelector{}
 	case RoutingStrategyFillFirst:
 		return &FillFirstSelector{}
-	case RoutingStrategySequentialFill:
-		return &SequentialFillSelector{}
 	default:
 		return &RoundRobinSelector{}
 	}

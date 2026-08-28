@@ -54,22 +54,11 @@ func (e *CodexExecutor) PrepareRequest(req *http.Request, auth *cliproxyauth.Aut
 	if req == nil {
 		return nil
 	}
-	if isAgentIdentityAuth(auth) {
-		assertion, err := generateAgentAssertion(auth)
-		if err != nil {
-			return err
-		}
-		req.Header.Set("Authorization", assertion)
-		if accountID := agentIdentityAccountID(auth); accountID != "" {
-			req.Header.Set("Chatgpt-Account-Id", accountID)
-		}
+	apiKey, _ := codexCreds(auth)
+	if strings.TrimSpace(apiKey) != "" {
+		req.Header.Set("Authorization", "Bearer "+apiKey)
 	} else {
-		apiKey, _ := codexCreds(auth)
-		if strings.TrimSpace(apiKey) != "" {
-			req.Header.Set("Authorization", "Bearer "+apiKey)
-		} else {
-			req.Header.Del("Authorization")
-		}
+		req.Header.Del("Authorization")
 	}
 	var attrs map[string]string
 	if auth != nil {
@@ -332,16 +321,7 @@ func applyCodexDirectImageHeaders(r *http.Request, auth *cliproxyauth.Auth, toke
 
 func applyCodexHeadersFromSources(r *http.Request, auth *cliproxyauth.Auth, token string, stream bool, cfg *config.Config, ginHeaders http.Header) error {
 	r.Header.Set("Content-Type", "application/json")
-	if isAgentIdentityAuth(auth) {
-		assertion, err := generateAgentAssertion(auth)
-		if err != nil {
-			return fmt.Errorf("codex executor: generate agent assertion: %w", err)
-		}
-		r.Header.Set("Authorization", assertion)
-		if accountID := agentIdentityAccountID(auth); accountID != "" {
-			r.Header.Set("Chatgpt-Account-Id", accountID)
-		}
-	} else if strings.TrimSpace(token) != "" {
+	if strings.TrimSpace(token) != "" {
 		r.Header.Set("Authorization", "Bearer "+token)
 	} else {
 		r.Header.Del("Authorization")
@@ -380,9 +360,6 @@ func applyCodexHeadersFromSources(r *http.Request, auth *cliproxyauth.Auth, toke
 			if v, ok := auth.Metadata["account_id"].(string); ok {
 				accountID = strings.TrimSpace(v)
 			}
-		}
-		if accountID == "" {
-			accountID = agentIdentityAccountID(auth)
 		}
 		if accountID != "" {
 			r.Header.Set("Chatgpt-Account-Id", accountID)

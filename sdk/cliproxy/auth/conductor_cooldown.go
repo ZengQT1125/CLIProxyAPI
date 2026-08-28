@@ -1192,16 +1192,6 @@ func (m *Manager) updateSessionAffinity(result Result, auth *Auth) {
 	if m == nil || m.selector == nil {
 		return
 	}
-	if !result.Success && auth != nil {
-		if affinity, ok := m.selector.(*SessionAffinitySelector); ok {
-			if _, sequential := affinity.fallback.(*SequentialFillSelector); sequential {
-				blocked, _, _ := isAuthBlockedForModel(auth, result.Model, time.Now())
-				if !blocked {
-					return
-				}
-			}
-		}
-	}
 	if affinity, ok := m.selector.(interface {
 		OnResult(Result)
 	}); ok && affinity != nil {

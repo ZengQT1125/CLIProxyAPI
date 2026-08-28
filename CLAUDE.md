@@ -38,7 +38,7 @@ Client → Gin HTTP Server (internal/api/server.go)
 `cmd/server/main.go` → `sdk/cliproxy/Builder` (fluent builder 模式) → `Service`
 
 Builder 注入核心组件: TokenStore、AuthManager、AccessManager、PluginHost、Hooks。
-`Build()` 根据 `routing` 配置创建对应的 Selector（RoundRobin/FillFirst/SequentialFill），
+`Build()` 根据 `routing` 配置创建对应的 Selector（RoundRobin/FillFirst/WeightedRoundRobin），
 可选包装 SessionAffinitySelector。
 
 ### Token Store 后端优先级
@@ -111,7 +111,7 @@ docker build -t cliproxyapi .
 # 测试
 go test ./...                                              # 全部测试
 go test ./sdk/cliproxy/auth/                               # 单包
-go test ./sdk/cliproxy/auth/ -run TestSequentialFill       # 匹配名称
+go test ./sdk/cliproxy/auth/ -run TestRoundRobinSelectorPick # 匹配名称
 go test ./sdk/cliproxy/auth/ -run TestNormalize/empty      # 单子测试
 go test -race ./...                                        # race 检测
 go test -count=1 ./internal/usage/                         # 禁用缓存
@@ -139,7 +139,7 @@ go test -count=1 ./internal/usage/                         # 禁用缓存
 - Token store env: 默认本地 file；`PGSTORE_*` / `GITSTORE_*` / `OBJECTSTORE_*`
 - `MANAGEMENT_STATIC_PATH`: 覆盖管理面板磁盘升级目录；默认使用 writable path 下的 `static/`，否则回退到 config 所在目录的 `static/`
 - `MANAGEMENT_PANEL_DEV_PATH`: 显式开发面板覆盖；设置后直接使用该文件并跳过自动更新
-- Routing 策略: `round-robin`（default）· `fill-first`/`ff` · `sequential-fill`/`sf`（**fork**）
+- Routing 策略: `round-robin`（default）· `fill-first`/`ff` · `weighted-round-robin`/`wrr`
 
 ## API Routes
 
@@ -204,7 +204,7 @@ Fork-only:
 - `internal/store/postgres_cooldown_store.go`（+tests）— PostgreSQL 事务型 cooldown store
 
 Modified:
-- `sdk/cliproxy/auth/selector.go`、`scheduler.go`、`conductor.go`（+tests）— `SequentialFillSelector` sticky 推进、按凭证 priority 分组、单/混合 provider 调度；SF 使用统一的 `request-retry`/`max-retry-credentials`，不得恢复 selector 级 retry override
+- `sdk/cliproxy/auth/selector.go`、`scheduler.go`、`conductor.go`（+tests）— 按凭证 priority 分组、单/混合 provider 调度；使用统一的 `request-retry`/`max-retry-credentials`，不得恢复 selector 级 retry override
 - `sdk/cliproxy/auth/cooldown_state.go`（+tests）— 文件 cooldown store、启动恢复与按 auth 增量清理
 - `sdk/cliproxy/auth/auto_refresh_loop.go`、`persist_policy.go` — 刷新失败生命周期处理；`delete-unauthorized-auth` 对终态无效凭证及 401 生效
 - `internal/runtime/executor/xai_executor.go` — 删除前执行 xAI 凭证探测，避免把瞬时刷新错误误判为终态失效

@@ -67,10 +67,6 @@ func codexCreds(a *cliproxyauth.Auth) (apiKey, baseURL string) {
 		apiKey = a.Attributes["api_key"]
 		baseURL = a.Attributes["base_url"]
 	}
-	if isAgentIdentityAuth(a) {
-		// Agent identity auths sign per-request assertions; there is no bearer credential.
-		return "", baseURL
-	}
 	if apiKey == "" && a.Metadata != nil {
 		if v, ok := a.Metadata["access_token"].(string); ok {
 			apiKey = v
