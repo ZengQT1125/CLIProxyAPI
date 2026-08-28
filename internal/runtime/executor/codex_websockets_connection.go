@@ -34,22 +34,7 @@ func (e *CodexWebsocketsExecutor) dialCodexWebsocket(ctx context.Context, auth *
 	if ctx == nil {
 		ctx = context.Background()
 	}
-	// AgentAssertion timestamps are short-lived. Always mint a fresh assertion
-	// immediately before DialContext so queued requests and reconnect dials never
-	// reuse a pre-lock / pre-retry Authorization header.
-	dialHeaders := headers
-	if isAgentIdentityAuth(auth) {
-		dialHeaders = http.Header{}
-		if headers != nil {
-			dialHeaders = headers.Clone()
-		}
-		assertion, errAssertion := generateAgentAssertion(auth)
-		if errAssertion != nil {
-			return nil, nil, nil, fmt.Errorf("codex websocket executor: generate agent assertion: %w", errAssertion)
-		}
-		dialHeaders.Set("Authorization", assertion)
-	}
-	conn, resp, err := dialer.DialContext(ctx, wsURL, dialHeaders)
+	conn, resp, err := dialer.DialContext(ctx, wsURL, headers)
 	closer := newWebsocketConnectionCloser(conn)
 	if conn != nil {
 		// Avoid gorilla/websocket flate tail validation issues on some upstreams/Go versions.

@@ -251,12 +251,10 @@ func (h *Handler) executeAPICall(ctx context.Context, body apiCallRequest) (apiC
 			if tokenErr != nil {
 				return fail(http.StatusBadRequest, "auth token refresh failed")
 			}
-			// Agent identity and base_URL-only API keys have no bearer token.
-			// Their executor injects the native scheme or omits stale auth headers.
+			// Base-URL-only API keys have no bearer token; their executor omits stale auth headers.
 			// OAuth/file credentials without a usable token must fail here so the
 			// management proxy does not forward an unauthenticated request.
-			kind := auth.AuthKind()
-			if kind == coreauth.AuthKindAgentIdentity || kind == coreauth.AuthKindAPIKey {
+			if auth.AuthKind() == coreauth.AuthKindAPIKey {
 				delete(reqHeaders, key)
 				continue
 			}

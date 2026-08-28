@@ -16,8 +16,6 @@ import (
 	"strconv"
 	"strings"
 	"time"
-
-	coreauth "github.com/router-for-me/CLIProxyAPI/v7/sdk/cliproxy/auth"
 )
 
 const (
@@ -270,9 +268,6 @@ func convertSub2APIAccount(candidate sub2APIAccountCandidate, now time.Time) (su
 	if provider == "" || authType != "oauth" {
 		return sub2APIConvertedAuth{}, fmt.Errorf("unsupported account platform/type %q/%q", platform, authType)
 	}
-	if provider == "codex" && isSub2APIAgentIdentity(record) {
-		return convertSub2APIAgentIdentityAccount(record)
-	}
 
 	accessToken := sub2APIFirstString(record,
 		[]string{"credentials", "access_token"}, []string{"credentials", "accessToken"},
@@ -450,113 +445,6 @@ func convertSub2APIAccount(candidate sub2APIAccountCandidate, now time.Time) (su
 		fingerprintIdentity = accountUUID
 	}
 	fingerprint := sha256.Sum256([]byte(accessToken + "\x00" + fingerprintIdentity))
-	return sub2APIConvertedAuth{
-		baseFilename: baseFilename,
-		payload:      append(payload, '\n'),
-		fingerprint:  fingerprint,
-	}, nil
-}
-
-func isSub2APIAgentIdentity(record map[string]any) bool {
-	authMode := strings.ToLower(sub2APIFirstString(record,
-		[]string{"credentials", "auth_mode"}, []string{"credentials", "authMode"},
-		[]string{"credential", "auth_mode"}, []string{"credential", "authMode"},
-		[]string{"auth_mode"}, []string{"authMode"},
-	))
-	switch authMode {
-	case "agentidentity", "agent_identity", "agent-identity":
-		return true
-	default:
-		return false
-	}
-}
-
-func convertSub2APIAgentIdentityAccount(record map[string]any) (sub2APIConvertedAuth, error) {
-	privateKey := sub2APIFirstString(record,
-		[]string{"credentials", "agent_private_key"}, []string{"credentials", "agentPrivateKey"},
-		[]string{"credential", "agent_private_key"}, []string{"credential", "agentPrivateKey"},
-		[]string{"agent_private_key"}, []string{"agentPrivateKey"},
-	)
-	runtimeID := sub2APIFirstString(record,
-		[]string{"credentials", "agent_runtime_id"}, []string{"credentials", "agentRuntimeId"},
-		[]string{"credential", "agent_runtime_id"}, []string{"credential", "agentRuntimeId"},
-		[]string{"agent_runtime_id"}, []string{"agentRuntimeId"},
-	)
-	taskID := sub2APIFirstString(record,
-		[]string{"credentials", "task_id"}, []string{"credentials", "taskId"},
-		[]string{"credential", "task_id"}, []string{"credential", "taskId"},
-		[]string{"task_id"}, []string{"taskId"},
-	)
-	if privateKey == "" || runtimeID == "" || taskID == "" {
-		return sub2APIConvertedAuth{}, fmt.Errorf("missing agent_private_key, agent_runtime_id, or task_id")
-	}
-
-	name := sub2APIFirstString(record, []string{"name"}, []string{"label"})
-	email := sub2APIFirstString(record,
-		[]string{"credentials", "email"}, []string{"credentials", "email_address"},
-		[]string{"credential", "email"}, []string{"credential", "email_address"},
-		[]string{"extra", "email"}, []string{"extra", "email_address"},
-		[]string{"email"}, []string{"email_address"},
-	)
-	if email == "" && strings.Contains(name, "@") {
-		email = name
-	}
-	accountID := sub2APIFirstString(record,
-		[]string{"credentials", "chatgpt_account_id"}, []string{"credentials", "account_id"}, []string{"credentials", "accountId"},
-		[]string{"credential", "chatgpt_account_id"}, []string{"credential", "account_id"}, []string{"credential", "accountId"},
-		[]string{"extra", "chatgpt_account_id"}, []string{"extra", "account_id"},
-		[]string{"chatgpt_account_id"}, []string{"account_id"}, []string{"accountId"},
-	)
-	identity := email
-	if identity == "" {
-		identity = accountID
-	}
-	if identity == "" {
-		identity = runtimeID
-	}
-	if identity == "" {
-		identity = name
-	}
-	filenameToken := sanitizeAuthFileToken(identity)
-	if filenameToken == "" {
-		return sub2APIConvertedAuth{}, fmt.Errorf("account has no usable email, account id, runtime id, or name")
-	}
-	baseFilename := "codex-" + filenameToken + ".json"
-
-	native := map[string]any{
-		"type":              "codex",
-		"auth_kind":         coreauth.AuthKindAgentIdentity,
-		"agent_private_key": privateKey,
-		"agent_runtime_id":  runtimeID,
-		"task_id":           taskID,
-		"disabled":          false,
-	}
-	setSub2APIString(native, "name", name)
-	setSub2APIString(native, "email", email)
-	setSub2APIString(native, "account_id", accountID)
-	setSub2APIString(native, "chatgpt_account_id", accountID)
-	setSub2APIString(native, "workspace_id", accountID)
-	setSub2APIString(native, "chatgpt_user_id", sub2APIFirstString(record,
-		[]string{"credentials", "chatgpt_user_id"}, []string{"credentials", "user_id"},
-		[]string{"credential", "chatgpt_user_id"}, []string{"credential", "user_id"},
-		[]string{"chatgpt_user_id"}, []string{"user_id"},
-	))
-	planType := sub2APIFirstString(record,
-		[]string{"credentials", "plan_type"}, []string{"credentials", "planType"}, []string{"credentials", "chatgpt_plan_type"},
-		[]string{"extra", "plan_type"}, []string{"extra", "chatgpt_plan_type"},
-		[]string{"plan_type"}, []string{"planType"}, []string{"chatgpt_plan_type"},
-	)
-	setSub2APIString(native, "plan_type", planType)
-	setSub2APIString(native, "chatgpt_plan_type", planType)
-	if errConfig := copySub2APIConfiguration(record, native); errConfig != nil {
-		return sub2APIConvertedAuth{baseFilename: baseFilename}, errConfig
-	}
-
-	payload, errMarshal := json.MarshalIndent(native, "", "  ")
-	if errMarshal != nil {
-		return sub2APIConvertedAuth{baseFilename: baseFilename}, fmt.Errorf("encode codex agent identity auth file: %w", errMarshal)
-	}
-	fingerprint := sha256.Sum256([]byte(privateKey + "\x00" + runtimeID + "\x00" + taskID))
 	return sub2APIConvertedAuth{
 		baseFilename: baseFilename,
 		payload:      append(payload, '\n'),

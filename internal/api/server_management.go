@@ -86,7 +86,6 @@ func (s *Server) registerManagementRoutes() {
 		mgmt.POST("/api-call", s.mgmt.APICall)
 		mgmt.POST("/custom/api-call/batch", s.mgmt.APICallBatch)
 		mgmt.POST("/custom/codex-cleanup", s.mgmt.CleanupCodexAuth)
-		mgmt.POST("/custom/codex-agent-identity/import", s.mgmt.ImportCodexAgentIdentity)
 
 		mgmt.GET("/quota-exceeded/switch-project", s.mgmt.GetSwitchProject)
 		mgmt.PUT("/quota-exceeded/switch-project", s.mgmt.PutSwitchProject)
