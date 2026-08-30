@@ -23,6 +23,13 @@ type recordingCooldownStateStore struct {
 	load       []CooldownStateSnapshot
 }
 
+func flushCooldownStateForTest(t *testing.T, manager *Manager) {
+	t.Helper()
+	if errFlush := manager.FlushCooldownStates(context.Background()); errFlush != nil {
+		t.Fatalf("FlushCooldownStates() returned error: %v", errFlush)
+	}
+}
+
 func (s *recordingCooldownStateStore) Load(context.Context) ([]CooldownStateSnapshot, error) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
@@ -46,6 +53,23 @@ func (s *recordingCooldownStateStore) recordedBatches() [][]CooldownStateSnapsho
 		batches[i] = cloneCooldownStateSnapshots(s.batches[i])
 	}
 	return batches
+}
+
+func (s *recordingCooldownStateStore) savedRecords() []CooldownStateRecord {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	snapshots := cloneCooldownStateSnapshots(s.snapshots)
+	var records []CooldownStateRecord
+	for _, snapshot := range snapshots {
+		records = append(records, snapshot.Records...)
+	}
+	return records
+}
+
+func (s *recordingCooldownStateStore) savedSnapshots() []CooldownStateSnapshot {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return cloneCooldownStateSnapshots(s.snapshots)
 }
 
 func (s *recordingCooldownStateStore) resetRecording() {

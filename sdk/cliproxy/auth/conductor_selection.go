@@ -161,110 +161,225 @@ func (m *Manager) RefreshSchedulerAll() {
 // ReconcileRegistryModelStates aligns per-model runtime state with the current
 // registry snapshot for one auth.
 //
-// Active cooldowns remain authoritative across model re-registration. Other
-// supported-model errors are reset because re-registration already cleared the
-// registry-side suspension snapshot. ModelStates for models that are no longer
-// present in the registry are pruned entirely so renamed/removed models cannot
-// keep auth-level status stale.
+// Active cooldown and quota states for supported models (including models
+// reachable via alias routes) are preserved, while stale/expired errors on
+// supported models are reset. ModelStates for models that are no longer
+// reachable either directly or via alias routes are pruned entirely so
+// renamed/removed models cannot keep auth-level status stale.
 func (m *Manager) ReconcileRegistryModelStates(ctx context.Context, authID string) {
 	if m == nil || authID == "" {
 		return
 	}
 
-	supportedModels := registry.GetGlobalRegistry().GetModelsForClient(authID)
-	supported := make(map[string]struct{}, len(supportedModels))
-	for _, model := range supportedModels {
-		if model == nil {
-			continue
-		}
-		modelKey := canonicalModelKey(model.ID)
-		if modelKey == "" {
-			continue
-		}
-		supported[modelKey] = struct{}{}
-	}
-
-	var snapshot *Auth
-	now := time.Now()
-	cooldownStateChanged := false
+	globalReg := registry.GetGlobalRegistry()
+	var (
+		snapshot             *Auth
+		supportedModels      []*registry.ModelInfo
+		regEpoch             uint64
+		now                  time.Time
+		cooldownStateChanged bool
+	)
 
 	m.mu.Lock()
 	auth, ok := m.auths[authID]
-	if ok && auth != nil && len(auth.ModelStates) > 0 {
+	if ok && auth != nil {
+		now = time.Now()
 		trackCooldownState := m.cooldownStore != nil
 		var cooldownRecordsBefore []CooldownStateRecord
 		if trackCooldownState {
 			cooldownRecordsBefore = m.cooldownStateRecordsForAuthLocked(auth, now)
 		}
-		statusBefore := auth.Status
-		statusMessageBefore := auth.StatusMessage
-		unavailableBefore := auth.Unavailable
-		nextRetryBefore := auth.NextRetryAfter
-		quotaBefore := auth.Quota
-		lastErrorBefore := cloneError(auth.LastError)
-		changed := false
-		for modelKey, state := range auth.ModelStates {
-			baseModel := canonicalModelKey(modelKey)
-			if baseModel == "" {
-				baseModel = strings.TrimSpace(modelKey)
+
+		for retry := 0; retry < 10; retry++ {
+			supportedModels, regEpoch = globalReg.GetModelsAndEpochForClient(authID)
+			candidateAuth := &Auth{
+				ID:          auth.ID,
+				Provider:    auth.Provider,
+				Attributes:  auth.Attributes,
+				ModelStates: cloneModelStates(auth.ModelStates),
 			}
-			if _, supportedModel := supported[baseModel]; !supportedModel {
-				// Drop state for models that disappeared from the current registry
-				// snapshot. Keeping them around leaks stale errors into auth-level
-				// status, management output, and websocket fallback checks.
-				delete(auth.ModelStates, modelKey)
-				changed = true
-				continue
+			candidateChanged := normalizeModelStates(candidateAuth)
+
+			// Historical alias migration:
+			// Migrate legacy alias state strictly based on registered route keys from supportedModels.
+			// Two-phase safe migration:
+			// Phase 1: Collect authoritative target keys and route-to-target mappings.
+			if len(candidateAuth.ModelStates) > 0 && len(supportedModels) > 0 {
+				authoritativeTargets := make(map[string]bool, len(supportedModels))
+				routeToTarget := make(map[string]string, len(supportedModels))
+				for _, sm := range supportedModels {
+					if sm == nil || strings.TrimSpace(sm.ID) == "" {
+						continue
+					}
+					routeID := strings.TrimSpace(sm.ID)
+					canonicalRoute := canonicalModelKey(routeID)
+					targetKey := m.selectionModelKeyForAuth(auth, routeID)
+					if targetKey == "" {
+						targetKey = canonicalRoute
+					}
+					if targetKey != "" {
+						authoritativeTargets[targetKey] = true
+					}
+					if canonicalRoute != "" {
+						routeToTarget[canonicalRoute] = targetKey
+					}
+				}
+
+				// Phase 2: For each registered routeKey, migrate legacy state to target ONLY if
+				// routeKey != target AND routeKey is not itself an authoritative target for any route.
+				for _, sm := range supportedModels {
+					if sm == nil || strings.TrimSpace(sm.ID) == "" {
+						continue
+					}
+					routeID := strings.TrimSpace(sm.ID)
+					canonicalRoute := canonicalModelKey(routeID)
+					targetKey := routeToTarget[canonicalRoute]
+					if targetKey == "" || canonicalRoute == "" {
+						continue
+					}
+					if canonicalRoute != targetKey && !authoritativeTargets[canonicalRoute] {
+						aliasKeys := []string{canonicalRoute}
+						if routeID != canonicalRoute {
+							aliasKeys = append(aliasKeys, routeID)
+						}
+						for _, aliasKey := range aliasKeys {
+							if state, hasAliasState := candidateAuth.ModelStates[aliasKey]; hasAliasState {
+								if state != nil && (!modelStateIsClean(state) || isModelStateActiveCooldown(state, now)) {
+									if existingTarget, exists := candidateAuth.ModelStates[targetKey]; exists && existingTarget != nil {
+										candidateAuth.ModelStates[targetKey] = mergeModelState(existingTarget, state)
+									} else {
+										candidateAuth.ModelStates[targetKey] = state.Clone()
+									}
+								}
+								delete(candidateAuth.ModelStates, aliasKey)
+								candidateChanged = true
+							}
+						}
+					}
+				}
 			}
-			if state == nil {
-				continue
+
+			supported := make(map[string]struct{}, len(supportedModels))
+			for _, model := range supportedModels {
+				if model == nil || strings.TrimSpace(model.ID) == "" {
+					continue
+				}
+				stateKey := m.selectionModelKeyForAuth(auth, model.ID)
+				if stateKey == "" {
+					stateKey = canonicalModelKey(model.ID)
+				}
+				if stateKey != "" {
+					supported[stateKey] = struct{}{}
+				}
 			}
-			if modelStateIsClean(state) {
-				continue
+
+			for modelKey, state := range candidateAuth.ModelStates {
+				baseModel := canonicalModelKey(modelKey)
+				if baseModel == "" {
+					baseModel = strings.TrimSpace(modelKey)
+				}
+				if _, isSupported := supported[baseModel]; !isSupported {
+					// Drop state for models that disappeared from the current registry
+					// snapshot and are not reachable via any alias route.
+					delete(candidateAuth.ModelStates, modelKey)
+					candidateChanged = true
+					continue
+				}
+				if state == nil {
+					continue
+				}
+				if modelStateIsClean(state) {
+					continue
+				}
+				if isModelStateActiveCooldown(state, now) {
+					continue
+				}
+				clonedState := state.Clone()
+				resetModelState(clonedState, now)
+				candidateAuth.ModelStates[modelKey] = clonedState
+				candidateChanged = true
 			}
-			if modelStateHasActiveCooldown(state, now) {
-				continue
+			if len(candidateAuth.ModelStates) == 0 {
+				candidateAuth.ModelStates = nil
 			}
-			resetModelState(state, now)
-			changed = true
-		}
-		if len(auth.ModelStates) == 0 {
-			auth.ModelStates = nil
-		}
-		updateAggregatedAvailability(auth, now)
-		if auth.Status != statusBefore ||
-			auth.StatusMessage != statusMessageBefore ||
-			auth.Unavailable != unavailableBefore ||
-			!auth.NextRetryAfter.Equal(nextRetryBefore) ||
-			!cooldownQuotaEqual(auth.Quota, quotaBefore) ||
-			!cooldownErrorEqual(auth.LastError, lastErrorBefore) {
-			changed = true
-		}
-		if changed {
-			if !hasModelError(auth, now) {
-				auth.LastError = nil
-				auth.StatusMessage = ""
-				auth.Status = StatusActive
-			}
-			auth.UpdatedAt = now
-			if errPersist := m.persist(ctx, auth); errPersist != nil {
-				logEntryWithRequestID(ctx).WithField("auth_id", auth.ID).Warnf("failed to persist auth changes during model state reconciliation: %v", errPersist)
-			}
-			snapshot = auth.Clone()
-			if trackCooldownState {
-				cooldownRecordsAfter := m.cooldownStateRecordsForAuthLocked(auth, now)
-				cooldownStateChanged = !cooldownStateRecordsEqual(cooldownRecordsBefore, cooldownRecordsAfter)
+
+			if globalReg.ClientRegistrationEpoch(authID) == regEpoch {
+				auth.ModelStates = candidateAuth.ModelStates
+				statusBefore := auth.Status
+				statusMessageBefore := auth.StatusMessage
+				unavailableBefore := auth.Unavailable
+				nextRetryBefore := auth.NextRetryAfter
+				quotaBefore := auth.Quota
+				lastErrorBefore := cloneError(auth.LastError)
+				// Recompute credential-level availability even when model states
+				// themselves did not change. Registry re-registration can add a
+				// healthy model and thereby clear stale auth-level cooldown fields.
+				updateAggregatedAvailability(auth, now)
+				if auth.Status != statusBefore ||
+					auth.StatusMessage != statusMessageBefore ||
+					auth.Unavailable != unavailableBefore ||
+					!auth.NextRetryAfter.Equal(nextRetryBefore) ||
+					!cooldownQuotaEqual(auth.Quota, quotaBefore) ||
+					!cooldownErrorEqual(auth.LastError, lastErrorBefore) {
+					candidateChanged = true
+				}
+				if candidateChanged {
+					if !hasModelError(auth, now) {
+						auth.LastError = nil
+						auth.StatusMessage = ""
+						auth.Status = StatusActive
+					}
+					auth.Generation++
+					auth.UpdatedAt = now
+					if errPersist := m.persist(context.Background(), auth); errPersist != nil {
+						logEntryWithRequestID(ctx).WithField("auth_id", auth.ID).Warnf("failed to persist auth changes during model state reconciliation: %v", errPersist)
+					}
+				}
+				if trackCooldownState {
+					cooldownRecordsAfter := m.cooldownStateRecordsForAuthLocked(auth, now)
+					cooldownStateChanged = candidateChanged || !cooldownStateRecordsEqual(cooldownRecordsBefore, cooldownRecordsAfter)
+				}
+				snapshot = auth.Clone()
+				break
 			}
 		}
 	}
 	m.mu.Unlock()
 
-	if m.scheduler != nil && snapshot != nil {
+	if snapshot == nil {
+		return
+	}
+
+	projections := make([]registry.ClientModelProjection, 0, len(supportedModels))
+	for _, sm := range supportedModels {
+		if sm == nil || strings.TrimSpace(sm.ID) == "" {
+			continue
+		}
+		projections = append(projections, m.clientModelProjectionForAuth(snapshot, sm.ID, now))
+	}
+	globalReg.ApplyClientModelProjections(authID, regEpoch, snapshot.Generation, projections)
+
+	if m.scheduler != nil {
 		m.scheduler.upsertAuth(snapshot)
 	}
 	if snapshot != nil && cooldownStateChanged {
 		m.queueCooldownStatePersist(authID)
 	}
+}
+
+func cloneModelStates(states map[string]*ModelState) map[string]*ModelState {
+	if len(states) == 0 {
+		return nil
+	}
+	cloned := make(map[string]*ModelState, len(states))
+	for k, v := range states {
+		if v != nil {
+			cloned[k] = v.Clone()
+		} else {
+			cloned[k] = nil
+		}
+	}
+	return cloned
 }
 
 func isSameSelector(a, b Selector) bool {
