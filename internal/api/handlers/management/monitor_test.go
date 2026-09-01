@@ -105,12 +105,12 @@ func TestGetMonitorRequestLogsIncludesRequestModes(t *testing.T) {
 	fastRecord := testUsageRecord(now, "api-1", "gpt-5.6", "source-1", false)
 	fastRecord.Provider = "codex"
 	fastRecord.ServiceTier = "priority"
-	fastRecord.Stream = &stream
+	fastRecord.Stream = stream
 	nonStream := false
 	standardRecord := testUsageRecord(now.Add(-time.Second), "api-1", "gpt-5.6", "source-1", false)
 	standardRecord.Provider = "codex"
 	standardRecord.ServiceTier = "default"
-	standardRecord.Stream = &nonStream
+	standardRecord.Stream = nonStream
 	h := newMonitorTestHandler(fastRecord, standardRecord)
 
 	rr := executeMonitorRequest(h.GetMonitorRequestLogs, "/monitor/request-logs")

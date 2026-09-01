@@ -298,6 +298,10 @@ func (p *DatabasePlugin) HandleUsage(ctx context.Context, record coreusage.Recor
 	}
 
 	method, path := ginMethodPath(ctx)
+	stream := record.Stream
+	if !stream {
+		stream = coreusage.StreamFromContext(ctx)
+	}
 
 	dbRecord := UsageRecord{
 		APIKey:           record.APIKey,
@@ -314,7 +318,7 @@ func (p *DatabasePlugin) HandleUsage(ctx context.Context, record coreusage.Recor
 		TotalTokens:      record.Detail.TotalTokens,
 		LatencyMs:        normaliseLatency(record.Latency),
 		TTFTMs:           normaliseLatency(record.TTFT),
-		Stream:           record.Stream,
+		Stream:           boolPointer(stream),
 		Fast:             boolPointer(coreusage.IsFastMode(record.Provider, record.ServiceTier)),
 		Method:           method,
 		Path:             path,
