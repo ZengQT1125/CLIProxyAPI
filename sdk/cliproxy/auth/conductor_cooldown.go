@@ -1183,15 +1183,16 @@ func (m *Manager) MarkResult(ctx context.Context, result Result) {
 		unlockLifecycle()
 		m.hook.OnResult(ctx, result)
 		m.publishErrorEvent(result, authSnapshot)
-		m.updateSessionAffinity(result, authSnapshot)
+		m.updateSessionAffinity(result)
 	}
 }
 
-func (m *Manager) updateSessionAffinity(result Result, auth *Auth) {
-	if m == nil || m.selector == nil {
+func (m *Manager) updateSessionAffinity(result Result) {
+	if m == nil {
 		return
 	}
-	if affinity, ok := m.selector.(interface {
+	sel := m.Selector()
+	if affinity, ok := sel.(interface {
 		OnResult(Result)
 	}); ok && affinity != nil {
 		affinity.OnResult(result)

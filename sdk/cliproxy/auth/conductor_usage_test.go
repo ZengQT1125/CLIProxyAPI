@@ -18,7 +18,8 @@ type usageModeExecutor struct {
 func (e *usageModeExecutor) Identifier() string { return "usage-mode" }
 
 func (e *usageModeExecutor) capture(ctx context.Context) {
-	e.mode, e.known = coreusage.StreamFromContext(ctx)
+	e.mode = coreusage.StreamFromContext(ctx)
+	e.known = true
 }
 
 func (e *usageModeExecutor) Execute(ctx context.Context, _ *Auth, _ cliproxyexecutor.Request, _ cliproxyexecutor.Options) (cliproxyexecutor.Response, error) {
@@ -41,6 +42,20 @@ func (e *usageModeExecutor) CountTokens(context.Context, *Auth, cliproxyexecutor
 
 func (e *usageModeExecutor) HttpRequest(context.Context, *Auth, *http.Request) (*http.Response, error) {
 	return nil, nil
+}
+
+func TestContextWithRequestedModelAliasIncludesStream(t *testing.T) {
+	for _, stream := range []bool{false, true} {
+		t.Run(map[bool]string{false: "stream_false", true: "stream_true"}[stream], func(t *testing.T) {
+			ctx := contextWithRequestedModelAlias(context.Background(), cliproxyexecutor.Options{
+				Stream: stream,
+			}, "fallback-model")
+
+			if got := coreusage.StreamFromContext(ctx); got != stream {
+				t.Fatalf("stream = %v, want %v", got, stream)
+			}
+		})
+	}
 }
 
 func TestContextWithRequestedModelAliasIncludesReasoningEffort(t *testing.T) {

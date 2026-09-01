@@ -43,13 +43,12 @@ type Record struct {
 	RequestServiceTier string
 	// ResponseServiceTier stores the final tier reported by the upstream response.
 	ResponseServiceTier string
-	// Stream stores whether the request used the streaming execution path.
-	// Nil means the caller did not provide an authoritative request mode.
-	Stream *bool
 	// Generate reports whether the client requested actual generation.
 	// nil or true means generation is enabled; only an explicit false disables generation.
 	// Use GenerateFlag to set the value and GenerateEnabled to read it with the default.
-	Generate    *bool
+	Generate *bool
+	// Stream reports whether the request was executed in streaming mode.
+	Stream      bool
 	RequestedAt time.Time
 	Latency     time.Duration
 	TTFT        time.Duration
@@ -177,23 +176,6 @@ func ServiceTierFromContext(ctx context.Context) string {
 	}
 }
 
-// WithStream stores the authoritative execution mode for usage sinks.
-func WithStream(ctx context.Context, stream bool) context.Context {
-	if ctx == nil {
-		ctx = context.Background()
-	}
-	return context.WithValue(ctx, streamContextKey{}, stream)
-}
-
-// StreamFromContext returns the execution mode and whether it was explicitly set.
-func StreamFromContext(ctx context.Context) (bool, bool) {
-	if ctx == nil {
-		return false, false
-	}
-	stream, ok := ctx.Value(streamContextKey{}).(bool)
-	return stream, ok
-}
-
 // IsFastMode reports whether a request uses Codex Priority processing.
 func IsFastMode(provider, serviceTier string) bool {
 	return strings.EqualFold(strings.TrimSpace(provider), "codex") &&
@@ -221,6 +203,29 @@ func GenerateFromContext(ctx context.Context) bool {
 		return value
 	default:
 		return true
+	}
+}
+
+// WithStream stores whether the request was executed in streaming mode for usage sinks.
+func WithStream(ctx context.Context, stream bool) context.Context {
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	return context.WithValue(ctx, streamContextKey{}, stream)
+}
+
+// StreamFromContext returns whether the request was executed in streaming mode.
+// Missing values default to false.
+func StreamFromContext(ctx context.Context) bool {
+	if ctx == nil {
+		return false
+	}
+	raw := ctx.Value(streamContextKey{})
+	switch value := raw.(type) {
+	case bool:
+		return value
+	default:
+		return false
 	}
 }
 

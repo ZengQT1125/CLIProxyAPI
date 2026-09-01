@@ -186,6 +186,10 @@ func (s *RequestStatistics) Record(ctx context.Context, record coreusage.Record)
 	if !failed {
 		failed = !resolveSuccess(ctx)
 	}
+	stream := record.Stream
+	if !stream {
+		stream = coreusage.StreamFromContext(ctx)
+	}
 	success := !failed
 	modelName := record.Model
 	if modelName == "" {
@@ -214,7 +218,7 @@ func (s *RequestStatistics) Record(ctx context.Context, record coreusage.Record)
 		Timestamp: timestamp,
 		LatencyMs: normaliseLatency(record.Latency),
 		TTFTMs:    normaliseLatency(record.TTFT),
-		Stream:    record.Stream,
+		Stream:    boolPointer(stream),
 		Fast:      boolPointer(coreusage.IsFastMode(record.Provider, record.ServiceTier)),
 		Source:    record.Source,
 		AuthIndex: record.AuthIndex,

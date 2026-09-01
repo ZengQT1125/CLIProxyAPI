@@ -5,6 +5,7 @@ import (
 	cryptotls "crypto/tls"
 	"errors"
 	"fmt"
+	"io"
 	"net"
 	"net/http"
 	"strings"
@@ -34,6 +35,9 @@ const (
 	defaultUtlsHTTP11MaxIdleConnsPerHost = 64
 	defaultUtlsHTTP11MaxConnsPerHost     = 128
 	defaultUtlsHTTP11IdleConnTimeout     = 90 * time.Second
+	// Go 1.27's net/http HTTP/2 adapter reports this initial limit until the
+	// peer's SETTINGS frame is observed.
+	initialUtlsH2MaxConcurrentStreams = 100
 )
 
 // utlsH2HostPool holds the live HTTP/2 client conns for a single host.
@@ -41,6 +45,7 @@ type utlsH2HostPool struct {
 	conns   []*http2.ClientConn
 	dialing int
 	cond    *sync.Cond
+	active  map[*http2.ClientConn]int
 }
 
 // utlsRoundTripper implements http.RoundTripper using a Chrome fingerprint for
@@ -82,6 +87,7 @@ func (t *utlsRoundTripper) hostPool(host string) *utlsH2HostPool {
 	}
 	pool = &utlsH2HostPool{}
 	pool.cond = sync.NewCond(&t.mu)
+	pool.active = make(map[*http2.ClientConn]int)
 	t.pools[host] = pool
 	return pool
 }
@@ -126,6 +132,20 @@ func (t *utlsRoundTripper) pickReadyConn(pool *utlsH2HostPool) *http2.ClientConn
 		conn := pool.conns[i]
 		state := conn.State()
 		load := utlsH2ConnLoad(state)
+		if localLoad := pool.active[conn]; localLoad > load {
+			// ClientConn state updates are asynchronous in Go 1.27. Do not
+			// reuse a connection while a locally-tracked request is not visible
+			// in that snapshot yet.
+			i++
+			continue
+		}
+		if pool.active[conn] > 0 && state.MaxConcurrentStreams == initialUtlsH2MaxConcurrentStreams && state.StreamsActive > 0 && state.StreamsReserved == 0 {
+			// The adapter may still be reporting its optimistic initial limit.
+			// Open another pooled connection rather than risking a peer-side
+			// REFUSED_STREAM before SETTINGS has propagated locally.
+			i++
+			continue
+		}
 		if state.MaxConcurrentStreams == 0 && load > 0 {
 			i++
 			continue
@@ -144,29 +164,72 @@ func (t *utlsRoundTripper) pickReadyConn(pool *utlsH2HostPool) *http2.ClientConn
 
 // pickAnyOpenConn reserves the least-loaded open conn. Client connections use
 // StrictMaxConcurrentStreams, so RoundTrip waits for a stream slot when the pool
-// is at capacity instead of failing or opening unbounded connections.
-func (t *utlsRoundTripper) pickAnyOpenConn(pool *utlsH2HostPool) *http2.ClientConn {
-	for {
-		t.pruneClosedConns(pool)
-		if len(pool.conns) == 0 {
-			return nil
+// is at capacity instead of failing or opening unbounded connections. A busy
+// connection whose peer SETTINGS have not arrived yet is excluded: its local
+// stream limit is still effectively infinite, while the peer may already reject
+// requests above its advertised limit.
+func (t *utlsRoundTripper) pickAnyOpenConn(pool *utlsH2HostPool) (*http2.ClientConn, bool) {
+	t.pruneClosedConns(pool)
+	bestIndex := -1
+	bestLoad := 0
+	for i, conn := range pool.conns {
+		state := conn.State()
+		load := utlsH2ConnLoad(state)
+		if localLoad := pool.active[conn]; localLoad > load {
+			load = localLoad
 		}
-
-		bestIndex := 0
-		bestLoad := utlsH2ConnLoad(pool.conns[0].State())
-		for i, conn := range pool.conns[1:] {
-			load := utlsH2ConnLoad(conn.State())
-			if load < bestLoad {
-				bestIndex = i + 1
-				bestLoad = load
-			}
+		if state.MaxConcurrentStreams == 0 && load > 0 {
+			continue
 		}
-		best := pool.conns[bestIndex]
-		if best.ReserveNewRequest() {
-			return best
+		if bestIndex < 0 || load < bestLoad {
+			bestIndex = i
+			bestLoad = load
 		}
-		pool.conns = append(pool.conns[:bestIndex], pool.conns[bestIndex+1:]...)
 	}
+	if bestIndex < 0 {
+		return nil, false
+	}
+	best := pool.conns[bestIndex]
+	if best.ReserveNewRequest() {
+		return best, true
+	}
+	// The Go 1.27 HTTP/2 adapter rejects reservations at the peer's stream
+	// limit, but its RoundTrip method still queues the request correctly. Keep
+	// a live saturated connection in that case and let RoundTrip do the wait.
+	state := best.State()
+	if !state.Closed && !state.Closing {
+		return best, false
+	}
+	pool.conns = append(pool.conns[:bestIndex], pool.conns[bestIndex+1:]...)
+	return nil, false
+}
+
+func (t *utlsRoundTripper) trackConnRequest(pool *utlsH2HostPool, conn *http2.ClientConn) {
+	if pool == nil || conn == nil {
+		return
+	}
+	if pool.active == nil {
+		pool.active = make(map[*http2.ClientConn]int)
+	}
+	pool.active[conn]++
+}
+
+func (t *utlsRoundTripper) releaseConnRequest(host string, conn *http2.ClientConn) {
+	if t == nil || conn == nil {
+		return
+	}
+	t.mu.Lock()
+	defer t.mu.Unlock()
+	pool := t.pools[host]
+	if pool == nil || pool.active == nil {
+		return
+	}
+	if count := pool.active[conn]; count > 1 {
+		pool.active[conn] = count - 1
+	} else {
+		delete(pool.active, conn)
+	}
+	pool.cond.Broadcast()
 }
 
 func (t *utlsRoundTripper) removeConnIfUnusable(host string, target *http2.ClientConn) {
@@ -195,23 +258,31 @@ func (t *utlsRoundTripper) removeConnIfUnusable(host string, target *http2.Clien
 }
 
 // waitForPoolChange waits on pool.cond while still allowing request cancellation.
+// HTTP/2 SETTINGS updates are internal to ClientConn and do not broadcast this
+// condition, so a short timer also wakes the caller to re-check connection state.
 // The caller must hold t.mu. context.AfterFunc broadcasts under the same lock, so
 // cancellation cannot race between checking the context and entering Cond.Wait.
 func (t *utlsRoundTripper) waitForPoolChange(ctx context.Context, pool *utlsH2HostPool) error {
 	if ctx == nil {
 		ctx = context.Background()
 	}
+	statePoll := time.AfterFunc(10*time.Millisecond, func() {
+		t.mu.Lock()
+		pool.cond.Broadcast()
+		t.mu.Unlock()
+	})
 	stopBroadcast := context.AfterFunc(ctx, func() {
 		t.mu.Lock()
 		pool.cond.Broadcast()
 		t.mu.Unlock()
 	})
 	pool.cond.Wait()
+	statePoll.Stop()
 	stopBroadcast()
 	return ctx.Err()
 }
 
-func (t *utlsRoundTripper) getOrCreateConnection(ctx context.Context, host, addr string) (*http2.ClientConn, error) {
+func (t *utlsRoundTripper) getOrCreateConnection(ctx context.Context, host, addr string) (*http2.ClientConn, bool, error) {
 	if ctx == nil {
 		ctx = context.Background()
 	}
@@ -222,11 +293,12 @@ func (t *utlsRoundTripper) getOrCreateConnection(ctx context.Context, host, addr
 
 	for {
 		if errCtx := ctx.Err(); errCtx != nil {
-			return nil, errCtx
+			return nil, false, errCtx
 		}
 		pool := t.hostPool(host)
 		if conn := t.pickReadyConn(pool); conn != nil {
-			return conn, nil
+			t.trackConnRequest(pool, conn)
+			return conn, true, nil
 		}
 
 		if len(pool.conns)+pool.dialing < maxConns {
@@ -238,46 +310,86 @@ func (t *utlsRoundTripper) getOrCreateConnection(ctx context.Context, host, addr
 			if err != nil {
 				pool.cond.Broadcast()
 				if ready := t.pickReadyConn(pool); ready != nil {
-					return ready, nil
+					t.trackConnRequest(pool, ready)
+					return ready, true, nil
 				}
-				if open := t.pickAnyOpenConn(pool); open != nil {
-					return open, nil
+				if open, reserved := t.pickAnyOpenConn(pool); open != nil {
+					t.trackConnRequest(pool, open)
+					return open, reserved, nil
 				}
 				if pool.dialing > 0 {
 					if errWait := t.waitForPoolChange(ctx, pool); errWait != nil {
-						return nil, errWait
+						return nil, false, errWait
 					}
 					continue
 				}
-				return nil, err
+				return nil, false, err
 			}
 			if errCtx := ctx.Err(); errCtx != nil {
 				_ = conn.Close()
 				pool.cond.Broadcast()
-				return nil, errCtx
+				return nil, false, errCtx
 			}
-			if !conn.ReserveNewRequest() {
-				_ = conn.Close()
-				pool.cond.Broadcast()
-				return nil, fmt.Errorf("utls HTTP/2: new connection unavailable for host %s", host)
+			reserved := conn.ReserveNewRequest()
+			if !reserved {
+				// A just-created connection may not have received peer SETTINGS yet,
+				// so the Go 1.27 adapter can temporarily reject Reserve even though
+				// RoundTrip can use the live connection. Keep it pooled and let the
+				// request path wait for a real stream slot.
+				state := conn.State()
+				if state.Closed || state.Closing {
+					_ = conn.Close()
+					pool.cond.Broadcast()
+					return nil, false, fmt.Errorf("utls HTTP/2: new connection unavailable for host %s", host)
+				}
 			}
 			pool.conns = append(pool.conns, conn)
+			t.trackConnRequest(pool, conn)
 			pool.cond.Broadcast()
-			return conn, nil
+			return conn, reserved, nil
 		}
 
 		// At capacity, reuse an open conn first. Strict HTTP/2 flow control waits
 		// there with the request context instead of blocking on an unrelated dial.
-		if conn := t.pickAnyOpenConn(pool); conn != nil {
-			return conn, nil
+		if conn, reserved := t.pickAnyOpenConn(pool); conn != nil {
+			t.trackConnRequest(pool, conn)
+			return conn, reserved, nil
 		}
-		if pool.dialing > 0 {
+		if pool.dialing > 0 || len(pool.conns) > 0 {
 			if errWait := t.waitForPoolChange(ctx, pool); errWait != nil {
-				return nil, errWait
+				return nil, false, errWait
 			}
 			continue
 		}
-		return nil, fmt.Errorf("utls HTTP/2: no connection available for host %s", host)
+		return nil, false, fmt.Errorf("utls HTTP/2: no connection available for host %s", host)
+	}
+}
+
+// waitForConnSlot waits for an unreserved connection selected at the pool's
+// stream limit. This is needed with Go 1.27's net/http-backed HTTP/2 adapter:
+// its RoundTrip does not reliably queue a request after Reserve rejects it.
+func (t *utlsRoundTripper) waitForConnSlot(ctx context.Context, conn *http2.ClientConn) error {
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	for {
+		state := conn.State()
+		if state.Closed || state.Closing {
+			return fmt.Errorf("utls HTTP/2: connection closed while waiting for a stream slot")
+		}
+		load := utlsH2ConnLoad(state)
+		if load == 0 || (state.MaxConcurrentStreams != 0 && uint64(load) < uint64(state.MaxConcurrentStreams)) {
+			return nil
+		}
+		timer := time.NewTimer(10 * time.Millisecond)
+		select {
+		case <-timer.C:
+		case <-ctx.Done():
+			if !timer.Stop() {
+				<-timer.C
+			}
+			return ctx.Err()
+		}
 	}
 }
 
@@ -347,24 +459,89 @@ func (t *utlsRoundTripper) RoundTrip(req *http.Request) (*http.Response, error) 
 	}
 	addr := net.JoinHostPort(hostname, port)
 
-	h2Conn, err := t.getOrCreateConnection(req.Context(), hostname, addr)
+	h2Conn, reserved, err := t.getOrCreateConnection(req.Context(), hostname, addr)
 	if err != nil {
 		return nil, err
 	}
-
-	resp, err := h2Conn.RoundTrip(req)
+	if !reserved {
+		if errWait := t.waitForConnSlot(req.Context(), h2Conn); errWait != nil {
+			t.releaseConnRequest(hostname, h2Conn)
+			t.removeConnIfUnusable(hostname, h2Conn)
+			return nil, errWait
+		}
+	}
+	var resp *http.Response
+	for retry := 0; ; retry++ {
+		resp, err = h2Conn.RoundTrip(req)
+		if err == nil {
+			break
+		}
+		var streamErr http2.StreamError
+		if retry > 0 || !errors.As(err, &streamErr) || streamErr.Code != http2.ErrCodeRefusedStream {
+			break
+		}
+		retryReq, ok := cloneRequestForRetry(req)
+		if !ok {
+			break
+		}
+		if errWait := t.waitForConnSlot(req.Context(), h2Conn); errWait != nil {
+			err = errWait
+			break
+		}
+		req = retryReq
+	}
 	if err != nil {
+		t.releaseConnRequest(hostname, h2Conn)
 		t.removeConnIfUnusable(hostname, h2Conn)
 		return nil, err
 	}
 	if resp == nil {
+		t.releaseConnRequest(hostname, h2Conn)
 		t.removeConnIfUnusable(hostname, h2Conn)
 		return nil, fmt.Errorf("utls: upstream returned an empty response")
 	}
 	if resp.Body == nil {
 		resp.Body = http.NoBody
+		t.releaseConnRequest(hostname, h2Conn)
+	} else if resp.Body == http.NoBody {
+		t.releaseConnRequest(hostname, h2Conn)
+	} else {
+		resp.Body = &utlsTrackedResponseBody{
+			ReadCloser: resp.Body,
+			release: func() {
+				t.releaseConnRequest(hostname, h2Conn)
+			},
+		}
 	}
 	return resp, nil
+}
+
+type utlsTrackedResponseBody struct {
+	io.ReadCloser
+	release func()
+	once    sync.Once
+}
+
+func (b *utlsTrackedResponseBody) Close() error {
+	err := b.ReadCloser.Close()
+	b.once.Do(b.release)
+	return err
+}
+
+func cloneRequestForRetry(req *http.Request) (*http.Request, bool) {
+	if req.Body == nil || req.Body == http.NoBody {
+		return req, true
+	}
+	if req.GetBody == nil {
+		return nil, false
+	}
+	body, err := req.GetBody()
+	if err != nil {
+		return nil, false
+	}
+	clone := req.Clone(req.Context())
+	clone.Body = body
+	return clone, true
 }
 
 type utlsHTTP11RoundTripper struct {
