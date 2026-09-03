@@ -1657,7 +1657,7 @@ func updateAggregatedAvailability(auth *Auth, now time.Time) {
 			auth.LastError = nil
 		}
 	}
-	if allUnavailable && quotaExceeded {
+	if quotaExceeded {
 		auth.Quota.Exceeded = true
 		auth.Quota.Reason = "quota"
 		if auth.Quota.NextRecoverAt.After(quotaRecover) {
