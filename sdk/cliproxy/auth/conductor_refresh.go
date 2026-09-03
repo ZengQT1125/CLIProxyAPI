@@ -32,6 +32,7 @@ const (
 	refreshIneffectiveBackoff = 30 * time.Second
 	quotaBackoffBase          = time.Second
 	quotaBackoffMax           = 30 * time.Minute
+	minQuotaCooldownFloor     = 10 * time.Second
 	transientErrorCooldown    = time.Minute
 )
 
@@ -120,7 +121,7 @@ func (m *Manager) shouldRefresh(a *Auth, now time.Time) bool {
 		if hasUnauthorizedAuthFailure(a) {
 			return false
 		}
-	} else if hasTerminalRefreshAuthFailure(a) {
+	} else if hasTerminalRefreshAuthFailure(a) && !a.HasValidAccessToken(now) {
 		return false
 	}
 	if !a.NextRefreshAfter.IsZero() && now.Before(a.NextRefreshAfter) {
@@ -506,7 +507,11 @@ func (m *Manager) refreshAuthForRequest(ctx context.Context, id, failedAccessTok
 		if useUpstreamXAI {
 			terminal = isUpstreamUnauthorizedError(err)
 		}
-		deleteTerminal := terminal && deleteUnauthorizedAuth.Load() && !useUpstreamXAI
+		// A refresh failure must not disable or delete a credential while its
+		// current access token is still valid. The request path can continue to
+		// use that token, and any existing cooldown/unavailable state belongs to
+		// the credential rather than the failed refresh attempt.
+		deleteTerminal := terminal && !auth.HasValidAccessToken(now) && deleteUnauthorizedAuth.Load() && !useUpstreamXAI
 		var unlockLifecycle func()
 		if deleteTerminal {
 			unlockLifecycle = m.lockAuthLifecycle(id)
@@ -532,7 +537,9 @@ func (m *Manager) refreshAuthForRequest(ctx context.Context, id, failedAccessTok
 				delete(m.auths, id)
 				shouldDelete = true
 			} else {
-				if terminal {
+				hasValidAccessToken := current.HasValidAccessToken(now)
+				switch {
+				case terminal && !hasValidAccessToken:
 					current.NextRefreshAfter = time.Time{}
 					current.Unavailable = true
 					current.Status = StatusError
@@ -543,8 +550,32 @@ func (m *Manager) refreshAuthForRequest(ctx context.Context, id, failedAccessTok
 						current.StatusMessage = current.LastError.Code
 						shouldUnschedule = true
 					}
-				} else {
+				case useUpstreamXAI:
+					// XAI's OAuth lifecycle keeps non-401 refresh failures on the
+					// schedule, even when the previous token has expired.
 					current.NextRefreshAfter = now.Add(refreshFailureBackoff)
+					shouldReschedule = true
+				case !hasValidAccessToken:
+					current.Unavailable = true
+					current.Status = StatusError
+					if isUnauthorizedError(err) {
+						current.NextRefreshAfter = time.Time{}
+						current.StatusMessage = "unauthorized"
+					} else {
+						current.NextRefreshAfter = now.Add(refreshFailureBackoff)
+						current.StatusMessage = "token expired"
+					}
+					shouldReschedule = true
+				default:
+					// Keep a still-valid access token active after a transient refresh failure.
+					nextRetry := now.Add(refreshFailureBackoff)
+					if exp, ok := current.AccessTokenExpirationTime(); ok && !exp.IsZero() && nextRetry.After(exp) {
+						nextRetry = exp
+					}
+					current.NextRefreshAfter = nextRetry
+					if !current.Unavailable {
+						log.Warnf("credential refresh failed for %s (%s): %s; retaining active credential as access token is unexpired", current.Provider, current.ID, safeErrorDiagnosticForLog(err))
+					}
 					shouldReschedule = true
 				}
 				m.auths[id] = current
