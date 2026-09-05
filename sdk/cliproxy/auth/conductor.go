@@ -177,6 +177,8 @@ type Manager struct {
 	// authLifecycleLocks serialize registration, updates, and terminal deletion
 	// for the same auth ID without holding m.mu during store operations.
 	authLifecycleLocks sync.Map
+	// persistLocks serializes disk persistence per auth ID and guards against out-of-order writes.
+	persistLocks sync.Map
 }
 
 // NewManager constructs a manager with optional custom selector and hook.

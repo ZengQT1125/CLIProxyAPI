@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"net/http"
 	"strconv"
 	"strings"
@@ -477,8 +478,8 @@ func (m *Manager) refreshAuthForRequest(ctx context.Context, id, failedAccessTok
 		}
 	}
 
-	cloned := auth.Clone()
-	updated, err := exec.Refresh(ctx, cloned)
+	base := auth.Clone()
+	updated, err := exec.Refresh(ctx, base.Clone())
 	if err == nil && !useUpstreamXAI {
 		// A refresh that hands back no access token is not a success. Accepting it
 		// would overwrite a credential that still works with an empty string, then
@@ -486,9 +487,9 @@ func (m *Manager) refreshAuthForRequest(ctx context.Context, id, failedAccessTok
 		// let the normal failure path schedule a retry.
 		refreshed := updated
 		if refreshed == nil {
-			refreshed = cloned
+			refreshed = base
 		}
-		if authAccessToken(auth) != "" && authAccessToken(refreshed) == "" {
+		if authAccessToken(base) != "" && authAccessToken(refreshed) == "" {
 			err = &Error{
 				Code:      "refresh_missing_access_token",
 				Message:   "refresh returned no access token; keeping the previous credential",
@@ -523,7 +524,11 @@ func (m *Manager) refreshAuthForRequest(ctx context.Context, id, failedAccessTok
 		deleteAuthIndex := ""
 		var deleteStore Store
 		m.mu.Lock()
-		if current := m.auths[id]; current == auth {
+		if current := m.auths[id]; current != nil {
+			if base != nil && current.RegistrationEpoch != base.RegistrationEpoch {
+				m.mu.Unlock()
+				return nil, err
+			}
 			current.Generation++
 			current.UpdatedAt = now
 			if useUpstreamXAI {
@@ -531,7 +536,7 @@ func (m *Manager) refreshAuthForRequest(ctx context.Context, id, failedAccessTok
 			} else {
 				current.LastError = refreshErrorFromError(err)
 			}
-			if deleteTerminal {
+			if deleteTerminal && !current.HasValidAccessToken(now) {
 				deleteStore = m.store
 				deleteAuthIndex = current.EnsureIndex()
 				delete(m.auths, id)
@@ -595,7 +600,7 @@ func (m *Manager) refreshAuthForRequest(ctx context.Context, id, failedAccessTok
 		return nil, err
 	}
 	if updated == nil {
-		updated = cloned
+		updated = base.Clone()
 	}
 	// Preserve runtime created by the executor during Refresh.
 	// If executor didn't set one, fall back to the previous runtime.
@@ -607,7 +612,7 @@ func (m *Manager) refreshAuthForRequest(ctx context.Context, id, failedAccessTok
 	updated.LastError = nil
 	updated.StatusMessage = ""
 	updated.Unavailable = false
-	if updated.Status == StatusError {
+	if updated.Status == StatusError || updated.Status == "" {
 		updated.Status = StatusActive
 	}
 	updated.UpdatedAt = now
@@ -615,11 +620,15 @@ func (m *Manager) refreshAuthForRequest(ctx context.Context, id, failedAccessTok
 	if m.shouldRefresh(updated, now) {
 		updated.NextRefreshAfter = now.Add(refreshIneffectiveBackoff)
 	}
-	saved, errUpdate := m.Update(ctx, updated)
-	targetAuth := saved
-	if targetAuth == nil {
-		targetAuth = updated
+	saved, errUpdate := m.UpdateRefreshedAuth(ctx, base, updated)
+	if errUpdate != nil {
+		log.Debugf("persist refreshed auth %s (%s) failed: %v", auth.Provider, auth.ID, errUpdate)
+		return nil, errUpdate
 	}
+	if saved == nil {
+		return nil, fmt.Errorf("auth %s not found", id)
+	}
+	targetAuth := saved
 	supportedModels, regEpoch := registry.GetGlobalRegistry().GetModelsAndEpochForClient(id)
 	projections := make([]registry.ClientModelProjection, 0, len(supportedModels))
 	for _, sm := range supportedModels {
@@ -631,11 +640,5 @@ func (m *Manager) refreshAuthForRequest(ctx context.Context, id, failedAccessTok
 	if targetAuth != nil && len(projections) > 0 {
 		registry.GetGlobalRegistry().ApplyClientModelProjections(id, regEpoch, targetAuth.Generation, projections)
 	}
-	if errUpdate != nil {
-		log.Debugf("persist refreshed auth %s (%s) failed: %v", auth.Provider, auth.ID, errUpdate)
-	}
-	if saved != nil {
-		return saved, nil
-	}
-	return updated.Clone(), nil
+	return saved.Clone(), nil
 }
