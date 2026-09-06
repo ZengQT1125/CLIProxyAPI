@@ -138,6 +138,7 @@ func (m *Manager) wrapStreamResult(ctx context.Context, auth *Auth, provider, re
 				warnLogUpstreamFailure(ctx, entry, provider, resultModel, auth, time.Since(streamStart), chunk.Err)
 				rerr := resultErrorFromError(chunk.Err)
 				action, okAction := matchRequestScopedErrorAction(auth, chunk.Err, m.runtimeConfigSnapshot())
+<<<<<<< HEAD
 				result := Result{
 					AuthID:     auth.ID,
 					Provider:   provider,
@@ -148,6 +149,11 @@ func (m *Manager) wrapStreamResult(ctx context.Context, auth *Auth, provider, re
 					RetryAfter: retryAfterFromError(chunk.Err),
 					Options:    opts,
 				}
+=======
+				result := Result{AuthID: auth.ID, Provider: provider, Model: resultModel, RouteModel: routeModel, Success: false, Error: rerr, Options: opts}
+				result.RetryAfter = retryAfterFromError(chunk.Err)
+				result.CredentialScope = isCredentialScopedError(chunk.Err)
+>>>>>>> upstream/main
 				applyRequestScopedActionToResult(action, okAction, &result)
 				m.recordExecutionResult(ctx, result, auth, ephemeralResult)
 			}
@@ -241,6 +247,7 @@ func (m *Manager) executeStreamWithModelPool(ctx context.Context, executor Provi
 			return nil, errCtx
 		}
 		entry := logEntryWithRequestID(ctx)
+		ctx = syncMetadataSessionToContext(ctx, execOpts.Metadata)
 		startStream := time.Now()
 		streamResult, errStream := executor.ExecuteStream(ctx, auth, execReq, execOpts)
 		errStream = markUpstreamExecutionAttemptFromContext(ctx, errStream)
@@ -260,6 +267,7 @@ func (m *Manager) executeStreamWithModelPool(ctx context.Context, executor Provi
 					publishSelectedAuthMetadata(execOpts.Metadata, auth)
 					didRefreshOnUnauthorized = true
 					ctx = newUpstreamAttemptContext(ctx)
+					ctx = syncMetadataSessionToContext(ctx, execOpts.Metadata)
 					startRetry := time.Now()
 					streamResult, errStream = executor.ExecuteStream(ctx, auth, execReq, execOpts)
 					errStream = markUpstreamExecutionAttemptFromContext(ctx, errStream)
