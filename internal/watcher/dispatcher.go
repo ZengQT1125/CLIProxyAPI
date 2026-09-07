@@ -5,13 +5,17 @@ package watcher
 import (
 	"context"
 	"fmt"
+	"maps"
 	"reflect"
 	"sync"
 	"time"
 
+	"github.com/router-for-me/CLIProxyAPI/v7/internal/config"
 	"github.com/router-for-me/CLIProxyAPI/v7/internal/watcher/synthesizer"
 	coreauth "github.com/router-for-me/CLIProxyAPI/v7/sdk/cliproxy/auth"
 )
+
+var snapshotCoreAuthsFunc = snapshotCoreAuths
 
 func (w *Watcher) setAuthUpdateQueue(queue chan<- AuthUpdateBatch) {
 	w.clientsMutex.Lock()
@@ -66,11 +70,13 @@ func (w *Watcher) dispatchRuntimeAuthUpdate(update AuthUpdate) bool {
 			}
 		}
 	}
+	updates := []AuthUpdate{update}
+	w.stampAuthUpdatesLocked(updates)
 	w.clientsMutex.Unlock()
 	if w.getAuthQueue() == nil {
 		return false
 	}
-	w.dispatchAuthUpdates([]AuthUpdate{update})
+	w.dispatchAuthUpdates(updates)
 	return true
 }
 
@@ -108,10 +114,6 @@ func (w *Watcher) dispatchPersistedAuthUpdate(update AuthUpdate) bool {
 		w.currentAuths = make(map[string]*coreauth.Auth)
 	}
 	w.currentAuths[clone.ID] = clone
-	w.clientsMutex.Unlock()
-	if w.getAuthQueue() == nil {
-		return false
-	}
 	if update.ID == "" {
 		update.ID = clone.ID
 	}
@@ -119,26 +121,49 @@ func (w *Watcher) dispatchPersistedAuthUpdate(update AuthUpdate) bool {
 		update.ReplaceMaterial = true
 	}
 	update.Auth = clone.Clone()
-	w.dispatchAuthUpdates([]AuthUpdate{update})
+	updates := []AuthUpdate{update}
+	w.stampAuthUpdatesLocked(updates)
+	w.clientsMutex.Unlock()
+	if w.getAuthQueue() == nil {
+		return false
+	}
+	w.dispatchAuthUpdates(updates)
 	return true
 }
 
 func (w *Watcher) refreshAuthState(force bool) {
-	w.clientsMutex.RLock()
+	w.clientsMutex.Lock()
+	w.activeAuthScans++
 	cfg := w.config
-	fileAuths := make([]*coreauth.Auth, 0)
-	for _, pathAuths := range w.fileAuthsByPath {
-		for _, auth := range pathAuths {
-			if auth != nil {
-				fileAuths = append(fileAuths, auth.Clone())
-			}
+	authDir := w.authDir
+	parser := w.pluginAuthParser
+	previous := maps.Clone(w.authRevisions)
+	previousFiles := maps.Clone(w.fileObservations)
+	w.clientsMutex.Unlock()
+	auths := snapshotCoreAuthsFunc(cfg, authDir, parser)
+	w.clientsMutex.Lock()
+	w.activeAuthScans--
+	// A full scan may finish after a newer file or persisted-auth update. Keep
+	// those concurrent changes, including deletions, instead of publishing stale data.
+	changedDuringScan := func(auth *coreauth.Auth) bool {
+		path := auth.Attributes[coreauth.AttributePath]
+		if path == "" {
+			path = auth.Attributes[coreauth.AttributeSource]
+		}
+		normalized := w.normalizeAuthPath(path)
+		return previous[auth.ID] != w.authRevisions[auth.ID] ||
+			previousFiles[normalized] != w.fileObservations[normalized]
+	}
+	for index, auth := range auths {
+		if auth != nil && changedDuringScan(auth) {
+			auths[index] = nil
 		}
 	}
-	w.clientsMutex.RUnlock()
-	ctx := &synthesizer.SynthesisContext{Config: cfg, Now: time.Now(), IDGenerator: synthesizer.NewStableIDGenerator()}
-	auths, _ := synthesizer.NewConfigSynthesizer().Synthesize(ctx)
-	auths = append(auths, fileAuths...)
-	w.clientsMutex.Lock()
+	for _, auth := range w.currentAuths {
+		if auth != nil && changedDuringScan(auth) {
+			auths = append(auths, auth.Clone())
+		}
+	}
 	if len(w.runtimeAuths) > 0 {
 		for _, a := range w.runtimeAuths {
 			if a != nil {
@@ -163,25 +188,6 @@ func (w *Watcher) prepareAuthUpdatesLocked(auths []*coreauth.Auth, force bool) [
 		}
 		newState[auth.ID] = auth.Clone()
 	}
-	if w.currentAuths == nil {
-		w.currentAuths = newState
-		if w.authQueue == nil {
-			return nil
-		}
-		updates := make([]AuthUpdate, 0, len(newState))
-		for _, id := range orderedIDs {
-			auth := newState[id]
-			if auth == nil {
-				continue
-			}
-			updates = append(updates, AuthUpdate{Action: AuthUpdateActionAdd, ID: id, Auth: auth.Clone()})
-		}
-		return updates
-	}
-	if w.authQueue == nil {
-		w.currentAuths = newState
-		return nil
-	}
 	updates := make([]AuthUpdate, 0, len(newState)+len(w.currentAuths))
 	for _, id := range orderedIDs {
 		auth := newState[id]
@@ -200,15 +206,43 @@ func (w *Watcher) prepareAuthUpdatesLocked(auths []*coreauth.Auth, force bool) [
 		}
 	}
 	w.currentAuths = newState
+	w.stampAuthUpdatesLocked(updates)
+	if w.authQueue == nil {
+		return nil
+	}
 	return updates
+}
+
+// stampAuthUpdatesLocked records observations even without a queue and retains
+// deletion revisions so a scan cannot resurrect an auth that appeared then vanished.
+func (w *Watcher) stampAuthUpdatesLocked(updates []AuthUpdate) {
+	if len(updates) == 0 {
+		return
+	}
+	if w.authRevisions == nil {
+		w.authRevisions = make(map[string]uint64)
+	}
+	for index := range updates {
+		update := &updates[index]
+		if update.ID == "" && update.Auth != nil {
+			update.ID = update.Auth.ID
+		}
+		if update.ID == "" {
+			continue
+		}
+		w.authRevisions[update.ID]++
+		update.revision = w.authRevisions[update.ID]
+	}
 }
 
 func (w *Watcher) dispatchAuthUpdates(updates []AuthUpdate) {
 	if len(updates) == 0 {
 		return
 	}
-	queue := w.getAuthQueue()
-	if queue == nil {
+	// Keep revision validation and enqueue atomic with respect to state changes.
+	w.clientsMutex.RLock()
+	defer w.clientsMutex.RUnlock()
+	if w.authQueue == nil {
 		return
 	}
 	baseTS := time.Now().UnixNano()
@@ -217,6 +251,9 @@ func (w *Watcher) dispatchAuthUpdates(updates []AuthUpdate) {
 		w.pendingUpdates = make(map[string]AuthUpdate)
 	}
 	for idx, update := range updates {
+		if update.revision != 0 && update.revision < w.authRevisions[update.ID] {
+			continue
+		}
 		key := w.authUpdateKey(update, baseTS+int64(idx))
 		if _, exists := w.pendingUpdates[key]; !exists {
 			w.pendingOrder = append(w.pendingOrder, key)
@@ -379,4 +416,28 @@ func normalizeAuth(a *coreauth.Auth) *coreauth.Auth {
 	clone.Runtime = nil
 	clone.Quota.NextRecoverAt = time.Time{}
 	return clone
+}
+
+func snapshotCoreAuths(cfg *config.Config, authDir string, parser synthesizer.PluginAuthParser) []*coreauth.Auth {
+	ctx := &synthesizer.SynthesisContext{
+		Config:           cfg,
+		AuthDir:          authDir,
+		Now:              time.Now(),
+		IDGenerator:      synthesizer.NewStableIDGenerator(),
+		PluginAuthParser: parser,
+	}
+
+	var out []*coreauth.Auth
+
+	configSynth := synthesizer.NewConfigSynthesizer()
+	if auths, err := configSynth.Synthesize(ctx); err == nil {
+		out = append(out, auths...)
+	}
+
+	fileSynth := synthesizer.NewFileSynthesizer()
+	if auths, err := fileSynth.Synthesize(ctx); err == nil {
+		out = append(out, auths...)
+	}
+
+	return out
 }

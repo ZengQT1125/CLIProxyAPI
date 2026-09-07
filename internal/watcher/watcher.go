@@ -52,6 +52,9 @@ type Watcher struct {
 	lastConfigHash         string
 	authQueue              chan<- AuthUpdateBatch
 	currentAuths           map[string]*coreauth.Auth
+	authRevisions          map[string]uint64 // Includes deletion tombstones; guarded by clientsMutex.
+	fileObservations       map[string]uint64 // Tracks file events even when content is unchanged.
+	activeAuthScans        int               // Guarded by clientsMutex.
 	runtimeAuths           map[string]*coreauth.Auth
 	dispatchMu             sync.Mutex
 	dispatchCond           *sync.Cond
@@ -93,6 +96,7 @@ type AuthUpdate struct {
 	Auth   *coreauth.Auth
 	// ReplaceMaterial means the persisted credential material changed and stale runtime errors must be cleared.
 	ReplaceMaterial bool
+	revision        uint64 // Watcher-local ordering, independent of runtime auth generations.
 }
 
 type AuthUpdateResult struct {
