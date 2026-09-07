@@ -10,9 +10,12 @@ import (
 	"sync"
 	"time"
 
+	"github.com/router-for-me/CLIProxyAPI/v7/internal/config"
 	"github.com/router-for-me/CLIProxyAPI/v7/internal/watcher/synthesizer"
 	coreauth "github.com/router-for-me/CLIProxyAPI/v7/sdk/cliproxy/auth"
 )
+
+var snapshotCoreAuthsFunc = snapshotCoreAuths
 
 func (w *Watcher) setAuthUpdateQueue(queue chan<- AuthUpdateBatch) {
 	w.clientsMutex.Lock()
@@ -132,27 +135,12 @@ func (w *Watcher) refreshAuthState(force bool) {
 	w.clientsMutex.Lock()
 	w.activeAuthScans++
 	cfg := w.config
-<<<<<<< HEAD
-	fileAuths := make([]*coreauth.Auth, 0)
-	for _, pathAuths := range w.fileAuthsByPath {
-		for _, auth := range pathAuths {
-			if auth != nil {
-				fileAuths = append(fileAuths, auth.Clone())
-			}
-		}
-	}
-	w.clientsMutex.RUnlock()
-	ctx := &synthesizer.SynthesisContext{Config: cfg, Now: time.Now(), IDGenerator: synthesizer.NewStableIDGenerator()}
-	auths, _ := synthesizer.NewConfigSynthesizer().Synthesize(ctx)
-	auths = append(auths, fileAuths...)
-=======
 	authDir := w.authDir
 	parser := w.pluginAuthParser
 	previous := maps.Clone(w.authRevisions)
 	previousFiles := maps.Clone(w.fileObservations)
 	w.clientsMutex.Unlock()
 	auths := snapshotCoreAuthsFunc(cfg, authDir, parser)
->>>>>>> upstream/main
 	w.clientsMutex.Lock()
 	w.activeAuthScans--
 	// A full scan may finish after a newer file or persisted-auth update. Keep
@@ -428,4 +416,28 @@ func normalizeAuth(a *coreauth.Auth) *coreauth.Auth {
 	clone.Runtime = nil
 	clone.Quota.NextRecoverAt = time.Time{}
 	return clone
+}
+
+func snapshotCoreAuths(cfg *config.Config, authDir string, parser synthesizer.PluginAuthParser) []*coreauth.Auth {
+	ctx := &synthesizer.SynthesisContext{
+		Config:           cfg,
+		AuthDir:          authDir,
+		Now:              time.Now(),
+		IDGenerator:      synthesizer.NewStableIDGenerator(),
+		PluginAuthParser: parser,
+	}
+
+	var out []*coreauth.Auth
+
+	configSynth := synthesizer.NewConfigSynthesizer()
+	if auths, err := configSynth.Synthesize(ctx); err == nil {
+		out = append(out, auths...)
+	}
+
+	fileSynth := synthesizer.NewFileSynthesizer()
+	if auths, err := fileSynth.Synthesize(ctx); err == nil {
+		out = append(out, auths...)
+	}
+
+	return out
 }

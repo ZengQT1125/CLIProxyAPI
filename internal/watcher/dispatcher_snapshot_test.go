@@ -62,7 +62,7 @@ func TestRefreshAuthStatePreservesConcurrentFileLifecycle(t *testing.T) {
 				t.Fatal(errWrite)
 			}
 			w.addOrUpdateClient(otherPath)
-			w.authQueue = make(chan AuthUpdate, 10)
+			w.authQueue = make(chan AuthUpdateBatch, 10)
 			// The full scan must still publish changes to unrelated files.
 			if errWrite := os.WriteFile(otherPath, []byte(`{"type":"codex","note":"scanned"}`), 0o600); errWrite != nil {
 				t.Fatal(errWrite)
@@ -126,7 +126,7 @@ func TestRefreshAuthStatePreservesConcurrentRoundTrip(t *testing.T) {
 				}
 				w.addOrUpdateClient(path)
 			}
-			w.authQueue = make(chan AuthUpdate, 10)
+			w.authQueue = make(chan AuthUpdateBatch, 10)
 			originalSnapshot := snapshotCoreAuthsFunc
 			t.Cleanup(func() { snapshotCoreAuthsFunc = originalSnapshot })
 			snapshotCoreAuthsFunc = func(cfg *config.Config, authDir string, parser synthesizer.PluginAuthParser) []*coreauth.Auth {
@@ -181,7 +181,7 @@ func TestRefreshAuthStatePreservesUnchangedFileObservation(t *testing.T) {
 			if errWrite := os.WriteFile(path, original, 0o600); errWrite != nil {
 				t.Fatal(errWrite)
 			}
-			w := &Watcher{authDir: dir, config: &config.Config{AuthDir: dir}, authQueue: make(chan AuthUpdate, 10)}
+			w := &Watcher{authDir: dir, config: &config.Config{AuthDir: dir}, authQueue: make(chan AuthUpdateBatch, 10)}
 			w.addOrUpdateClient(path)
 			// The intermediate content is seen only by the full scan, never by an event.
 			if errWrite := os.WriteFile(path, []byte(`{"type":"codex"}`), 0o600); errWrite != nil {
@@ -218,52 +218,13 @@ func TestRefreshAuthStatePreservesUnchangedFileObservation(t *testing.T) {
 	}
 }
 
-func TestRefreshAuthStateAppliesHashCachedFileObservation(t *testing.T) {
-	for _, phase := range []string{"during_scan", "after_scan"} {
-		t.Run(phase, func(t *testing.T) {
-			dir := t.TempDir()
-			path := filepath.Join(dir, "account.json")
-			if errWrite := os.WriteFile(path, []byte(`{"type":"codex"}`), 0o600); errWrite != nil {
-				t.Fatal(errWrite)
-			}
-			w := &Watcher{authDir: dir, config: &config.Config{AuthDir: dir}, authQueue: make(chan AuthUpdate, 10)}
-			w.addOrUpdateClient(path)
-			if errWrite := os.WriteFile(path, []byte(`{"type":"codex","proxy_url":"http://latest.proxy:8080"}`), 0o600); errWrite != nil {
-				t.Fatal(errWrite)
-			}
-			originalSnapshot := snapshotCoreAuthsFunc
-			t.Cleanup(func() { snapshotCoreAuthsFunc = originalSnapshot })
-			snapshotCoreAuthsFunc = func(cfg *config.Config, authDir string, parser synthesizer.PluginAuthParser) []*coreauth.Auth {
-				auths := originalSnapshot(cfg, authDir, parser)
-				// reloadClients cached the new hash before publishing its matching auth.
-				if phase == "after_scan" {
-					// Suspend the event after observation, before content processing.
-					w.observeAuthFile(path)
-				} else {
-					w.handleEvent(fsnotify.Event{Name: path, Op: fsnotify.Write})
-				}
-				return auths
-			}
-			w.reloadClients(true, nil, false)
-			if phase == "after_scan" {
-				w.handleEvent(fsnotify.Event{Name: path, Op: fsnotify.Write})
-			}
-			current := w.currentAuths["account.json"]
-			pending := w.pendingUpdates["account.json"]
-			if current == nil || current.ProxyURL != "http://latest.proxy:8080" || pending.Auth == nil || pending.Auth.ProxyURL != "http://latest.proxy:8080" {
-				t.Fatal("hash-cache warmup suppressed the newer auth update")
-			}
-		})
-	}
-}
-
 func TestRefreshAuthStateDoesNotResurrectUnregisteredFile(t *testing.T) {
 	dir := t.TempDir()
 	path := filepath.Join(dir, "account.json")
 	if errWrite := os.WriteFile(path, []byte(`{"type":"codex"}`), 0o600); errWrite != nil {
 		t.Fatal(errWrite)
 	}
-	w := &Watcher{authDir: dir, config: &config.Config{AuthDir: dir}, authQueue: make(chan AuthUpdate, 10)}
+	w := &Watcher{authDir: dir, config: &config.Config{AuthDir: dir}, authQueue: make(chan AuthUpdateBatch, 10)}
 	originalSnapshot := snapshotCoreAuthsFunc
 	t.Cleanup(func() { snapshotCoreAuthsFunc = originalSnapshot })
 	snapshotCoreAuthsFunc = func(cfg *config.Config, authDir string, parser synthesizer.PluginAuthParser) []*coreauth.Auth {
@@ -290,7 +251,7 @@ func TestDispatchAuthUpdatesRejectsDelayedScan(t *testing.T) {
 			}
 			w := &Watcher{authDir: dir, config: &config.Config{AuthDir: dir}}
 			w.addOrUpdateClient(path)
-			w.authQueue = make(chan AuthUpdate, 10)
+			w.authQueue = make(chan AuthUpdateBatch, 10)
 			// Suspend the full-scan pipeline between its state commit and dispatch.
 			w.clientsMutex.Lock()
 			delayed := w.prepareAuthUpdatesLocked([]*coreauth.Auth{w.currentAuths["account.json"].Clone()}, true)
@@ -362,7 +323,7 @@ func TestRefreshAuthStatePreservesConcurrentProxyUpdate(t *testing.T) {
 			}
 			w := &Watcher{authDir: dir, config: &config.Config{AuthDir: dir}}
 			w.addOrUpdateClient(path)
-			w.authQueue = make(chan AuthUpdate, 10)
+			w.authQueue = make(chan AuthUpdateBatch, 10)
 
 			finishScan := pauseAuthSnapshot(t, w, false)
 

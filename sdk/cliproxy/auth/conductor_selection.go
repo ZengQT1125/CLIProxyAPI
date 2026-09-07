@@ -561,10 +561,8 @@ func selectionArgForSelector(selector Selector, routeModel string) string {
 
 func selectorContextForAvailableAuths(ctx context.Context, selector Selector, routeModel string) context.Context {
 	ctx = withWeightedSelectorStateModel(ctx, selector, routeModel)
-	if !isBuiltInSelector(selector) {
-		if _, sessionAffinity := selector.(*SessionAffinitySelector); !sessionAffinity {
-			return ctx
-		}
+	if _, sessionAffinity := selector.(*SessionAffinitySelector); !sessionAffinity {
+		return ctx
 	}
 	if ctx == nil {
 		ctx = context.Background()
@@ -1583,13 +1581,12 @@ func (m *Manager) pickNextLegacy(ctx context.Context, provider, model string, op
 		return nil, nil, errPick
 	}
 	if !handled {
-<<<<<<< HEAD
-		selectorCtx := withWeightedSelectorStateModel(ctx, selector, model)
-		selected, errPick = pickSelectorWithRetry(selectorCtx, selector, provider, selectionArgForSelector(selector, model), opts, available, selectable)
-=======
 		selectorCtx := selectorContextForAvailableAuths(ctx, selector, model)
-		selected, errPick = selector.Pick(selectorCtx, provider, selectionArgForSelector(selector, model), opts, selectorAuths)
->>>>>>> upstream/main
+		if _, sessionAffinity := selector.(*SessionAffinitySelector); sessionAffinity && len(tried) == 0 {
+			selected, errPick = selector.Pick(selectorCtx, provider, selectionArgForSelector(selector, model), opts, available)
+		} else {
+			selected, errPick = pickSelectorWithRetry(selectorCtx, selector, provider, selectionArgForSelector(selector, model), opts, available, selectable)
+		}
 		if errPick != nil {
 			if isBuiltInSelector(selector) {
 				errPick = restoreModelCooldownErrorModel(errPick, model)
@@ -1932,13 +1929,12 @@ func (m *Manager) pickNextMixedLegacy(ctx context.Context, providers []string, m
 		return nil, nil, "", errPick
 	}
 	if !handled {
-<<<<<<< HEAD
-		selectorCtx := withWeightedSelectorStateModel(ctx, selector, model)
-		selected, errPick = pickSelectorWithRetry(selectorCtx, selector, "mixed", selectionArgForSelector(selector, model), opts, available, selectable)
-=======
 		selectorCtx := selectorContextForAvailableAuths(ctx, selector, model)
-		selected, errPick = selector.Pick(selectorCtx, "mixed", selectionArgForSelector(selector, model), opts, selectorAuths)
->>>>>>> upstream/main
+		if _, sessionAffinity := selector.(*SessionAffinitySelector); sessionAffinity && len(tried) == 0 {
+			selected, errPick = selector.Pick(selectorCtx, "mixed", selectionArgForSelector(selector, model), opts, available)
+		} else {
+			selected, errPick = pickSelectorWithRetry(selectorCtx, selector, "mixed", selectionArgForSelector(selector, model), opts, available, selectable)
+		}
 		if errPick != nil {
 			if isBuiltInSelector(selector) {
 				errPick = restoreModelCooldownErrorModel(errPick, model)

@@ -512,10 +512,6 @@ func getAvailableAuths(auths []*Auth, provider, model string, now time.Time) ([]
 	return getAvailableAuthsWithPriorityMode(auths, provider, model, now, false)
 }
 
-<<<<<<< HEAD
-func getReadyAuths(auths []*Auth, provider, model string, now time.Time) ([]*Auth, error) {
-	return getAvailableAuthsWithPriorityMode(auths, provider, model, now, true)
-=======
 type prevalidatedAuthCandidatesKey struct{}
 
 func getSelectorAvailableAuths(ctx context.Context, auths []*Auth, provider, model string, now time.Time) ([]*Auth, error) {
@@ -540,7 +536,6 @@ func getSelectorAvailableAuthsWithPriorityMode(ctx context.Context, auths []*Aut
 		}
 	}
 	return getAvailableAuthsWithPriorityMode(auths, provider, model, now, allPriorities)
->>>>>>> upstream/main
 }
 
 func getAvailableAuthsAcrossPriorities(auths []*Auth, provider, model string, now time.Time) ([]*Auth, error) {
@@ -1077,9 +1072,6 @@ func (s *SessionAffinitySelector) Pick(ctx context.Context, provider, model stri
 	}
 	if primaryID != "" {
 		primaryID = cliproxysession.BoundSessionIdentity(primaryID)
-		if fallbackID != "" {
-			fallbackID = cliproxysession.BoundSessionIdentity(fallbackID)
-		}
 		if opts.Metadata != nil {
 			opts.Metadata[cliproxyexecutor.CanonicalSessionIDMetadataKey] = primaryID
 		}

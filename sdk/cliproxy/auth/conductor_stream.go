@@ -138,22 +138,9 @@ func (m *Manager) wrapStreamResult(ctx context.Context, auth *Auth, provider, re
 				warnLogUpstreamFailure(ctx, entry, provider, resultModel, auth, time.Since(streamStart), chunk.Err)
 				rerr := resultErrorFromError(chunk.Err)
 				action, okAction := matchRequestScopedErrorAction(auth, chunk.Err, m.runtimeConfigSnapshot())
-<<<<<<< HEAD
-				result := Result{
-					AuthID:     auth.ID,
-					Provider:   provider,
-					Model:      resultModel,
-					RouteModel: routeModel,
-					Success:    false,
-					Error:      rerr,
-					RetryAfter: retryAfterFromError(chunk.Err),
-					Options:    opts,
-				}
-=======
 				result := Result{AuthID: auth.ID, Provider: provider, Model: resultModel, RouteModel: routeModel, Success: false, Error: rerr, Options: opts}
 				result.RetryAfter = retryAfterFromError(chunk.Err)
 				result.CredentialScope = isCredentialScopedError(chunk.Err)
->>>>>>> upstream/main
 				applyRequestScopedActionToResult(action, okAction, &result)
 				m.recordExecutionResult(ctx, result, auth, ephemeralResult)
 			}

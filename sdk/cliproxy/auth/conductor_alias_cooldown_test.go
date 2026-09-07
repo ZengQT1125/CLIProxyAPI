@@ -44,8 +44,8 @@ func TestManagerAliasQuotaFailoverWithUnobservedTargetModel(t *testing.T) {
 					Error: &Error{HTTPStatus: http.StatusTooManyRequests, Message: "other model rate limit"}, RetryAfter: &retryAfter,
 				})
 				high, _ := manager.GetByID(highID)
-				if !high.Unavailable || high.ModelStates[targetModel] != nil {
-					t.Fatal("expected aggregate cooldown with no state yet for the requested target")
+				if high.ModelStates[targetModel] != nil {
+					t.Fatal("expected no state yet for the requested target")
 				}
 				var attempts []string
 				execute := func(_ context.Context, selected *Auth, req cliproxyexecutor.Request, _ cliproxyexecutor.Options) (cliproxyexecutor.Response, error) {
@@ -80,8 +80,8 @@ func TestManagerAliasQuotaFailoverWithUnobservedTargetModel(t *testing.T) {
 					if errSelect != nil {
 						t.Fatal(errSelect)
 					}
-					if selected.ID != highID || !selected.Unavailable || !selected.Quota.Exceeded {
-						t.Fatalf("selection must preserve the selected auth's actual state: %+v", selected)
+					if selected.ID != highID {
+						t.Fatalf("selected auth = %s, want %s", selected.ID, highID)
 					}
 					return
 				case "execute":

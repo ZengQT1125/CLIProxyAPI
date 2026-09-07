@@ -100,13 +100,10 @@ func (w *Watcher) handleEvent(event fsnotify.Event) {
 	}
 	w.authRescanMu.Lock()
 	defer w.authRescanMu.Unlock()
-<<<<<<< HEAD
 	w.clientsMutex.Lock()
 	w.advancePathGenerationLocked(normalizedName)
 	w.clientsMutex.Unlock()
-=======
 	w.observeAuthFile(event.Name)
->>>>>>> upstream/main
 
 	if event.Op&(fsnotify.Remove|fsnotify.Rename) != 0 {
 		if w.shouldDebounceRemove(normalizedName, now) {

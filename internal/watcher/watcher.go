@@ -31,7 +31,6 @@ type authDirProvider interface {
 
 // Watcher manages file watching for configuration and authentication files
 type Watcher struct {
-<<<<<<< HEAD
 	configPath             string
 	authDir                string
 	config                 *config.Config
@@ -53,6 +52,9 @@ type Watcher struct {
 	lastConfigHash         string
 	authQueue              chan<- AuthUpdateBatch
 	currentAuths           map[string]*coreauth.Auth
+	authRevisions          map[string]uint64 // Includes deletion tombstones; guarded by clientsMutex.
+	fileObservations       map[string]uint64 // Tracks file events even when content is unchanged.
+	activeAuthScans        int               // Guarded by clientsMutex.
 	runtimeAuths           map[string]*coreauth.Auth
 	dispatchMu             sync.Mutex
 	dispatchCond           *sync.Cond
@@ -76,42 +78,6 @@ type Watcher struct {
 	authEventGateArmed     bool
 	authEventGateOpen      bool
 	pendingConfigEvent     bool
-=======
-	configPath        string
-	authDir           string
-	config            *config.Config
-	clientsMutex      sync.RWMutex
-	authRescanMu      sync.Mutex
-	configReloadMu    sync.Mutex
-	configReloadTimer *time.Timer
-	serverUpdateMu    sync.Mutex
-	serverUpdateTimer *time.Timer
-	serverUpdateLast  time.Time
-	serverUpdatePend  bool
-	stopped           atomic.Bool
-	reloadCallback    func(*config.Config)
-	watcher           *fsnotify.Watcher
-	lastAuthHashes    map[string]string
-	lastAuthContents  map[string]*coreauth.Auth
-	fileAuthsByPath   map[string]map[string]*coreauth.Auth
-	lastRemoveTimes   map[string]time.Time
-	lastConfigHash    string
-	authQueue         chan<- AuthUpdate
-	currentAuths      map[string]*coreauth.Auth
-	authRevisions     map[string]uint64 // Includes deletion tombstones; guarded by clientsMutex.
-	fileObservations  map[string]uint64 // Tracks file events even when content is unchanged.
-	activeAuthScans   int               // Guarded by clientsMutex.
-	runtimeAuths      map[string]*coreauth.Auth
-	dispatchMu        sync.Mutex
-	dispatchCond      *sync.Cond
-	pendingUpdates    map[string]AuthUpdate
-	pendingOrder      []string
-	dispatchCancel    context.CancelFunc
-	storePersister    storePersister
-	pluginAuthParser  synthesizer.PluginAuthParser
-	mirroredAuthDir   string
-	oldConfigYaml     []byte
->>>>>>> upstream/main
 }
 
 // AuthUpdateAction represents the type of change detected in auth sources.
@@ -125,12 +91,12 @@ const (
 
 // AuthUpdate describes an incremental change to auth configuration.
 type AuthUpdate struct {
-<<<<<<< HEAD
 	Action AuthUpdateAction
 	ID     string
 	Auth   *coreauth.Auth
 	// ReplaceMaterial means the persisted credential material changed and stale runtime errors must be cleared.
 	ReplaceMaterial bool
+	revision        uint64 // Watcher-local ordering, independent of runtime auth generations.
 }
 
 type AuthUpdateResult struct {
@@ -147,12 +113,6 @@ type AuthUpdateBatch struct {
 type AuthLoadHooks struct {
 	Before func(context.Context) error
 	After  func(context.Context) error
-=======
-	Action   AuthUpdateAction
-	ID       string
-	Auth     *coreauth.Auth
-	revision uint64 // Watcher-local ordering, independent of runtime auth generations.
->>>>>>> upstream/main
 }
 
 const (
