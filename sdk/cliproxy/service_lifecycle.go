@@ -100,7 +100,8 @@ func (s *Service) Run(ctx context.Context) error {
 			// registered for oauth credentials and every request fails with
 			// auth_not_found even though models resolve to the right providers.
 			s.registerAvailableExecutors(startupCtx, executorRegistrationOptions{
-				auths: s.coreManager.List(),
+				includeBaseline: true,
+				auths:           s.coreManager.List(),
 			})
 			s.registerConfigAPIKeyAuths(startupCtx, s.cfg)
 			if s.cfg.SaveCooldownStatus {
@@ -108,6 +109,7 @@ func (s *Service) Run(ctx context.Context) error {
 					log.Warnf("failed to restore cooldown state: %v", errRestoreCooldown)
 				}
 			}
+			s.startCoreAuthAutoRefresh(runCtx)
 		}
 	}
 

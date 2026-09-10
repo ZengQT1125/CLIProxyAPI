@@ -193,6 +193,7 @@ func (s *Server) registerManagementRoutes() {
 		mgmt.PATCH("/auth-files/status", s.mgmt.PatchAuthFileStatus)
 		mgmt.PATCH("/auth-files/fields", s.mgmt.PatchAuthFileFields)
 		mgmt.PATCH("/auth-files/fields/batch", s.mgmt.PatchAuthFileFieldsBatch)
+		mgmt.POST("/auth-files/refresh", s.mgmt.RefreshAuthFiles)
 		mgmt.POST("/vertex/import", s.mgmt.ImportVertexCredential)
 
 		mgmt.GET("/anthropic-auth-url", s.mgmt.RequestAnthropicToken)
