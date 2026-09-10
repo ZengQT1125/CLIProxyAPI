@@ -148,6 +148,10 @@ func codexTerminalStreamContextLengthErr(eventData []byte) (statusErr, bool) {
 }
 
 func codexTerminalStreamErr(eventData []byte) (statusErr, []byte, bool) {
+	return codexTerminalStreamErrWithCooling(eventData, false)
+}
+
+func codexTerminalStreamErrWithCooling(eventData []byte, modelLevelCooling bool) (statusErr, []byte, bool) {
 	body, ok := codexTerminalFailureBody(eventData)
 	if !ok || !codexTerminalStreamErrShouldHandle(body) {
 		return statusErr{}, nil, false
@@ -156,18 +160,22 @@ func codexTerminalStreamErr(eventData []byte) (statusErr, []byte, bool) {
 	if codexTerminalErrorIsUsageLimitReached(body) {
 		statusCode = http.StatusTooManyRequests
 	}
-	return newCodexStatusErr(statusCode, body), body, true
+	return newCodexStatusErrWithCooling(statusCode, body, modelLevelCooling), body, true
 }
 
 func codexTerminalFailureErr(eventData []byte) (statusErr, []byte, bool) {
-	if streamErr, body, ok := codexTerminalStreamErr(eventData); ok {
+	return codexTerminalFailureErrWithCooling(eventData, false)
+}
+
+func codexTerminalFailureErrWithCooling(eventData []byte, modelLevelCooling bool) (statusErr, []byte, bool) {
+	if streamErr, body, ok := codexTerminalStreamErrWithCooling(eventData, modelLevelCooling); ok {
 		return streamErr, body, true
 	}
 	body, ok := codexTerminalFailureBody(eventData)
 	if !ok {
 		return statusErr{}, nil, false
 	}
-	return newCodexStatusErr(codexTerminalFailureStatus(body), body), body, true
+	return newCodexStatusErrWithCooling(codexTerminalFailureStatus(body), body, modelLevelCooling), body, true
 }
 
 func codexTerminalFailureStatus(body []byte) int {
@@ -307,9 +315,14 @@ func codexTerminalErrorIsContextLength(body []byte) bool {
 }
 
 func newCodexStatusErr(statusCode int, body []byte) statusErr {
+	return newCodexStatusErrWithCooling(statusCode, body, false)
+}
+
+func newCodexStatusErrWithCooling(statusCode int, body []byte, modelLevelCooling bool) statusErr {
 	errCode := statusCode
-	credentialScoped := isCodexUsageLimitError(body)
-	if isCodexModelCapacityError(body) || credentialScoped {
+	isUsageLimit := isCodexUsageLimitError(body)
+	credentialScoped := isUsageLimit && !modelLevelCooling
+	if isCodexModelCapacityError(body) || isUsageLimit {
 		errCode = http.StatusTooManyRequests
 	}
 	body = classifyCodexStatusError(errCode, body)
