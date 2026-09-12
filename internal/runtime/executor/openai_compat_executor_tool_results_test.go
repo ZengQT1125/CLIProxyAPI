@@ -5,6 +5,7 @@ import (
 	"io"
 	"net/http"
 	"net/http/httptest"
+	"strings"
 	"testing"
 
 	"github.com/router-for-me/CLIProxyAPI/v7/internal/config"
@@ -14,17 +15,41 @@ import (
 	"github.com/tidwall/gjson"
 )
 
+// countImagePartsInBody counts image content parts anywhere in the request body,
+// regardless of which message the translator placed them in.
+func countImagePartsInBody(body []byte) int {
+	count := 0
+	gjson.GetBytes(body, "messages").ForEach(func(_, message gjson.Result) bool {
+		message.Get("content").ForEach(func(_, part gjson.Result) bool {
+			switch strings.ToLower(strings.TrimSpace(part.Get("type").String())) {
+			case "image", "image_url", "input_image":
+				count++
+			default:
+				if part.Get("image_url").Exists() || part.Get("input_image").Exists() {
+					count++
+				}
+			}
+			return true
+		})
+		return true
+	})
+	return count
+}
+
 func TestOpenAICompatExecutorToolResultContentByInputModalities(t *testing.T) {
+	// The upstream translator always flattens Claude tool_result content into a
+	// string and relays any images into a following user message. The fork's
+	// input_modalities feature then decides whether those relayed images survive.
 	tests := []struct {
 		name            string
 		stream          bool
 		inputModalities []string
-		wantString      bool
+		wantImages      bool
 	}{
-		{name: "non-stream text-only", stream: false, inputModalities: []string{"text"}, wantString: true},
-		{name: "stream text-only", stream: true, inputModalities: []string{"text"}, wantString: true},
-		{name: "non-stream multimodal", stream: false, inputModalities: []string{"text", "image"}, wantString: false},
-		{name: "non-stream unspecified", stream: false, inputModalities: nil, wantString: false},
+		{name: "non-stream text-only", stream: false, inputModalities: []string{"text"}, wantImages: false},
+		{name: "stream text-only", stream: true, inputModalities: []string{"text"}, wantImages: false},
+		{name: "non-stream multimodal", stream: false, inputModalities: []string{"text", "image"}, wantImages: true},
+		{name: "non-stream unspecified", stream: false, inputModalities: nil, wantImages: true},
 	}
 
 	for _, tt := range tests {
@@ -83,17 +108,30 @@ func TestOpenAICompatExecutorToolResultContentByInputModalities(t *testing.T) {
 				t.Fatalf("Execute error: %v", errExecute)
 			}
 
+			// Upstream contract: tool_result text is flattened into a string and
+			// the image is relayed out of the tool message.
 			toolContent := gjson.GetBytes(gotBody, "messages.1.content")
-			if tt.wantString {
-				if toolContent.Type != gjson.String {
-					t.Fatalf("tool content type = %s, want string; body=%s", toolContent.Type, string(gotBody))
+			if toolContent.Type != gjson.String {
+				t.Fatalf("tool content type = %s, want string; body=%s", toolContent.Type, string(gotBody))
+			}
+			if toolContent.String() != "image inspected" {
+				t.Fatalf("tool content = %q, want %q", toolContent.String(), "image inspected")
+			}
+
+			// Fork feature: a text-only model must not receive the relayed image,
+			// while models that accept image input keep it.
+			imageParts := countImagePartsInBody(gotBody)
+			if tt.wantImages {
+				if imageParts == 0 {
+					t.Fatalf("body has no image part, want relayed image; body=%s", string(gotBody))
 				}
-				want := "image inspected\n\n[image omitted: unsupported by upstream]"
-				if toolContent.String() != want {
-					t.Fatalf("tool content = %q, want %q", toolContent.String(), want)
-				}
-			} else if !toolContent.IsArray() {
-				t.Fatalf("tool content type = %s, want array; body=%s", toolContent.Type, string(gotBody))
+				return
+			}
+			if imageParts != 0 {
+				t.Fatalf("body has %d image part(s) for a text-only model; body=%s", imageParts, string(gotBody))
+			}
+			if !strings.Contains(string(gotBody), "[image omitted: unsupported by upstream]") {
+				t.Fatalf("expected image omission marker; body=%s", string(gotBody))
 			}
 		})
 	}

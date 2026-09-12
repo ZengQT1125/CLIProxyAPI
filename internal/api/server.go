@@ -286,6 +286,14 @@ func (s *Server) publishListening(addr net.Addr) {
 	})
 }
 
+// Handler returns the HTTP handler used by the server.
+func (s *Server) Handler() http.Handler {
+	if s == nil || s.server == nil {
+		return nil
+	}
+	return s.server.Handler
+}
+
 // Start begins listening for and serving HTTP or HTTPS requests.
 // It's a blocking call and will only return on an unrecoverable error.
 //

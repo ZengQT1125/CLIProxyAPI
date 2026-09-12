@@ -240,6 +240,19 @@ func (m *Manager) updateInternal(ctx context.Context, base, auth *Auth, mode upd
 		if len(auth.ModelStates) == 0 && len(existing.ModelStates) > 0 {
 			auth.ModelStates = existing.ModelStates
 		}
+		credChanged := CredentialsChanged(existing, auth)
+		if credChanged {
+			if hasUnauthorizedAuthFailure(existing) || (auth.LastError != nil && isUnauthorizedError(auth.LastError)) {
+				auth.Unavailable = false
+				auth.LastError = nil
+				auth.StatusMessage = ""
+				auth.Status = StatusActive
+			}
+			resumed := clearUnauthorizedModelStates(auth, time.Now())
+			if len(resumed) > 0 {
+				cooldownStateChanged = true
+			}
+		}
 		if existing.Quota.Exceeded && existing.Quota.Reason == "credential_quota" && existing.Quota.NextRecoverAt.After(time.Now()) {
 			auth.Unavailable = existing.Unavailable
 			auth.NextRetryAfter = existing.NextRetryAfter

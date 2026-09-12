@@ -26,8 +26,11 @@ func ShouldNormalizeOpenAIToolResultsForModel(compat *config.OpenAICompatibility
 	return normalize
 }
 
-// NormalizeOpenAIToolResultsTextOnly converts tool message content to strings.
-// Text parts are preserved and image parts are replaced with a short marker.
+// NormalizeOpenAIToolResultsTextOnly converts tool message content to strings
+// and removes image parts from every other message. A model that excludes image
+// input must not receive images anywhere: tool results are flattened, and images
+// that the request translator relays into a following user message are replaced
+// with the same marker.
 func NormalizeOpenAIToolResultsTextOnly(payload []byte) []byte {
 	messages := gjson.GetBytes(payload, "messages")
 	if !messages.Exists() || !messages.IsArray() {
@@ -37,11 +40,15 @@ func NormalizeOpenAIToolResultsTextOnly(payload []byte) []byte {
 	out := payload
 	messageIndex := 0
 	messages.ForEach(func(_, message gjson.Result) bool {
-		if message.Get("role").String() == "tool" {
-			content := message.Get("content")
-			if content.Exists() && content.Type != gjson.String {
-				path := fmt.Sprintf("messages.%d.content", messageIndex)
+		content := message.Get("content")
+		if content.Exists() && content.Type != gjson.String {
+			path := fmt.Sprintf("messages.%d.content", messageIndex)
+			if message.Get("role").String() == "tool" {
 				if updated, errSet := sjson.SetBytes(out, path, flattenOpenAIToolResultContent(content)); errSet == nil {
+					out = updated
+				}
+			} else if stripped, changed := replaceOpenAIImageParts(content); changed {
+				if updated, errSet := sjson.SetRawBytes(out, path, stripped); errSet == nil {
 					out = updated
 				}
 			}
@@ -50,6 +57,43 @@ func NormalizeOpenAIToolResultsTextOnly(payload []byte) []byte {
 		return true
 	})
 	return out
+}
+
+// replaceOpenAIImageParts rewrites image parts in a content array as text
+// markers, preserving the array shape expected for non-tool messages.
+func replaceOpenAIImageParts(content gjson.Result) ([]byte, bool) {
+	if !content.IsArray() {
+		return nil, false
+	}
+
+	changed := false
+	parts := make([][]byte, 0, len(content.Array()))
+	content.ForEach(func(_, item gjson.Result) bool {
+		if isOpenAIImageToolResultPart(item) {
+			changed = true
+			marker := []byte(`{"type":"text","text":""}`)
+			marker, _ = sjson.SetBytes(marker, "text", openAIToolResultImageOmittedText)
+			parts = append(parts, marker)
+			return true
+		}
+		parts = append(parts, []byte(item.Raw))
+		return true
+	})
+	if !changed {
+		return nil, false
+	}
+	return []byte("[" + joinRawJSON(parts) + "]"), true
+}
+
+func joinRawJSON(parts [][]byte) string {
+	var builder strings.Builder
+	for index, part := range parts {
+		if index > 0 {
+			builder.WriteByte(',')
+		}
+		builder.Write(part)
+	}
+	return builder.String()
 }
 
 func openAICompatibilityModelExcludesImages(models []config.OpenAICompatibilityModel, model string) (bool, bool) {
