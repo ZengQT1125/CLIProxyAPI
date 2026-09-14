@@ -38,6 +38,7 @@ func (e *CodexExecutor) ExecuteStream(ctx context.Context, auth *cliproxyauth.Au
 
 	from := opts.SourceFormat
 	responseFormat := cliproxyexecutor.ResponseFormatOrSource(opts)
+	preserveNativeOutput := helps.IsNativeCodexRequest(req.Payload, opts)
 	isGrokClient := grokbuild.IsGrokClientContext(ctx, opts.Headers)
 	to := sdktranslator.FromString("codex")
 	originalPayloadSource := req.Payload
@@ -65,7 +66,7 @@ func (e *CodexExecutor) ExecuteStream(ctx context.Context, auth *cliproxyauth.Au
 		body, _ = sjson.SetBytes(body, "stream_options.reasoning_summary_delivery", reasoningSummaryDelivery.Value())
 	}
 	body = helps.SetStringIfDifferent(body, "model", baseModel)
-	body = applyCodexInstructionPatches(e.cfg, body)
+	body = applyCodexInstructionPatches(e.cfg, body, preserveNativeOutput)
 	if e.cfg == nil || e.cfg.DisableImageGeneration == config.DisableImageGenerationOff {
 		body = ensureImageGenerationTool(body, baseModel, auth, opts.Headers)
 	}
@@ -274,7 +275,9 @@ func (e *CodexExecutor) ExecuteStream(ctx context.Context, auth *cliproxyauth.Au
 						reporter.EnsurePublished(ctx)
 					}
 					publishCodexImageToolUsage(ctx, reporter, body, data)
-					data = patchCodexCompletedOutput(data, outputItemsByIndex, outputItemsFallback)
+					if !preserveNativeOutput {
+						data = patchCodexCompletedOutput(data, outputItemsByIndex, outputItemsFallback)
+					}
 					if eventType == "response.completed" || eventType == "response.done" {
 						cacheCodexReasoningReplayFromCompleted(replayScope, data)
 					}
@@ -412,7 +415,9 @@ func (e *CodexExecutor) ExecuteStream(ctx context.Context, auth *cliproxyauth.Au
 						reporter.EnsurePublished(ctx)
 					}
 					publishCodexImageToolUsage(ctx, reporter, body, data)
-					data = patchCodexCompletedOutput(data, outputItemsByIndex, outputItemsFallback)
+					if !preserveNativeOutput {
+						data = patchCodexCompletedOutput(data, outputItemsByIndex, outputItemsFallback)
+					}
 					if eventType == "response.completed" || eventType == "response.done" {
 						cacheCodexReasoningReplayFromCompleted(replayScope, data)
 					}

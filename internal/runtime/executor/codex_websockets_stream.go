@@ -36,6 +36,7 @@ func (e *CodexWebsocketsExecutor) ExecuteStream(ctx context.Context, auth *clipr
 
 	from := opts.SourceFormat
 	responseFormat := cliproxyexecutor.ResponseFormatOrSource(opts)
+	preserveNativeOutput := helps.IsNativeCodexRequest(req.Payload, opts)
 	to := sdktranslator.FromString("codex")
 	originalPayloadSource := req.Payload
 	if len(opts.OriginalRequest) > 0 {
@@ -53,7 +54,7 @@ func (e *CodexWebsocketsExecutor) ExecuteStream(ctx context.Context, auth *clipr
 	requestPath := helps.PayloadRequestPath(opts)
 	body = helps.ApplyPayloadConfigWithRequest(e.cfg, baseModel, to.String(), from.String(), "", body, originalTranslated, requestedModel, requestPath, opts.Headers)
 	body = helps.SetStringIfDifferent(body, "model", baseModel)
-	body = applyCodexInstructionPatches(e.cfg, body)
+	body = applyCodexInstructionPatches(e.cfg, body, preserveNativeOutput)
 	if e.cfg == nil || e.cfg.DisableImageGeneration == config.DisableImageGenerationOff {
 		body = ensureImageGenerationTool(body, baseModel, auth, opts.Headers)
 	}
@@ -82,7 +83,7 @@ func (e *CodexWebsocketsExecutor) ExecuteStream(ctx context.Context, auth *clipr
 	upstreamBody, identityState := applyCodexIdentityConfuseBody(e.cfg, auth, originalPayloadSource, body)
 	reporter.SetTranslatedReasoningEffort(clientBody, to.String())
 	var errHeaders error
-	wsHeaders, errHeaders = applyCodexWebsocketHeaders(ctx, wsHeaders, auth, apiKey, e.cfg, opts.Headers)
+	wsHeaders, errHeaders = applyCodexWebsocketHeaders(ctx, wsHeaders, auth, apiKey, e.cfg, preserveNativeOutput, opts.Headers)
 	if errHeaders != nil {
 		return nil, errHeaders
 	}
@@ -439,7 +440,9 @@ func (e *CodexWebsocketsExecutor) ExecuteStream(ctx context.Context, auth *clipr
 			completedPayload := payload
 			if eventType == "response.completed" || eventType == "response.done" || eventType == "response.incomplete" {
 				completedPayload = normalizeCodexWebsocketCompletion(completedPayload)
-				completedPayload = patchCodexCompletedOutput(completedPayload, outputItemsByIndex, outputItemsFallback)
+				if !preserveNativeOutput {
+					completedPayload = patchCodexCompletedOutput(completedPayload, outputItemsByIndex, outputItemsFallback)
+				}
 				if eventType != "response.incomplete" {
 					cacheCodexReasoningReplayFromCompleted(replayScope, completedPayload)
 				}
@@ -666,7 +669,9 @@ func (e *CodexWebsocketsExecutor) ExecuteStream(ctx context.Context, auth *clipr
 			completedPayload := payload
 			if eventType == "response.completed" || eventType == "response.done" || eventType == "response.incomplete" {
 				completedPayload = normalizeCodexWebsocketCompletion(completedPayload)
-				completedPayload = patchCodexCompletedOutput(completedPayload, outputItemsByIndex, outputItemsFallback)
+				if !preserveNativeOutput {
+					completedPayload = patchCodexCompletedOutput(completedPayload, outputItemsByIndex, outputItemsFallback)
+				}
 				if eventType != "response.incomplete" {
 					cacheCodexReasoningReplayFromCompleted(replayScope, completedPayload)
 				}

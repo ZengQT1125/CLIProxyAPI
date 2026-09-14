@@ -101,8 +101,8 @@ type WatcherWrapper struct {
 	start func(ctx context.Context) error
 	stop  func() error
 
-	setConfig                    func(cfg *config.Config)
-	snapshotAuths                func() []*coreauth.Auth
+	setConfig     func(cfg *config.Config)
+	snapshotAuths func() []*coreauth.Auth
 	// setUpdateQueue uses the batch type so the fork's batched dispatcher stays intact.
 	setUpdateQueue               func(queue chan<- watcher.AuthUpdateBatch)
 	dispatchRuntimeUpdate        func(update watcher.AuthUpdate) bool

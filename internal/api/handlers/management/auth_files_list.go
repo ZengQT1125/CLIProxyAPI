@@ -6,6 +6,7 @@ import (
 	"sort"
 	"strconv"
 	"strings"
+	"time"
 
 	"github.com/gin-gonic/gin"
 	coreauth "github.com/router-for-me/CLIProxyAPI/v7/sdk/cliproxy/auth"
@@ -303,10 +304,14 @@ func authFilePriority(auth *coreauth.Auth) (int, bool) {
 	return authFileIntValue(auth.Metadata["priority"])
 }
 
-func (h *Handler) writeFullAuthFileList(c *gin.Context, auths []*coreauth.Auth) {
+func (h *Handler) writeFullAuthFileList(c *gin.Context, auths []*coreauth.Auth, observedAt time.Time, cooldownsKnown bool) {
 	files := make([]gin.H, 0, len(auths))
 	for _, auth := range auths {
 		if entry := h.buildAuthFileEntry(auth); entry != nil {
+			entry["cooldowns"] = nil
+			if cooldownsKnown {
+				entry["cooldowns"] = coreauth.CooldownSnapshotForAuth(auth, observedAt)
+			}
 			files = append(files, entry)
 		}
 	}
@@ -315,5 +320,5 @@ func (h *Handler) writeFullAuthFileList(c *gin.Context, auths []*coreauth.Auth) 
 		nameJ, _ := files[j]["name"].(string)
 		return strings.ToLower(nameI) < strings.ToLower(nameJ)
 	})
-	c.JSON(http.StatusOK, gin.H{"files": files})
+	c.JSON(http.StatusOK, gin.H{"observed_at": observedAt, "files": files})
 }

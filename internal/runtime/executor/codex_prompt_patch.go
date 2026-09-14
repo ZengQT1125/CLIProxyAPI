@@ -10,8 +10,8 @@ import (
 
 const codexIntermediaryUpdatesHeading = "## Intermediary updates"
 
-func applyCodexInstructionPatches(cfg *config.Config, body []byte) []byte {
-	body = normalizeCodexInstructions(body)
+func applyCodexInstructionPatches(cfg *config.Config, body []byte, nativeRequest bool) []byte {
+	body = normalizeCodexInstructions(body, nativeRequest)
 	return stripCodexIntermediaryUpdatesFromPayload(cfg, body)
 }
 

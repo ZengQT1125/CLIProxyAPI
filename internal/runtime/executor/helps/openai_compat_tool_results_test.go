@@ -55,13 +55,13 @@ func TestNormalizeOpenAIToolResultsTextOnlyNonToolContent(t *testing.T) {
 		wantRaw string
 	}{
 		{
-			name:  "relay message drops image and keeps notice",
-			input: `{"messages":[{"role":"user","content":[{"type":"text","text":"notice"},{"type":"image_url","image_url":{"url":"data:image/png;base64,AA=="}}]}]}`,
+			name:    "relay message drops image and keeps notice",
+			input:   `{"messages":[{"role":"user","content":[{"type":"text","text":"notice"},{"type":"image_url","image_url":{"url":"data:image/png;base64,AA=="}}]}]}`,
 			wantRaw: `[{"type":"text","text":"notice"},{"type":"text","text":"` + openAIToolResultImageOmittedText + `"}]`,
 		},
 		{
-			name:  "claude style image part",
-			input: `{"messages":[{"role":"user","content":[{"type":"image","source":{"type":"base64","media_type":"image/png","data":"AA=="}}]}]}`,
+			name:    "claude style image part",
+			input:   `{"messages":[{"role":"user","content":[{"type":"image","source":{"type":"base64","media_type":"image/png","data":"AA=="}}]}]}`,
 			wantRaw: `[{"type":"text","text":"` + openAIToolResultImageOmittedText + `"}]`,
 		},
 		{
