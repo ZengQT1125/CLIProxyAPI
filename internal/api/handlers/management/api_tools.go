@@ -239,31 +239,53 @@ func (h *Handler) executeAPICall(ctx context.Context, body apiCallRequest) (apiC
 	var token string
 	var tokenResolved bool
 	var tokenErr error
-	for key, value := range reqHeaders {
-		if !strings.Contains(value, "$TOKEN$") {
-			continue
-		}
+
+	resolveToken := func() *apiCallExecutionError {
 		if !tokenResolved {
 			token, tokenErr = h.resolveTokenForAuth(ctx, auth, requestProxyURL)
 			tokenResolved = true
 		}
 		if auth != nil && token == "" {
 			if tokenErr != nil {
-				return fail(http.StatusBadRequest, "auth token refresh failed")
+				return &apiCallExecutionError{status: http.StatusBadRequest, message: "auth token refresh failed"}
 			}
 			// Base-URL-only API keys have no bearer token; their executor omits stale auth headers.
 			// OAuth/file credentials without a usable token must fail here so the
 			// management proxy does not forward an unauthenticated request.
-			if auth.AuthKind() == coreauth.AuthKindAPIKey {
-				delete(reqHeaders, key)
-				continue
+			if auth.AuthKind() != coreauth.AuthKindAPIKey {
+				return &apiCallExecutionError{status: http.StatusUnauthorized, message: "missing access token"}
 			}
-			return fail(http.StatusUnauthorized, "missing access token")
+		}
+		return nil
+	}
+
+	for key, value := range reqHeaders {
+		if !strings.Contains(value, "$TOKEN$") {
+			continue
+		}
+		if tokenFailure := resolveToken(); tokenFailure != nil {
+			return fail(tokenFailure.status, tokenFailure.message)
 		}
 		if token == "" {
+			delete(reqHeaders, key)
 			continue
 		}
 		reqHeaders[key] = strings.ReplaceAll(value, "$TOKEN$", token)
+	}
+
+	if strings.Contains(body.Data, "$TOKEN$") {
+		if tokenFailure := resolveToken(); tokenFailure != nil {
+			return fail(tokenFailure.status, tokenFailure.message)
+		}
+		if token != "" {
+			replacement := token
+			if json.Valid([]byte(body.Data)) && strings.ContainsAny(token, "\"\\\r\n\t") {
+				if b, errMarshal := json.Marshal(token); errMarshal == nil && len(b) >= 2 {
+					replacement = string(b[1 : len(b)-1])
+				}
+			}
+			body.Data = strings.ReplaceAll(body.Data, "$TOKEN$", replacement)
+		}
 	}
 
 	var requestBody io.Reader
@@ -357,6 +379,9 @@ func tokenValueForAuth(auth *coreauth.Auth) string {
 	}
 	if auth.Attributes != nil {
 		if v := strings.TrimSpace(auth.Attributes["api_key"]); v != "" {
+			return v
+		}
+		if v := strings.TrimSpace(auth.Attributes["session_token"]); v != "" {
 			return v
 		}
 	}
@@ -577,6 +602,12 @@ func tokenValueFromMetadata(metadata map[string]any) string {
 		return strings.TrimSpace(v)
 	}
 	if v, ok := metadata["id_token"].(string); ok && strings.TrimSpace(v) != "" {
+		return strings.TrimSpace(v)
+	}
+	if v, ok := metadata["api_key"].(string); ok && strings.TrimSpace(v) != "" {
+		return strings.TrimSpace(v)
+	}
+	if v, ok := metadata["session_token"].(string); ok && strings.TrimSpace(v) != "" {
 		return strings.TrimSpace(v)
 	}
 	if v, ok := metadata["cookie"].(string); ok && strings.TrimSpace(v) != "" {
