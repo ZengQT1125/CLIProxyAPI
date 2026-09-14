@@ -6,6 +6,7 @@ import (
 	"crypto/tls"
 	"encoding/json"
 	"fmt"
+	"io"
 	"net"
 	"net/http"
 	"net/http/httptest"
@@ -895,5 +896,67 @@ func TestAuthByIndexDistinguishesSharedAPIKeysAcrossProviders(t *testing.T) {
 	}
 	if gotCompat.ID != compatAuth.ID {
 		t.Fatalf("authByIndex(compat) returned %q, want %q", gotCompat.ID, compatAuth.ID)
+	}
+}
+
+func TestAPICallReplacesTokenInBodyData(t *testing.T) {
+	t.Parallel()
+
+	var receivedBody string
+	upstreamServer := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		b, _ := io.ReadAll(r.Body)
+		receivedBody = string(b)
+		w.WriteHeader(http.StatusOK)
+		_, _ = w.Write([]byte(`{"ok":true}`))
+	}))
+	defer upstreamServer.Close()
+
+	manager := coreauth.NewManager(nil, &coreauth.RoundRobinSelector{}, nil)
+	manager.RegisterExecutor(runtimeexecutor.NewDevinExecutor(&config.Config{}))
+	devinAuth := &coreauth.Auth{
+		ID:       "devin-test.json",
+		Provider: "devin",
+		Attributes: map[string]string{
+			"api_key": "secret-session-token-xyz",
+		},
+		Metadata: map[string]any{
+			"type":    "devin",
+			"api_key": "secret-session-token-xyz",
+		},
+	}
+	if _, errRegister := manager.Register(context.Background(), devinAuth); errRegister != nil {
+		t.Fatalf("register devin auth: %v", errRegister)
+	}
+	authIndex := devinAuth.EnsureIndex()
+
+	h := &Handler{
+		cfg:         &config.Config{},
+		authManager: manager,
+	}
+	router := gin.New()
+	router.POST("/", h.APICall)
+
+	reqPayload := map[string]any{
+		"method":     "POST",
+		"url":        upstreamServer.URL,
+		"auth_index": authIndex,
+		"header": map[string]string{
+			"Content-Type": "application/json",
+		},
+		"data": `{"metadata":{"apiKey":"$TOKEN$","ideName":"chisel"}}`,
+	}
+	reqBytes, _ := json.Marshal(reqPayload)
+
+	recorder := httptest.NewRecorder()
+	req := httptest.NewRequest(http.MethodPost, "/", strings.NewReader(string(reqBytes)))
+	req.Header.Set("Content-Type", "application/json")
+	router.ServeHTTP(recorder, req)
+
+	if recorder.Code != http.StatusOK {
+		t.Fatalf("status code = %d, want %d; body = %s", recorder.Code, http.StatusOK, recorder.Body.String())
+	}
+	expectedBody := `{"metadata":{"apiKey":"secret-session-token-xyz","ideName":"chisel"}}`
+	if receivedBody != expectedBody {
+		t.Fatalf("received body = %q, want %q", receivedBody, expectedBody)
 	}
 }

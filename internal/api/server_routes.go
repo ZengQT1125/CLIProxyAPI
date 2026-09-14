@@ -177,7 +177,7 @@ func (s *Server) setupRoutes() {
 		c.String(http.StatusOK, oauthCallbackSuccessHTML)
 	})
 
-	s.engine.GET("/devin/callback", func(c *gin.Context) {
+	devinCallbackHandler := func(c *gin.Context) {
 		c.Header("Cache-Control", "no-store")
 		code := strings.TrimSpace(c.Query("code"))
 		state := strings.TrimSpace(c.Query("state"))
@@ -195,7 +195,10 @@ func (s *Server) setupRoutes() {
 		}
 		c.Header("Content-Type", "text/html; charset=utf-8")
 		c.String(http.StatusOK, oauthCallbackSuccessHTML)
-	})
+	}
+
+	s.engine.GET("/callback", devinCallbackHandler)
+	s.engine.GET("/devin/callback", devinCallbackHandler)
 
 	// Management routes are registered lazily by registerManagementRoutes when a secret is configured.
 }
