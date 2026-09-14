@@ -135,6 +135,8 @@ func (h *Handler) ListAuthFiles(c *gin.Context) {
 		quotaSupportedProviders = host.QuotaSupportedProvidersSet(c.Request.Context())
 	}
 	auths := h.authManager.List()
+	observedAt := time.Now().UTC()
+	cooldownsKnown := !h.authManager.HomeEnabled()
 	if nameFilter != "" || authIndexFilter != "" {
 		filtered := make([]*coreauth.Auth, 0, len(auths))
 		for _, auth := range auths {
@@ -145,17 +147,22 @@ func (h *Handler) ListAuthFiles(c *gin.Context) {
 		auths = filtered
 	}
 	if !paginated {
-		h.writeFullAuthFileList(c, auths)
+		h.writeFullAuthFileList(c, auths, observedAt, cooldownsKnown)
 		return
 	}
 	page := buildAuthFileListPage(auths, query)
 	files := make([]gin.H, 0, len(page.Auths))
 	for _, auth := range page.Auths {
 		if entry := h.buildAuthFileEntry(auth, quotaSupportedProviders); entry != nil {
+			entry["cooldowns"] = nil
+			if cooldownsKnown {
+				entry["cooldowns"] = coreauth.CooldownSnapshotForAuth(auth, observedAt)
+			}
 			files = append(files, entry)
 		}
 	}
 	c.JSON(http.StatusOK, gin.H{
+		"observed_at":         observedAt,
 		"files":               files,
 		"total":               page.Total,
 		"page":                page.Page,
@@ -277,6 +284,7 @@ func (h *Handler) GetAuthFileLoadStatus(c *gin.Context) {
 
 // List auth files from disk when the auth manager is unavailable.
 func (h *Handler) listAuthFilesFromDisk(c *gin.Context, query authFileListQuery, paginated bool) {
+	observedAt := time.Now().UTC()
 	nameFilter := strings.TrimSpace(c.Query("name"))
 	authIndexFilter := strings.TrimSpace(c.Query("auth_index"))
 	entries, err := os.ReadDir(h.cfg.AuthDir)
@@ -290,10 +298,11 @@ func (h *Handler) listAuthFilesFromDisk(c *gin.Context, query authFileListQuery,
 	// Disk fallback has no stable auth_index identity; reject that filter.
 	if authIndexFilter != "" {
 		if !paginated {
-			c.JSON(200, gin.H{"files": files})
+			c.JSON(200, gin.H{"observed_at": observedAt, "files": files})
 			return
 		}
 		c.JSON(http.StatusOK, gin.H{
+			"observed_at":         observedAt,
 			"files":               files,
 			"total":               0,
 			"page":                query.Page,
@@ -316,7 +325,7 @@ func (h *Handler) listAuthFilesFromDisk(c *gin.Context, query authFileListQuery,
 			continue
 		}
 		if info, errInfo := e.Info(); errInfo == nil {
-			fileData := gin.H{"name": name, "size": info.Size(), "modtime": info.ModTime()}
+			fileData := gin.H{"name": name, "size": info.Size(), "modtime": info.ModTime(), "cooldowns": nil}
 
 			// Read file to get type field
 			full := filepath.Join(h.cfg.AuthDir, name)
@@ -396,7 +405,7 @@ func (h *Handler) listAuthFilesFromDisk(c *gin.Context, query authFileListQuery,
 		}
 	}
 	if !paginated {
-		c.JSON(200, gin.H{"files": files})
+		c.JSON(200, gin.H{"observed_at": observedAt, "files": files})
 		return
 	}
 	page := buildAuthFileListPage(diskAuths, query)
@@ -405,6 +414,7 @@ func (h *Handler) listAuthFilesFromDisk(c *gin.Context, query authFileListQuery,
 		pageFiles = append(pageFiles, diskEntries[auth])
 	}
 	c.JSON(http.StatusOK, gin.H{
+		"observed_at":         observedAt,
 		"files":               pageFiles,
 		"total":               page.Total,
 		"page":                page.Page,
@@ -451,6 +461,10 @@ func (h *Handler) buildAuthFileEntryLocked(auth *coreauth.Auth, quotaSupported .
 	}
 	entry["success"] = auth.Success
 	entry["failed"] = auth.Failed
+	entry["quota"] = quotaObservationPayloadForProvider(auth.Provider, auth.Quota)
+	if modelQuotas := modelQuotaObservationPayload(auth.Provider, auth.ModelStates); len(modelQuotas) > 0 {
+		entry["model_quotas"] = modelQuotas
+	}
 	if auth.LastRequestError != nil {
 		entry["last_request_error"] = auth.LastRequestError
 	}
