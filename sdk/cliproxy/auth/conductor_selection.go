@@ -1328,7 +1328,7 @@ func (m *Manager) shouldRetryAfterErrorWithAttempted(ctx context.Context, opts c
 	}
 	var exhausted *homeRetryRoundExhaustedError
 	if m.HomeEnabled() && errors.As(err, &exhausted) && exhausted != nil {
-		if !isCredentialRetryRoundStatus(status) || !m.homeRetryAllowed(attempt, homeRetryLimit) {
+		if !isRequestRetryRoundError(err) || !m.homeRetryAllowed(attempt, homeRetryLimit) {
 			return 0, false
 		}
 		if exhausted.retryNow {
@@ -1356,7 +1356,7 @@ func (m *Manager) shouldRetryAfterErrorWithAttempted(ctx context.Context, opts c
 	}
 	eligibility := authSelectionEligibilityForRequest(ctx, opts)
 	pinnedAuthID := pinnedAuthIDFromMetadata(opts.Metadata)
-	if !isCredentialRetryRoundStatus(status) || !m.retryAllowed(attempt, providers, model, eligibility, pinnedAuthID, defaultRequestRetry) {
+	if !isRequestRetryRoundError(err) || !m.retryAllowed(attempt, providers, model, eligibility, pinnedAuthID, defaultRequestRetry) {
 		return 0, false
 	}
 	wait, found := m.closestCooldownWaitWithAttempted(providers, model, attempt, eligibility, pinnedAuthID, defaultRequestRetry, status, attempted)
@@ -1433,6 +1433,13 @@ func isCredentialRetryRoundStatus(status int) bool {
 	default:
 		return false
 	}
+}
+
+func isRequestRetryRoundError(err error) bool {
+	if err == nil {
+		return false
+	}
+	return isCredentialRetryRoundStatus(statusCodeFromError(err)) || isTransientTransportError(err)
 }
 
 // cooldownWaitJitterCap bounds the random jitter added to cooldown waits so a
