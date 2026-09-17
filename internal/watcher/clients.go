@@ -275,12 +275,13 @@ func authSliceToMap(auths []*coreauth.Auth) map[string]*coreauth.Auth {
 	return byID
 }
 
-func BuildAPIKeyClients(cfg *config.Config) (int, int, int, int, int, int) {
+func BuildAPIKeyClients(cfg *config.Config) (int, int, int, int, int, int, int) {
 	geminiAPIKeyCount := 0
 	vertexCompatAPIKeyCount := 0
 	claudeAPIKeyCount := 0
 	codexAPIKeyCount := 0
 	xaiAPIKeyCount := 0
+	metaAPIKeyCount := 0
 	openAICompatCount := 0
 
 	if len(cfg.GeminiKey) > 0 {
@@ -301,6 +302,9 @@ func BuildAPIKeyClients(cfg *config.Config) (int, int, int, int, int, int) {
 	if len(cfg.XAIKey) > 0 {
 		xaiAPIKeyCount += len(cfg.XAIKey)
 	}
+	if len(cfg.MetaKey) > 0 {
+		metaAPIKeyCount += len(cfg.MetaKey)
+	}
 	if len(cfg.OpenAICompatibility) > 0 {
 		for _, compatConfig := range cfg.OpenAICompatibility {
 			if compatConfig.Disabled {
@@ -309,7 +313,7 @@ func BuildAPIKeyClients(cfg *config.Config) (int, int, int, int, int, int) {
 			openAICompatCount += len(compatConfig.APIKeyEntries)
 		}
 	}
-	return geminiAPIKeyCount, vertexCompatAPIKeyCount, claudeAPIKeyCount, codexAPIKeyCount, xaiAPIKeyCount, openAICompatCount
+	return geminiAPIKeyCount, vertexCompatAPIKeyCount, claudeAPIKeyCount, codexAPIKeyCount, xaiAPIKeyCount, metaAPIKeyCount, openAICompatCount
 }
 
 func (w *Watcher) persistConfigAsync() {
