@@ -114,8 +114,12 @@ func TestOpenAICompatExecutorToolResultContentByInputModalities(t *testing.T) {
 			if toolContent.Type != gjson.String {
 				t.Fatalf("tool content type = %s, want string; body=%s", toolContent.Type, string(gotBody))
 			}
-			if toolContent.String() != "image inspected" {
-				t.Fatalf("tool content = %q, want %q", toolContent.String(), "image inspected")
+			wantText := "image inspected"
+			if !tt.wantImages {
+				wantText += "\n\n[image omitted: unsupported by upstream]"
+			}
+			if toolContent.String() != wantText {
+				t.Fatalf("tool content = %q, want %q", toolContent.String(), wantText)
 			}
 
 			// Fork feature: a text-only model must not receive the relayed image,

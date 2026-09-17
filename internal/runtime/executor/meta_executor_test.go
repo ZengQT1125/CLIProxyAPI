@@ -134,8 +134,8 @@ func TestMetaExecutor_ExecuteSuccessAndRateLimit(t *testing.T) {
 
 		if r.URL.Path == "/responses" {
 			// Check user agent
-			if ua := r.Header.Get("User-Agent"); ua != "muse-build/1.3.0 (interactive; macos-aarch64; build ac7280f2aca67769d1455a8847bb502b617d50f6)" {
-				t.Errorf("unexpected User-Agent: %s", ua)
+			if ua := r.Header.Get("User-Agent"); ua != metaUserAgent {
+				t.Errorf("expected User-Agent %s, got %s", metaUserAgent, ua)
 			}
 			// Simulate 429 rate limit
 			w.WriteHeader(http.StatusTooManyRequests)
