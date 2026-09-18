@@ -199,10 +199,21 @@ func (e *ClaudeExecutor) claudeStatusErr(ctx context.Context, httpClient *http.C
 		return classified
 	}
 	now := time.Now()
+	var retryAfter *time.Duration
+	type retryAfterProvider interface {
+		RetryAfter() *time.Duration
+	}
+	var retryProvider retryAfterProvider
+	if errors.As(classified, &retryProvider) && retryProvider != nil {
+		retryAfter = retryProvider.RetryAfter()
+	}
+	if !helps.ClaudeHeadersIndicateOverageOnlyRejection(headers) {
+		retryAfter = claudeRetryAfterFromHeader(headers, now)
+	}
 	errStatus := statusErr{
 		code:       code,
 		msg:        string(body),
-		retryAfter: claudeRetryAfterFromHeader(headers, now),
+		retryAfter: retryAfter,
 	}
 	if code != http.StatusTooManyRequests || errStatus.retryAfter != nil {
 		return errStatus
