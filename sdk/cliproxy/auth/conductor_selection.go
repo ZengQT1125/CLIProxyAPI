@@ -42,6 +42,27 @@ func (m *Manager) hasPluginScheduler() bool {
 	return true
 }
 
+func (m *Manager) pluginSchedulerWantsAcrossPrioritiesLocked() bool {
+	if m == nil || m.pluginScheduler == nil {
+		return false
+	}
+	if opt, ok := m.pluginScheduler.(PluginSchedulerAcrossPriorities); ok && opt != nil {
+		return opt.SchedulerWantsAcrossPriorities()
+	}
+	return false
+}
+
+// PluginSchedulerWantsAcrossPriorities reports whether the configured plugin scheduler
+// opted into receiving candidates across all priority tiers.
+func (m *Manager) PluginSchedulerWantsAcrossPriorities() bool {
+	if m == nil {
+		return false
+	}
+	m.mu.RLock()
+	defer m.mu.RUnlock()
+	return m.pluginSchedulerWantsAcrossPrioritiesLocked()
+}
+
 func isBuiltInSelector(selector Selector) bool {
 	switch selector.(type) {
 	case *RoundRobinSelector, *WeightedRoundRobinSelector, *FillFirstSelector:
@@ -610,11 +631,14 @@ func (m *Manager) availableAuthsForRouteModelWithPriorityMode(auths []*Auth, pro
 }
 
 // availableAuthsForSelector reports the candidates handed to priority-scoped consumers such as
-// the plugin scheduler, plus the candidates handed to the configured selector. Retry-aware
-// selectors receive every ready priority tier so request-scoped failover and established session
-// bindings do not mutate sticky state. Other selectors receive only the highest ready tier.
+// the plugin scheduler, plus the candidates handed to the configured selector. Both are equal
+// unless session affinity or an across-priorities scheduler is active, in which case the selector
+// or scheduler additionally receives lower priority tiers.
 func (m *Manager) availableAuthsForSelector(selector Selector, auths []*Auth, provider, routeModel string, now time.Time) (priorityAuths, selectorAuths []*Auth, err error) {
-	if _, retryAware := selector.(retryAwareSelector); !retryAware {
+	_, sessionAffinity := selector.(*SessionAffinitySelector)
+	schedulerAcross := m.pluginSchedulerWantsAcrossPrioritiesLocked()
+
+	if !sessionAffinity && !schedulerAcross {
 		priorityAuths, err = m.availableAuthsForRouteModel(auths, provider, routeModel, now)
 		if err != nil {
 			return nil, nil, err
@@ -625,12 +649,24 @@ func (m *Manager) availableAuthsForSelector(selector Selector, auths []*Auth, pr
 
 	// One availability pass and one clone pass serve both lists: the highest priority tier is a
 	// subset of the across-priority candidates, so it is narrowed from the same cloned auths.
-	selectorAuths, err = m.availableAuthsForRouteModelAcrossPriorities(auths, provider, routeModel, now)
-	if err != nil {
-		return nil, nil, err
+	allAuths, errAcross := m.availableAuthsForRouteModelAcrossPriorities(auths, provider, routeModel, now)
+	if errAcross != nil {
+		return nil, nil, errAcross
 	}
-	selectorAuths = cloneAuthSlice(selectorAuths)
-	return highestPriorityAuths(selectorAuths), selectorAuths, nil
+	allAuths = cloneAuthSlice(allAuths)
+
+	if schedulerAcross {
+		priorityAuths = allAuths
+	} else {
+		priorityAuths = highestPriorityAuths(allAuths)
+	}
+
+	if sessionAffinity {
+		selectorAuths = allAuths
+	} else {
+		selectorAuths = highestPriorityAuths(allAuths)
+	}
+	return priorityAuths, selectorAuths, nil
 }
 
 func selectionArgForSelector(selector Selector, routeModel string) string {
@@ -1628,6 +1664,7 @@ func (m *Manager) pickNextLegacy(ctx context.Context, provider, model string, op
 	selector := m.selector
 	opts.Metadata[cliproxyexecutor.SessionAffinityModelMetadataKey] = selectionArgForSelector(selector, model)
 	pluginScheduler := m.pluginScheduler
+	schedulerAcross := m.pluginSchedulerWantsAcrossPrioritiesLocked()
 	executor, okExecutor := m.executors[provider]
 	if !okExecutor {
 		m.mu.RUnlock()
@@ -1682,7 +1719,10 @@ func (m *Manager) pickNextLegacy(ctx context.Context, provider, model string, op
 	}
 	schedulerCandidates := priorityAuths
 	if retryAware {
-		schedulerCandidates = highestPriorityAuths(selectable)
+		schedulerCandidates = selectable
+		if !schedulerAcross {
+			schedulerCandidates = highestPriorityAuths(selectable)
+		}
 	}
 	selected, handled, errPick := m.pickViaPluginScheduler(ctx, pluginScheduler, provider, []string{provider}, model, opts, tried, schedulerCandidates)
 	if errPick != nil {
@@ -1971,6 +2011,7 @@ func (m *Manager) pickNextMixedLegacy(ctx context.Context, providers []string, m
 	selector := m.selector
 	opts.Metadata[cliproxyexecutor.SessionAffinityModelMetadataKey] = selectionArgForSelector(selector, model)
 	pluginScheduler := m.pluginScheduler
+	schedulerAcross := m.pluginSchedulerWantsAcrossPrioritiesLocked()
 	candidates := make([]*Auth, 0, len(m.auths))
 	modelKey := strings.TrimSpace(model)
 	// Always use base model name (without thinking suffix) for auth matching.
@@ -2030,7 +2071,10 @@ func (m *Manager) pickNextMixedLegacy(ctx context.Context, providers []string, m
 	}
 	schedulerCandidates := priorityAuths
 	if retryAware {
-		schedulerCandidates = highestPriorityAuths(selectable)
+		schedulerCandidates = selectable
+		if !schedulerAcross {
+			schedulerCandidates = highestPriorityAuths(selectable)
+		}
 	}
 	selected, handled, errPick := m.pickViaPluginScheduler(ctx, pluginScheduler, "mixed", providers, model, opts, tried, schedulerCandidates)
 	if errPick != nil {
