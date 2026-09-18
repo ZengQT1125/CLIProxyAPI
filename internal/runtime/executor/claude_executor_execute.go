@@ -344,7 +344,7 @@ func (e *ClaudeExecutor) Execute(ctx context.Context, auth *cliproxyauth.Auth, r
 				log.Errorf("response body close error: %v", errClose)
 			}
 			if fastRequest {
-				errClassified := classifyClaudeUpstreamError(httpResp.StatusCode, httpResp.Header, []byte(msg))
+				errClassified := classifyClaudeUpstreamErrorWithCooling(httpResp.StatusCode, httpResp.Header, []byte(msg), e.modelLevelCooling())
 				return resp, wrapClaudeFastRequestError(true, httpResp.StatusCode, errClassified)
 			}
 			return resp, e.claudeStatusErr(ctx, rawHTTPClient, apiKey, baseURL, httpResp.StatusCode, httpResp.Header, []byte(msg))
