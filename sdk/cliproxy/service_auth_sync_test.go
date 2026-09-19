@@ -1269,10 +1269,11 @@ func TestEndToEndAuthFileReplacement_RestoresModelsInV1ModelsWithoutRestart(t *t
 	authDir := t.TempDir()
 	fileName := "codex-team.json"
 	filePath := filepath.Join(authDir, fileName)
+	modelPrefix := "auth-replacement-e2e"
 
 	// Synthetic JWT containing CodexAuthInfo claims with chatgpt_plan_type: team
 	teamIDToken := "eyJhbGciOiJub25lIn0.eyJlbWFpbCI6ICJ1c2VyQGV4YW1wbGUuY29tIiwgImh0dHBzOi8vYXBpLm9wZW5haS5jb20vYXV0aCI6IHsiY2hhdGdwdF9wbGFuX3R5cGUiOiAidGVhbSIsICJjaGF0Z3B0X2FjY291bnRfaWQiOiAiYWNjLTEyMyJ9fQ.sig"
-	initialContent := fmt.Sprintf(`{"type":"codex","email":"user@example.com","access_token":"token-old","id_token":%q}`, teamIDToken)
+	initialContent := fmt.Sprintf(`{"type":"codex","email":"user@example.com","access_token":"token-old","id_token":%q,"prefix":%q}`, teamIDToken, modelPrefix)
 	if errWrite := os.WriteFile(filePath, []byte(initialContent), 0o600); errWrite != nil {
 		t.Fatalf("write auth file: %v", errWrite)
 	}
@@ -1291,7 +1292,8 @@ func TestEndToEndAuthFileReplacement_RestoresModelsInV1ModelsWithoutRestart(t *t
 	}
 
 	cfg := &config.Config{
-		AuthDir: authDir,
+		SDKConfig: config.SDKConfig{ForceModelPrefix: true},
+		AuthDir:   authDir,
 		RemoteManagement: config.RemoteManagement{
 			SecretKey:   string(hashedSecret),
 			AllowRemote: true,
@@ -1317,6 +1319,7 @@ func TestEndToEndAuthFileReplacement_RestoresModelsInV1ModelsWithoutRestart(t *t
 		ID:       authID,
 		FileName: fileName,
 		Provider: "codex",
+		Prefix:   modelPrefix,
 		Status:   coreauth.StatusActive,
 		Metadata: map[string]any{
 			"type":         "codex",
@@ -1360,7 +1363,12 @@ func TestEndToEndAuthFileReplacement_RestoresModelsInV1ModelsWithoutRestart(t *t
 		}
 		return false
 	}
-	teamModels := []string{"gpt-6-astra", "gpt-5.6-sol", "gpt-5.6-terra", "codex-auto-review"}
+	teamModels := []string{
+		modelPrefix + "/gpt-6-astra",
+		modelPrefix + "/gpt-5.6-sol",
+		modelPrefix + "/gpt-5.6-terra",
+		modelPrefix + "/codex-auto-review",
+	}
 	for _, m := range teamModels {
 		if !hasModel(m) {
 			t.Fatalf("expected %q to be in initial /v1/models list: %s", m, rec.Body.String())
@@ -1377,7 +1385,7 @@ func TestEndToEndAuthFileReplacement_RestoresModelsInV1ModelsWithoutRestart(t *t
 		service.coreManager.MarkResult(context.Background(), coreauth.Result{
 			AuthID:     authID,
 			Provider:   "codex",
-			Model:      m,
+			Model:      strings.TrimPrefix(m, modelPrefix+"/"),
 			RouteModel: m,
 			Success:    false,
 			Error:      unauthErr,
@@ -1394,12 +1402,12 @@ func TestEndToEndAuthFileReplacement_RestoresModelsInV1ModelsWithoutRestart(t *t
 	}
 	for _, m := range teamModels {
 		if hasModel(m) {
-			t.Fatalf("expected %q to be absent after terminal auth failure", m)
+			t.Fatalf("expected %q to be absent after terminal auth failure (client_suspended=%t, model_count=%d, providers=%v)", m, reg.IsModelSuspendedForClient(authID, m), reg.GetModelCount(m), reg.GetModelProviders(m))
 		}
 	}
 
 	// 3. Replace credential via management upload (POST /v0/management/auth-files)
-	newContent := fmt.Sprintf(`{"type":"codex","email":"user@example.com","access_token":"token-new","id_token":%q}`, teamIDToken)
+	newContent := fmt.Sprintf(`{"type":"codex","email":"user@example.com","access_token":"token-new","id_token":%q,"prefix":%q}`, teamIDToken, modelPrefix)
 	var body bytes.Buffer
 	writer := multipart.NewWriter(&body)
 	part, err := writer.CreateFormFile("file", fileName)
@@ -1438,7 +1446,7 @@ func TestEndToEndAuthFileReplacement_RestoresModelsInV1ModelsWithoutRestart(t *t
 
 	// 5. Verify direct inference request succeeds using the replacement credential token
 	service.coreManager.RegisterExecutor(&syncTestExecutor{})
-	resp, errExec := service.coreManager.Execute(context.Background(), []string{"codex"}, cliproxyexecutor.Request{Model: "gpt-6-astra"}, cliproxyexecutor.Options{})
+	resp, errExec := service.coreManager.Execute(context.Background(), []string{"codex"}, cliproxyexecutor.Request{Model: teamModels[0]}, cliproxyexecutor.Options{})
 	if errExec != nil || string(resp.Payload) != "token-new" {
 		t.Fatalf("expected inference execution to use replacement token, got resp=%q err=%v", string(resp.Payload), errExec)
 	}
@@ -1448,9 +1456,10 @@ func TestEndToEndAuthFilePatch_RestoresModelsInV1ModelsWithoutRestart(t *testing
 	authDir := t.TempDir()
 	fileName := "codex-patch.json"
 	filePath := filepath.Join(authDir, fileName)
+	modelPrefix := "auth-patch-e2e"
 
 	teamIDToken := "eyJhbGciOiJub25lIn0.eyJlbWFpbCI6ICJ1c2VyQGV4YW1wbGUuY29tIiwgImh0dHBzOi8vYXBpLm9wZW5haS5jb20vYXV0aCI6IHsiY2hhdGdwdF9wbGFuX3R5cGUiOiAidGVhbSIsICJjaGF0Z3B0X2FjY291bnRfaWQiOiAiYWNjLTEyMyJ9fQ.sig"
-	initialContent := fmt.Sprintf(`{"type":"codex","email":"user@example.com","access_token":"token-old","id_token":%q}`, teamIDToken)
+	initialContent := fmt.Sprintf(`{"type":"codex","email":"user@example.com","access_token":"token-old","id_token":%q,"prefix":%q}`, teamIDToken, modelPrefix)
 	if errWrite := os.WriteFile(filePath, []byte(initialContent), 0o600); errWrite != nil {
 		t.Fatalf("write auth file: %v", errWrite)
 	}
@@ -1469,7 +1478,8 @@ func TestEndToEndAuthFilePatch_RestoresModelsInV1ModelsWithoutRestart(t *testing
 	}
 
 	cfg := &config.Config{
-		AuthDir: authDir,
+		SDKConfig: config.SDKConfig{ForceModelPrefix: true},
+		AuthDir:   authDir,
 		RemoteManagement: config.RemoteManagement{
 			SecretKey:   string(hashedSecret),
 			AllowRemote: true,
@@ -1495,6 +1505,7 @@ func TestEndToEndAuthFilePatch_RestoresModelsInV1ModelsWithoutRestart(t *testing
 		ID:       authID,
 		FileName: fileName,
 		Provider: "codex",
+		Prefix:   modelPrefix,
 		Status:   coreauth.StatusActive,
 		Metadata: map[string]any{
 			"type":         "codex",
@@ -1522,12 +1533,17 @@ func TestEndToEndAuthFilePatch_RestoresModelsInV1ModelsWithoutRestart(t *testing
 		Code:       "unauthorized",
 		Message:    "Encountered invalidated oauth token: test-token",
 	}
-	teamModels := []string{"gpt-6-astra", "gpt-5.6-sol", "gpt-5.6-terra", "codex-auto-review"}
+	teamModels := []string{
+		modelPrefix + "/gpt-6-astra",
+		modelPrefix + "/gpt-5.6-sol",
+		modelPrefix + "/gpt-5.6-terra",
+		modelPrefix + "/codex-auto-review",
+	}
 	for _, m := range teamModels {
 		service.coreManager.MarkResult(context.Background(), coreauth.Result{
 			AuthID:     authID,
 			Provider:   "codex",
-			Model:      m,
+			Model:      strings.TrimPrefix(m, modelPrefix+"/"),
 			RouteModel: m,
 			Success:    false,
 			Error:      unauthErr,
@@ -1554,7 +1570,7 @@ func TestEndToEndAuthFilePatch_RestoresModelsInV1ModelsWithoutRestart(t *testing
 	}
 	for _, m := range teamModels {
 		if hasModel(m) {
-			t.Fatalf("expected %q to be absent after terminal auth failure", m)
+			t.Fatalf("expected %q to be absent after terminal auth failure (client_suspended=%t, model_count=%d, providers=%v)", m, reg.IsModelSuspendedForClient(authID, m), reg.GetModelCount(m), reg.GetModelProviders(m))
 		}
 	}
 
@@ -1585,7 +1601,7 @@ func TestEndToEndAuthFilePatch_RestoresModelsInV1ModelsWithoutRestart(t *testing
 
 	// 4. Verify direct inference request succeeds using fresh token after PATCH
 	service.coreManager.RegisterExecutor(&syncTestExecutor{})
-	resp, errExec := service.coreManager.Execute(context.Background(), []string{"codex"}, cliproxyexecutor.Request{Model: "gpt-6-astra"}, cliproxyexecutor.Options{})
+	resp, errExec := service.coreManager.Execute(context.Background(), []string{"codex"}, cliproxyexecutor.Request{Model: teamModels[0]}, cliproxyexecutor.Options{})
 	if errExec != nil || string(resp.Payload) != "token-fresh" {
 		t.Fatalf("expected inference execution to use fresh token after PATCH, got resp=%q err=%v", string(resp.Payload), errExec)
 	}

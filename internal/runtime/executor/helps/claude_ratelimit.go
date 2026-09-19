@@ -41,6 +41,18 @@ func ClaudeHeadersIndicateUnifiedRateLimitRejection(headers http.Header) bool {
 	return !isOverageOrFableOnlyRejection(headers, status5h, status7d, status7dOI)
 }
 
+// ClaudeHeadersIndicateOverageOnlyRejection reports whether the rejection is
+// limited to overage/Fable access while the shared subscription windows remain healthy.
+func ClaudeHeadersIndicateOverageOnlyRejection(headers http.Header) bool {
+	if headers == nil {
+		return false
+	}
+	status5h := strings.ToLower(strings.TrimSpace(getHeaderCaseInsensitive(headers, "Anthropic-Ratelimit-Unified-5h-Status")))
+	status7d := strings.ToLower(strings.TrimSpace(getHeaderCaseInsensitive(headers, "Anthropic-Ratelimit-Unified-7d-Status")))
+	status7dOI := strings.ToLower(strings.TrimSpace(getHeaderCaseInsensitive(headers, "Anthropic-Ratelimit-Unified-7d_oi-Status")))
+	return isOverageOrFableOnlyRejection(headers, status5h, status7d, status7dOI)
+}
+
 func isClaudeWindowAllowed(status string) bool {
 	return status == "allowed" || status == "allowed_warning"
 }
@@ -135,13 +147,15 @@ func parseClaudeRateLimitResetWithFuzz(headers http.Header, now time.Time, minFu
 		rejectedWindows = append(rejectedWindows, "7d_oi")
 	}
 
-	// 1. Retry-After header
-	if rawRetryAfter := getHeaderCaseInsensitive(headers, "Retry-After"); rawRetryAfter != "" {
-		if !containsString(rejectedWindows, "retry-after") {
-			rejectedWindows = append(rejectedWindows, "retry-after")
-		}
-		if t, ok := parseRetryAfterHeader(rawRetryAfter, now); ok && t.After(now) {
-			candidateDeadlines = append(candidateDeadlines, t)
+	// 1. Retry-After header (skipped for an overage/Fable-only rejection, which does not describe the credential)
+	if !overageOnlyRejection {
+		if rawRetryAfter := getHeaderCaseInsensitive(headers, "Retry-After"); rawRetryAfter != "" {
+			if !containsString(rejectedWindows, "retry-after") {
+				rejectedWindows = append(rejectedWindows, "retry-after")
+			}
+			if t, ok := parseRetryAfterHeader(rawRetryAfter, now); ok && t.After(now) {
+				candidateDeadlines = append(candidateDeadlines, t)
+			}
 		}
 	}
 
