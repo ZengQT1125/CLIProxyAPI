@@ -2081,6 +2081,12 @@ func isUpstreamUnauthorizedError(err error) bool {
 	return strings.Contains(raw, "status 401") || strings.Contains(raw, "401 unauthorized")
 }
 
+// HasUnauthorizedAuthFailure reports whether the auth has a terminal unauthorized error
+// with no pending refresh scheduled.
+func HasUnauthorizedAuthFailure(auth *Auth) bool {
+	return hasUnauthorizedAuthFailure(auth)
+}
+
 func refreshErrorFromError(err error) *Error {
 	if err == nil {
 		return nil

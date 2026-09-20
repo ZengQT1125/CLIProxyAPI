@@ -9,6 +9,7 @@ package claude
 import (
 	"bytes"
 	"context"
+	"math"
 	"strings"
 
 	translatorcommon "github.com/router-for-me/CLIProxyAPI/v7/internal/translator/common"
@@ -157,7 +158,7 @@ func ConvertCodexResponseToClaude(_ context.Context, _ string, originalRequestRa
 		output = append(output, stopCodexTextBlock(params)...)
 		template, _ = sjson.SetBytes(template, "delta.stop_reason", mapCodexStopReasonToClaude(codexStopReason(responseData), params.HasEmittedToolUse))
 		template = setClaudeStopSequence(template, "delta.stop_sequence", responseData)
-		inputTokens, outputTokens, cachedTokens, reasoningTokens, cacheWriteTokens := extractResponsesUsage(responseData.Get("usage"))
+		inputTokens, outputTokens, cachedTokens, reasoningTokens, cacheWriteTokens := extractResponsesUsageWithReasoning(responseData.Get("usage"))
 		template, _ = sjson.SetBytes(template, "usage.input_tokens", inputTokens)
 		template, _ = sjson.SetBytes(template, "usage.output_tokens", outputTokens)
 		if cachedTokens > 0 {
@@ -368,7 +369,7 @@ func ConvertCodexResponseToClaudeNonStream(_ context.Context, _ string, original
 	out := []byte(`{"id":"","type":"message","role":"assistant","model":"","content":[],"stop_reason":null,"stop_sequence":null,"usage":{"input_tokens":0,"output_tokens":0}}`)
 	out, _ = sjson.SetBytes(out, "id", responseData.Get("id").String())
 	out, _ = sjson.SetBytes(out, "model", responseData.Get("model").String())
-	inputTokens, outputTokens, cachedTokens, reasoningTokens, cacheWriteTokens := extractResponsesUsage(responseData.Get("usage"))
+	inputTokens, outputTokens, cachedTokens, reasoningTokens, cacheWriteTokens := extractResponsesUsageWithReasoning(responseData.Get("usage"))
 	out, _ = sjson.SetBytes(out, "usage.input_tokens", inputTokens)
 	out, _ = sjson.SetBytes(out, "usage.output_tokens", outputTokens)
 	if cachedTokens > 0 {
@@ -808,7 +809,12 @@ func resolveCodexClaudeToolUseName(originalRequestRawJSON []byte, name string) s
 	return name
 }
 
-func extractResponsesUsage(usage gjson.Result) (inputTokens, outputTokens, cachedTokens, reasoningTokens, cacheWriteTokens int64) {
+func extractResponsesUsage(usage gjson.Result) (inputTokens, outputTokens, cachedTokens, cacheWriteTokens int64) {
+	inputTokens, outputTokens, cachedTokens, _, cacheWriteTokens = extractResponsesUsageWithReasoning(usage)
+	return inputTokens, outputTokens, cachedTokens, cacheWriteTokens
+}
+
+func extractResponsesUsageWithReasoning(usage gjson.Result) (inputTokens, outputTokens, cachedTokens, reasoningTokens, cacheWriteTokens int64) {
 	if !usage.Exists() || usage.Type == gjson.Null {
 		return 0, 0, 0, 0, 0
 	}
@@ -823,16 +829,31 @@ func extractResponsesUsage(usage gjson.Result) (inputTokens, outputTokens, cache
 		reasoningTokens = usage.Get("completion_tokens_details.reasoning_tokens").Int()
 	}
 	cacheWriteTokens = usage.Get("input_tokens_details.cache_write_tokens").Int()
-	if cacheWriteTokens == 0 {
+	if cacheWriteTokens <= 0 {
 		cacheWriteTokens = usage.Get("input_tokens_details.cache_creation_tokens").Int()
 	}
 
+	deductTokens := int64(0)
 	if cachedTokens > 0 {
-		if inputTokens >= cachedTokens {
-			inputTokens -= cachedTokens
+		deductTokens += cachedTokens
+	}
+	if cacheWriteTokens > 0 {
+		if math.MaxInt64-deductTokens < cacheWriteTokens {
+			deductTokens = math.MaxInt64
+		} else {
+			deductTokens += cacheWriteTokens
+		}
+	}
+
+	if deductTokens > 0 {
+		if inputTokens >= deductTokens {
+			inputTokens -= deductTokens
 		} else {
 			inputTokens = 0
 		}
+	}
+	if inputTokens < 0 {
+		inputTokens = 0
 	}
 
 	return inputTokens, outputTokens, cachedTokens, reasoningTokens, cacheWriteTokens
