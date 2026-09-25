@@ -91,6 +91,7 @@ func (e *CodexExecutor) ExecuteStream(ctx context.Context, auth *cliproxyauth.Au
 	if err = applyCodexHeaders(httpReq, auth, apiKey, true, e.cfg, opts.Headers); err != nil {
 		return nil, err
 	}
+	applyCodexRoutingHint(ctx, httpReq.Header, auth, baseModel, upstreamBody, opts.Headers)
 	applyModelHeaderOverrides(httpReq.Header, baseModel)
 	applyCodexIdentityConfuseHeaders(httpReq.Header, &identityState)
 	var authID, authLabel, authType, authValue string
@@ -141,9 +142,10 @@ func (e *CodexExecutor) ExecuteStream(ctx context.Context, auth *cliproxyauth.Au
 				if retryBuildErr != nil {
 					return nil, retryBuildErr
 				}
-				if err := applyCodexHeaders(retryReq, auth, apiKey, true, e.cfg); err != nil {
+				if err := applyCodexHeaders(retryReq, auth, apiKey, true, e.cfg, opts.Headers); err != nil {
 					return nil, err
 				}
+				applyCodexRoutingHint(ctx, retryReq.Header, auth, baseModel, retryUpstreamBody, opts.Headers)
 				applyCodexIdentityConfuseHeaders(retryReq.Header, &retryIdentityState)
 				helps.RecordAPIRequest(ctx, e.cfg, helps.UpstreamRequestLog{
 					URL:       url,

@@ -355,7 +355,7 @@ func parseSingleModelConfig(b []byte) rawDevinModel {
 	return m
 }
 
-func vendorName(id uint64) string {
+func vendorName(id uint64, uid string) string {
 	switch id {
 	case 1:
 		return "cognition"
@@ -374,6 +374,9 @@ func vendorName(id uint64) string {
 	case 11:
 		return "nvidia"
 	default:
+		if strings.Contains(strings.ToLower(uid), "grok") {
+			return "xai"
+		}
 		return "devin"
 	}
 }
@@ -389,7 +392,7 @@ func formatRawModels(raw []rawDevinModel) []devinModelJSON {
 			ID:                        r.UID,
 			Object:                    "model",
 			Type:                      "devin",
-			OwnedBy:                   vendorName(r.VendorID),
+			OwnedBy:                   vendorName(r.VendorID, r.UID),
 			DisplayName:               r.Label,
 			ContextLength:             r.ContextLength,
 			MaxCompletionTokens:       64000,
@@ -475,7 +478,7 @@ func aggregateModels(raw []rawDevinModel) []devinModelJSON {
 			ID:                        entry.baseID,
 			Object:                    "model",
 			Type:                      "devin",
-			OwnedBy:                   vendorName(entry.vendorID),
+			OwnedBy:                   vendorName(entry.vendorID, entry.baseID),
 			DisplayName:               entry.displayName,
 			ContextLength:             entry.contextLength,
 			MaxCompletionTokens:       64000,
