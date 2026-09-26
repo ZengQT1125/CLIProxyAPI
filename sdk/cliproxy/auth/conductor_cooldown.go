@@ -2111,6 +2111,25 @@ func HasUnauthorizedAuthFailure(auth *Auth) bool {
 	return hasUnauthorizedAuthFailure(auth)
 }
 
+func hasDisabledInvalidGrantFailure(auth *Auth) bool {
+	if auth == nil {
+		return false
+	}
+	isDisabled := auth.Disabled || auth.Status == StatusDisabled
+	if !isDisabled {
+		return false
+	}
+	if auth.LastError != nil && (isInvalidGrantResultError(auth.LastError) || isInvalidGrantErrorMessage(auth.LastError.Message) || isInvalidGrantErrorMessage(auth.LastError.Code)) {
+		return true
+	}
+	return false
+}
+
+// HasDisabledInvalidGrantFailure reports whether the auth is disabled and has encountered an invalid_grant error.
+func HasDisabledInvalidGrantFailure(auth *Auth) bool {
+	return hasDisabledInvalidGrantFailure(auth)
+}
+
 func refreshErrorFromError(err error) *Error {
 	if err == nil {
 		return nil
@@ -2118,14 +2137,14 @@ func refreshErrorFromError(err error) *Error {
 	statusCode := statusCodeFromError(err)
 	authErr := &Error{Message: err.Error(), HTTPStatus: statusCode}
 	switch {
-	case isInvalidGrantError(err):
-		authErr.Code = "invalid_grant"
-		authErr.Retryable = false
 	case isUnauthorizedError(err):
 		if authErr.HTTPStatus == 0 {
 			authErr.HTTPStatus = http.StatusUnauthorized
 		}
 		authErr.Code = "unauthorized"
+		authErr.Retryable = false
+	case isInvalidGrantError(err):
+		authErr.Code = "invalid_grant"
 		authErr.Retryable = false
 	}
 	return authErr
@@ -2225,33 +2244,50 @@ func oauthErrorCodeFromError(err error) string {
 	return ""
 }
 
+// isInvalidGrantError reports whether the refresh error represents an OAuth
+// invalid_grant rejection. Structured OAuth error codes take priority: a
+// non-invalid_grant code never matches, regardless of message text. Without a
+// structured code, plain invalid_grant text counts when the HTTP status is
+// 400, 401, or absent (loose matching for raw provider errors).
 func isInvalidGrantError(err error) bool {
 	if err == nil {
-		return false
-	}
-	status := statusCodeFromError(err)
-	if status != http.StatusBadRequest && status != http.StatusUnauthorized {
 		return false
 	}
 	if code := oauthErrorCodeFromError(err); code != "" {
 		return strings.EqualFold(code, "invalid_grant")
 	}
-	return isInvalidGrantErrorMessage(err.Error())
+	if !isInvalidGrantErrorMessage(err.Error()) {
+		return false
+	}
+	status := statusCodeFromError(err)
+	return status == http.StatusBadRequest || status == http.StatusUnauthorized || status == 0
 }
 
+// isPermanentRefreshAuthError reports refresh errors that are terminal for the
+// credential lifecycle. Unauthorized errors and structured invalid_grant codes
+// are terminal; unstructured invalid_grant text alone remains retryable.
 func isPermanentRefreshAuthError(err error) bool {
-	return isUnauthorizedError(err) || isInvalidGrantError(err)
+	if isUnauthorizedError(err) {
+		return true
+	}
+	if code := oauthErrorCodeFromError(err); code != "" {
+		return strings.EqualFold(code, "invalid_grant")
+	}
+	return false
 }
 
 func isInvalidGrantResultError(err *Error) bool {
 	if err == nil {
 		return false
 	}
-	status := statusCodeFromResult(err)
-	if status != http.StatusBadRequest && status != http.StatusUnauthorized {
+	if !isInvalidGrantErrorMessage(err.Code) && !isInvalidGrantErrorMessage(err.Message) {
 		return false
 	}
-	return isInvalidGrantErrorMessage(err.Code) || isInvalidGrantErrorMessage(err.Message)
+	status := statusCodeFromResult(err)
+	if status == http.StatusBadRequest || status == http.StatusUnauthorized || status == 0 {
+		return true
+	}
+	return false
 }
 
 func isModelSupportResultError(err *Error) bool {
