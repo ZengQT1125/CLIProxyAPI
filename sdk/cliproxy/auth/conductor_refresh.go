@@ -336,6 +336,10 @@ func (m *Manager) markRefreshPending(id string, now time.Time) bool {
 		m.mu.Unlock()
 		return false
 	}
+	if !usesUpstreamXAIOAuthLifecycle(auth) && hasTerminalRefreshAuthFailure(auth) && !auth.HasValidAccessToken(now) {
+		m.mu.Unlock()
+		return false
+	}
 	auth.NextRefreshAfter = now.Add(refreshPendingBackoff)
 	auth.Generation++
 	auth.UpdatedAt = now

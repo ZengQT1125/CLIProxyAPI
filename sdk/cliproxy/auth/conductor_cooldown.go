@@ -2137,14 +2137,14 @@ func refreshErrorFromError(err error) *Error {
 	statusCode := statusCodeFromError(err)
 	authErr := &Error{Message: err.Error(), HTTPStatus: statusCode}
 	switch {
-	case isInvalidGrantError(err):
-		authErr.Code = "invalid_grant"
-		authErr.Retryable = false
 	case isUnauthorizedError(err):
 		if authErr.HTTPStatus == 0 {
 			authErr.HTTPStatus = http.StatusUnauthorized
 		}
 		authErr.Code = "unauthorized"
+		authErr.Retryable = false
+	case isInvalidGrantError(err):
+		authErr.Code = "invalid_grant"
 		authErr.Retryable = false
 	}
 	return authErr
@@ -2244,22 +2244,36 @@ func oauthErrorCodeFromError(err error) string {
 	return ""
 }
 
+// isInvalidGrantError reports whether the refresh error represents an OAuth
+// invalid_grant rejection. Structured OAuth error codes take priority: a
+// non-invalid_grant code never matches, regardless of message text. Without a
+// structured code, plain invalid_grant text counts when the HTTP status is
+// 400, 401, or absent (loose matching for raw provider errors).
 func isInvalidGrantError(err error) bool {
 	if err == nil {
-		return false
-	}
-	if !isInvalidGrantErrorMessage(err.Error()) {
 		return false
 	}
 	if code := oauthErrorCodeFromError(err); code != "" {
 		return strings.EqualFold(code, "invalid_grant")
 	}
+	if !isInvalidGrantErrorMessage(err.Error()) {
+		return false
+	}
 	status := statusCodeFromError(err)
 	return status == http.StatusBadRequest || status == http.StatusUnauthorized || status == 0
 }
 
+// isPermanentRefreshAuthError reports refresh errors that are terminal for the
+// credential lifecycle. Unauthorized errors and structured invalid_grant codes
+// are terminal; unstructured invalid_grant text alone remains retryable.
 func isPermanentRefreshAuthError(err error) bool {
-	return isUnauthorizedError(err) || isInvalidGrantError(err)
+	if isUnauthorizedError(err) {
+		return true
+	}
+	if code := oauthErrorCodeFromError(err); code != "" {
+		return strings.EqualFold(code, "invalid_grant")
+	}
+	return false
 }
 
 func isInvalidGrantResultError(err *Error) bool {
