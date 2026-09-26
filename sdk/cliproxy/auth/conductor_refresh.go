@@ -23,10 +23,12 @@ type RefreshEvaluator interface {
 }
 
 const (
-	refreshCheckInterval  = 5 * time.Second
-	refreshMaxConcurrency = 16
-	refreshPendingBackoff = time.Minute
-	refreshFailureBackoff = 5 * time.Minute
+	refreshCheckInterval    = 5 * time.Second
+	refreshMaxConcurrency   = 16
+	refreshPendingBackoff   = time.Minute
+	refreshFailureBackoff   = 5 * time.Minute
+	invalidGrantBackoffBase = time.Minute
+	invalidGrantBackoffMax  = 30 * time.Minute
 	// refreshIneffectiveBackoff throttles refresh attempts when an executor returns
 	// success but the auth still evaluates as needing refresh (e.g. token expiry
 	// wasn't updated). Without this guard, the auto-refresh loop can tight-loop and
@@ -116,11 +118,10 @@ func (m *Manager) shouldRefresh(a *Auth, now time.Time) bool {
 	if a == nil {
 		return false
 	}
-	if usesUpstreamXAIOAuthLifecycle(a) {
-		if hasUnauthorizedAuthFailure(a) {
-			return false
-		}
-	} else if hasTerminalRefreshAuthFailure(a) && !a.HasValidAccessToken(now) {
+	if hasUnauthorizedAuthFailure(a) || hasDisabledInvalidGrantFailure(a) {
+		return false
+	}
+	if !usesUpstreamXAIOAuthLifecycle(a) && hasTerminalRefreshAuthFailure(a) && !a.HasValidAccessToken(now) {
 		return false
 	}
 	if !a.NextRefreshAfter.IsZero() && now.Before(a.NextRefreshAfter) {
@@ -327,7 +328,7 @@ func lookupMetadataTime(meta map[string]any, keys ...string) (time.Time, bool) {
 func (m *Manager) markRefreshPending(id string, now time.Time) bool {
 	m.mu.Lock()
 	auth, ok := m.auths[id]
-	if !ok || auth == nil {
+	if !ok || auth == nil || hasDisabledInvalidGrantFailure(auth) {
 		m.mu.Unlock()
 		return false
 	}
@@ -496,6 +497,21 @@ func (m *Manager) tryRefreshAfterUnauthorized(ctx context.Context, auth *Auth, e
 	return refreshed, true
 }
 
+func invalidGrantBackoffDuration(failures int) time.Duration {
+	if failures <= 1 {
+		return invalidGrantBackoffBase
+	}
+	shift := failures - 1
+	if shift > 10 {
+		shift = 10
+	}
+	backoff := invalidGrantBackoffBase * time.Duration(1<<shift)
+	if backoff > invalidGrantBackoffMax {
+		return invalidGrantBackoffMax
+	}
+	return backoff
+}
+
 func (m *Manager) refreshAuth(ctx context.Context, id string) {
 	_, _ = m.refreshAuthForRequest(ctx, id, "")
 }
@@ -538,6 +554,9 @@ func (m *Manager) refreshAuthForRequest(ctx context.Context, id, failedAccessTok
 		return nil, errors.New("auth or executor not found")
 	}
 	useUpstreamXAI := usesUpstreamXAIOAuthLifecycle(auth)
+	if hasDisabledInvalidGrantFailure(auth) {
+		return nil, errors.New("auth is disabled with invalid grant")
+	}
 
 	// Another request may already have refreshed this credential.
 	if failedAccessToken != "" {
@@ -586,9 +605,12 @@ func (m *Manager) refreshAuthForRequest(ctx context.Context, id, failedAccessTok
 			unlockLifecycle = m.lockAuthLifecycle(id)
 			defer unlockLifecycle()
 		}
+		unauthorized := isUnauthorizedError(err)
+		invalidGrant := isInvalidGrantError(err)
 		shouldDelete := false
 		shouldReschedule := false
 		shouldUnschedule := false
+		isPermanentlyDisabled := false
 		deleteAuthIndex := ""
 		var deleteStore Store
 		m.mu.Lock()
@@ -611,7 +633,24 @@ func (m *Manager) refreshAuthForRequest(ctx context.Context, id, failedAccessTok
 				shouldDelete = true
 			} else {
 				hasValidAccessToken := current.HasValidAccessToken(now)
+				isDisabled := current.Disabled || current.Status == StatusDisabled
 				switch {
+				case isDisabled && invalidGrant:
+					// Disabled credentials must not keep retrying an invalid grant.
+					current.Unavailable = true
+					current.Status = StatusDisabled
+					current.NextRefreshAfter = time.Time{}
+					current.RefreshFailures = 0
+					current.StatusMessage = "disabled (invalid grant)"
+					isPermanentlyDisabled = true
+				case isDisabled:
+					current.Unavailable = true
+					current.Status = StatusDisabled
+					current.NextRefreshAfter = now.Add(refreshFailureBackoff)
+					if current.StatusMessage == "" {
+						current.StatusMessage = "disabled"
+					}
+					shouldReschedule = true
 				case terminal && !hasValidAccessToken:
 					current.NextRefreshAfter = time.Time{}
 					current.Unavailable = true
@@ -631,17 +670,30 @@ func (m *Manager) refreshAuthForRequest(ctx context.Context, id, failedAccessTok
 				case !hasValidAccessToken:
 					current.Unavailable = true
 					current.Status = StatusError
-					if isUnauthorizedError(err) {
+					if unauthorized {
 						current.NextRefreshAfter = time.Time{}
+						current.RefreshFailures = 0
 						current.StatusMessage = "unauthorized"
+					} else if invalidGrant {
+						current.RefreshFailures++
+						current.NextRefreshAfter = now.Add(invalidGrantBackoffDuration(current.RefreshFailures))
+						current.StatusMessage = "invalid grant (retrying)"
+						shouldReschedule = true
 					} else {
+						current.RefreshFailures = 0
 						current.NextRefreshAfter = now.Add(refreshFailureBackoff)
 						current.StatusMessage = "token expired"
+						shouldReschedule = true
 					}
-					shouldReschedule = true
 				default:
 					// Keep a still-valid access token active after a transient refresh failure.
 					nextRetry := now.Add(refreshFailureBackoff)
+					if invalidGrant {
+						current.RefreshFailures++
+						nextRetry = now.Add(invalidGrantBackoffDuration(current.RefreshFailures))
+					} else {
+						current.RefreshFailures = 0
+					}
 					if exp, ok := current.AccessTokenExpirationTime(); ok && !exp.IsZero() && nextRetry.After(exp) {
 						nextRetry = exp
 					}
@@ -664,6 +716,8 @@ func (m *Manager) refreshAuthForRequest(ctx context.Context, id, failedAccessTok
 			m.queueRefreshUnschedule(id)
 		} else if shouldReschedule {
 			m.queueRefreshReschedule(id)
+		} else if isPermanentlyDisabled {
+			m.queueRefreshUnschedule(id)
 		}
 		return nil, err
 	}
@@ -680,6 +734,7 @@ func (m *Manager) refreshAuthForRequest(ctx context.Context, id, failedAccessTok
 	updated.LastError = nil
 	updated.StatusMessage = ""
 	updated.Unavailable = false
+	updated.RefreshFailures = 0
 	if updated.Status == StatusError || updated.Status == "" {
 		updated.Status = StatusActive
 	}

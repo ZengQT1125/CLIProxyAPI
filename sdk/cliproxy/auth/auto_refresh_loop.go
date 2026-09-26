@@ -345,6 +345,7 @@ func (l *authAutoRefreshLoop) remove(authID string) {
 	}
 	l.mu.Lock()
 	defer l.mu.Unlock()
+	delete(l.dirty, authID)
 	item, ok := l.index[authID]
 	if !ok || item == nil {
 		return
@@ -361,7 +362,7 @@ func nextRefreshCheckAt(now time.Time, auth *Auth, interval time.Duration) (time
 		if hasUnauthorizedAuthFailure(auth) {
 			return time.Time{}, false
 		}
-	} else if hasTerminalRefreshAuthFailure(auth) && !auth.HasValidAccessToken(now) {
+	} else if hasDisabledInvalidGrantFailure(auth) || (hasTerminalRefreshAuthFailure(auth) && !auth.HasValidAccessToken(now)) {
 		return time.Time{}, false
 	}
 
