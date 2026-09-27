@@ -11,7 +11,7 @@ import (
 	"strings"
 	"sync"
 
-	"github.com/router-for-me/CLIProxyAPI/v7/internal/buildinfo"
+	"github.com/router-for-me/CLIProxyAPI/v8/internal/buildinfo"
 	log "github.com/sirupsen/logrus"
 )
 

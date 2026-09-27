@@ -10,9 +10,9 @@ import (
 	"testing"
 	"time"
 
-	internalusage "github.com/router-for-me/CLIProxyAPI/v7/internal/usage"
-	cliproxyexecutor "github.com/router-for-me/CLIProxyAPI/v7/sdk/cliproxy/executor"
-	coreusage "github.com/router-for-me/CLIProxyAPI/v7/sdk/cliproxy/usage"
+	internalusage "github.com/router-for-me/CLIProxyAPI/v8/internal/usage"
+	cliproxyexecutor "github.com/router-for-me/CLIProxyAPI/v8/sdk/cliproxy/executor"
+	coreusage "github.com/router-for-me/CLIProxyAPI/v8/sdk/cliproxy/usage"
 )
 
 type deleteTrackingStore struct {

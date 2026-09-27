@@ -1,6 +1,6 @@
 package codexapi
 
-import "github.com/router-for-me/CLIProxyAPI/v7/internal/util"
+import "github.com/router-for-me/CLIProxyAPI/v8/internal/util"
 
 const (
 	BaseURLEnv     = "CODEX_BASE_URL"

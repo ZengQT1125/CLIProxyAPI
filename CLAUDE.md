@@ -6,11 +6,11 @@ AI 工作指南。**必读 Fork-Specific 部分**——合并上游或重构时�
 
 ## Identity
 
-- Module: `github.com/router-for-me/CLIProxyAPI/v7`
+- Module: `github.com/router-for-me/CLIProxyAPI/v8`
 - Go 1.26.0
-- 上游 `router-for-me/CLIProxyAPI`（远程 `upstream`），当前基于 v7.3.19
+- 上游 `router-for-me/CLIProxyAPI`（远程 `upstream`），当前基于 v8.0.2
 - Fork 增量: SF routing · 冷却状态持久化 · 渐进式凭证加载 · usage 持久化 · 管理中心 · 管理面板资源管理 · provider/protocol 修复
-- Fork tag 命名: `fork/v*`（如 `fork/v8.20.1`），与上游 `v7.x.x` tag 共存
+- Fork tag 命名: `fork/v*`（如 `fork/v8.20.1`），与上游 `v8.x.x` tag 共存
 
 ## Hard Constraints
 
@@ -135,6 +135,7 @@ go test -count=1 ./internal/usage/                         # 禁用缓存
 ## Config
 
 - `config.yaml`（template: `config.example.yaml`）；`auths/*.json`；`.env`
+- 配置文件使用 v8 分组布局；旧版顶层字段仍可读取，显式迁移时映射到 `server`、`management`、`routing`、`oauth`、`observability` 等分组。
 - 主要 sections: `tls` `remote-management` `routing` `proxy-url` `request-retry` `quota-exceeded` `payload` `oauth-model-alias` `oauth-excluded-models` `oauth-request-scoped-errors` `ws-auth` `usage-persistence-enabled` `delete-unauthorized-auth` `auth-load-workers` `local-model` `claude-header-defaults` `codex.strip-intermediary-updates` `cloak` `passthrough-headers` `streaming` `home` `save-cooldown-status`
 - Token store env: 默认本地 file；`PGSTORE_*` / `GITSTORE_*` / `OBJECTSTORE_*`
 - `MANAGEMENT_STATIC_PATH`: 覆盖管理面板磁盘升级目录；默认使用 writable path 下的 `static/`，否则回退到 config 所在目录的 `static/`
@@ -166,7 +167,7 @@ go test -count=1 ./internal/usage/                         # 禁用缓存
 
 ## Fork-Specific Modifications (Upstream Merge Protection)
 
-> **合并上游时必须保护下列行为和文件**。清单以当前 `upstream/main`（v7.2.88）为基线；TUI 已在上游，不是 fork 增量。被覆盖/删除，或重新引入下面明确删除的上游文件，均属于合并错误。
+> **合并上游时必须保护下列行为和文件**。清单以当前 `upstream/main`（v8.0.2）为基线；TUI 已在上游，不是 fork 增量。被覆盖/删除，或重新引入下面明确删除的上游文件，均属于合并错误。
 
 ### 1. Usage Persistence & SQLite Store
 
