@@ -7,8 +7,8 @@ import (
 	"strings"
 	"time"
 
-	"github.com/router-for-me/CLIProxyAPI/v7/internal/registry"
-	sdkpluginstore "github.com/router-for-me/CLIProxyAPI/v7/sdk/pluginstore"
+	"github.com/router-for-me/CLIProxyAPI/v8/internal/registry"
+	sdkpluginstore "github.com/router-for-me/CLIProxyAPI/v8/sdk/pluginstore"
 	"gopkg.in/yaml.v3"
 )
 
@@ -332,9 +332,10 @@ type RemoteManagement struct {
 	// DisableAutoUpdatePanel disables automatic periodic background updates of the management panel asset from GitHub.
 	// When true, newer panels can only be installed through a manual management API update.
 	DisableAutoUpdatePanel bool `yaml:"disable-auto-update-panel"`
-	// PanelGitHubRepository selects the repository used by management panel update operations.
-	// Custom repositories download their latest management.html release asset without a manifest.
+	// PanelGitHubRepository is retained for legacy config compatibility; panel updates use the fork repository.
 	PanelGitHubRepository string `yaml:"panel-github-repository,omitempty"`
+	// BaseURL specifies the base URL of the remote management API for TUI client mode (e.g. "https://proxy.example.com").
+	BaseURL string `yaml:"base-url,omitempty" json:"base-url,omitempty"`
 }
 
 // QuotaExceeded defines the behavior when API quota limits are exceeded.
