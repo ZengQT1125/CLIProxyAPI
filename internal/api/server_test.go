@@ -19,6 +19,7 @@ import (
 	"time"
 
 	gin "github.com/gin-gonic/gin"
+	"github.com/google/uuid"
 	"github.com/klauspost/compress/zstd"
 	managementHandlers "github.com/router-for-me/CLIProxyAPI/v8/internal/api/handlers/management"
 	claudemodels "github.com/router-for-me/CLIProxyAPI/v8/internal/client/claude/models"
@@ -984,9 +985,12 @@ func TestCodexAlphaSearchForwardsRequest(t *testing.T) {
 		t.Fatalf("response Content-Type = %q", got)
 	}
 	traceID := rr.Header().Get(internallogging.CPATraceIDHeader)
-	parts := strings.Split(traceID, "-")
-	if len(parts) != 3 || parts[1] != credential.Index || len(parts[2]) != 8 {
+	parts := strings.SplitN(traceID, "-", 3)
+	if len(parts) != 3 || parts[1] != credential.Index || parts[2] == "" {
 		t.Fatalf("trace ID = %q, want timestamp-%s-requestID", traceID, credential.Index)
+	}
+	if _, errParseUUID := uuid.Parse(parts[2]); errParseUUID != nil {
+		t.Fatalf("trace requestID = %q: %v", parts[2], errParseUUID)
 	}
 	if _, errParse := time.Parse("20060102150405", parts[0]); errParse != nil {
 		t.Fatalf("trace timestamp = %q: %v", parts[0], errParse)

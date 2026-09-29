@@ -701,11 +701,11 @@ func (e *CodexWebsocketsExecutor) ExecuteStream(ctx context.Context, auth *clipr
 				}
 			}
 
-			clientPayload := applyCodexIdentityExposeResponsePayload(payload, identityState)
 			if cliproxyexecutor.DownstreamWebsocket(ctx) {
 				if eventType == "response.completed" || eventType == "response.done" || eventType == "response.incomplete" {
-					clientPayload = applyCodexIdentityExposeResponsePayload(completedPayload, identityState)
+					payload = completedPayload
 				}
+				clientPayload := applyCodexIdentityExposeResponsePayload(payload, identityState)
 				downstreamPayload := helps.EnsureResponsesUsageDetails(clientPayload)
 				if !send(cliproxyexecutor.StreamChunk{Payload: downstreamPayload}) {
 					terminateReason = "context_done"
@@ -723,7 +723,7 @@ func (e *CodexWebsocketsExecutor) ExecuteStream(ctx context.Context, auth *clipr
 				payload = completedPayload
 			}
 			eventType = gjson.GetBytes(payload, "type").String()
-			clientPayload = applyCodexIdentityExposeResponsePayload(payload, identityState)
+			clientPayload := applyCodexIdentityExposeResponsePayload(payload, identityState)
 			line := encodeCodexWebsocketAsSSE(clientPayload)
 			chunks := helps.TranslateStreamWithClaudeInputTokens(ctx, to, responseFormat, req.Model, originalPayload, clientBody, line, &param, claudeInputTokens)
 			for i := range chunks {
@@ -794,7 +794,7 @@ func (e *CodexWebsocketsExecutor) prepareCodexWebsocketStream(ctx context.Contex
 	body = normalizeCodexWebsocketParallelToolCalls(body, opts.Headers)
 	body = helps.NormalizeCodexToolSchemas(body)
 	multiAgentV2Conflict := helps.HasCodexMultiAgentV2NamespaceConflict(body)
-	body, optimizeMultiAgentV2 := helps.OptimizeCodexMultiAgentV2RequestForAuth(ctx, opts.Headers, body, e.cfg, auth, baseModel)
+	body, optimizeMultiAgentV2 := helps.OptimizeCodexMultiAgentV2RequestForAuth(ctx, opts.Headers, body, e.cfg, auth, isCompat)
 	body, replayScope, errReplay := applyCodexReasoningReplayCacheRequired(ctx, from, req, opts, body)
 	if errReplay != nil {
 		return nil, errReplay
@@ -811,7 +811,6 @@ func (e *CodexWebsocketsExecutor) prepareCodexWebsocketStream(ctx context.Contex
 		return nil, errPromptCache
 	}
 	clientBody := body
-	var identityState codexIdentityConfuseState
 	upstreamBody, identityState := applyCodexIdentityConfuseBody(e.cfg, auth, originalPayloadSource, body)
 	var errHeaders error
 	wsHeaders, errHeaders = applyCodexWebsocketHeaders(ctx, wsHeaders, auth, apiKey, e.cfg, preserveNativeOutput, opts.Headers)
