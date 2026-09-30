@@ -34,7 +34,7 @@ codex-header-defaults:
 	}
 }
 
-func TestLoadConfigOptional_CodexIdentityConfuse(t *testing.T) {
+func TestLoadConfigOptional_CodexOptions(t *testing.T) {
 	dir := t.TempDir()
 	configPath := filepath.Join(dir, "config.yaml")
 	configYAML := []byte(`
@@ -53,7 +53,7 @@ codex:
 	}
 
 	if !cfg.Codex.IdentityConfuse {
-		t.Fatalf("IdentityConfuse = false, want true")
+		t.Fatal("IdentityConfuse = false, want true")
 	}
 	if !cfg.Codex.DisableCodexCloaking {
 		t.Fatal("DisableCodexCloaking = false, want true")
