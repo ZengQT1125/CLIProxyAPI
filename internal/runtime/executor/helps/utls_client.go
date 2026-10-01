@@ -49,9 +49,9 @@ type utlsH2HostPool struct {
 }
 
 // utlsRoundTripper implements http.RoundTripper using a Chrome fingerprint for
-// providers that require a browser-like TLS and HTTP/2 transport.
+// providers that require browser-like TLS. The HTTP version follows ALPN.
 //
-// Connections are pooled per host up to maxConnsPerHost. When every live conn is
+// HTTP/2 connections are pooled per host up to maxConnsPerHost. When every live conn is
 // at its stream limit, RoundTrip still reuses a busy conn (http2 waits for a
 // stream slot) instead of unbounded dial storms.
 type utlsRoundTripper struct {
@@ -282,7 +282,7 @@ func (t *utlsRoundTripper) waitForPoolChange(ctx context.Context, pool *utlsH2Ho
 	return ctx.Err()
 }
 
-func (t *utlsRoundTripper) getOrCreateConnection(ctx context.Context, host, addr string) (*http2.ClientConn, bool, error) {
+func (t *utlsRoundTripper) getOrCreateConnection(ctx context.Context, host, addr string) (*http2.ClientConn, *tls.UConn, bool, error) {
 	if ctx == nil {
 		ctx = context.Background()
 	}
@@ -293,42 +293,50 @@ func (t *utlsRoundTripper) getOrCreateConnection(ctx context.Context, host, addr
 
 	for {
 		if errCtx := ctx.Err(); errCtx != nil {
-			return nil, false, errCtx
+			return nil, nil, false, errCtx
 		}
 		pool := t.hostPool(host)
 		if conn := t.pickReadyConn(pool); conn != nil {
 			t.trackConnRequest(pool, conn)
-			return conn, true, nil
+			return conn, nil, true, nil
 		}
 
 		if len(pool.conns)+pool.dialing < maxConns {
 			pool.dialing++
 			t.mu.Unlock()
-			conn, err := t.createConnection(ctx, host, addr)
+			conn, tlsConn, err := t.createConnection(ctx, host, addr)
 			t.mu.Lock()
 			pool.dialing--
 			if err != nil {
 				pool.cond.Broadcast()
 				if ready := t.pickReadyConn(pool); ready != nil {
 					t.trackConnRequest(pool, ready)
-					return ready, true, nil
+					return ready, nil, true, nil
 				}
 				if open, reserved := t.pickAnyOpenConn(pool); open != nil {
 					t.trackConnRequest(pool, open)
-					return open, reserved, nil
+					return open, nil, reserved, nil
 				}
 				if pool.dialing > 0 {
 					if errWait := t.waitForPoolChange(ctx, pool); errWait != nil {
-						return nil, false, errWait
+						return nil, nil, false, errWait
 					}
 					continue
 				}
-				return nil, false, err
+				return nil, nil, false, err
+			}
+			if tlsConn != nil {
+				pool.cond.Broadcast()
+				if errCtx := ctx.Err(); errCtx != nil {
+					_ = tlsConn.Close()
+					return nil, nil, false, errCtx
+				}
+				return nil, tlsConn, false, nil
 			}
 			if errCtx := ctx.Err(); errCtx != nil {
 				_ = conn.Close()
 				pool.cond.Broadcast()
-				return nil, false, errCtx
+				return nil, nil, false, errCtx
 			}
 			reserved := conn.ReserveNewRequest()
 			if !reserved {
@@ -340,28 +348,28 @@ func (t *utlsRoundTripper) getOrCreateConnection(ctx context.Context, host, addr
 				if state.Closed || state.Closing {
 					_ = conn.Close()
 					pool.cond.Broadcast()
-					return nil, false, fmt.Errorf("utls HTTP/2: new connection unavailable for host %s", host)
+					return nil, nil, false, fmt.Errorf("utls HTTP/2: new connection unavailable for host %s", host)
 				}
 			}
 			pool.conns = append(pool.conns, conn)
 			t.trackConnRequest(pool, conn)
 			pool.cond.Broadcast()
-			return conn, reserved, nil
+			return conn, nil, reserved, nil
 		}
 
 		// At capacity, reuse an open conn first. Strict HTTP/2 flow control waits
 		// there with the request context instead of blocking on an unrelated dial.
 		if conn, reserved := t.pickAnyOpenConn(pool); conn != nil {
 			t.trackConnRequest(pool, conn)
-			return conn, reserved, nil
+			return conn, nil, reserved, nil
 		}
 		if pool.dialing > 0 || len(pool.conns) > 0 {
 			if errWait := t.waitForPoolChange(ctx, pool); errWait != nil {
-				return nil, false, errWait
+				return nil, nil, false, errWait
 			}
 			continue
 		}
-		return nil, false, fmt.Errorf("utls HTTP/2: no connection available for host %s", host)
+		return nil, nil, false, fmt.Errorf("utls HTTP/2: no connection available for host %s", host)
 	}
 }
 
@@ -393,62 +401,67 @@ func (t *utlsRoundTripper) waitForConnSlot(ctx context.Context, conn *http2.Clie
 	}
 }
 
-func (t *utlsRoundTripper) createConnection(ctx context.Context, host, addr string) (*http2.ClientConn, error) {
+func (t *utlsRoundTripper) createConnection(ctx context.Context, host, addr string) (*http2.ClientConn, *tls.UConn, error) {
 	if t != nil && t.newClientConn != nil {
-		return t.newClientConn(host, addr)
+		conn, err := t.newClientConn(host, addr)
+		return conn, nil, err
 	}
 
 	contextDialer, ok := t.dialer.(proxy.ContextDialer)
 	if !ok {
-		return nil, fmt.Errorf("utls: dialer does not support context cancellation")
+		return nil, nil, fmt.Errorf("utls: dialer does not support context cancellation")
 	}
 	conn, errDial := contextDialer.DialContext(ctx, "tcp", addr)
 	if errDial != nil {
-		return nil, fmt.Errorf("utls: dial upstream: %w", errDial)
+		return nil, nil, fmt.Errorf("utls: dial upstream: %w", errDial)
 	}
 
 	tlsConfig := &tls.Config{ServerName: host}
-	spec, errSpec := chromeH2ClientHelloSpec()
+	spec, errSpec := chromeClientHelloSpecWithALPN([]string{"h2", "http/1.1"}, false)
 	if errSpec != nil {
 		if errClose := conn.Close(); errClose != nil {
 			log.Errorf("utls HTTP/2 connection close after ClientHello spec error: %v", errClose)
 		}
-		return nil, errSpec
+		return nil, nil, errSpec
 	}
 	tlsConn := tls.UClient(conn, tlsConfig, tls.HelloCustom)
 	if errApply := tlsConn.ApplyPreset(&spec); errApply != nil {
 		if errClose := conn.Close(); errClose != nil {
 			log.Errorf("utls HTTP/2 connection close after ClientHello preset error: %v", errClose)
 		}
-		return nil, errApply
+		return nil, nil, errApply
 	}
 
 	if errHandshake := tlsConn.HandshakeContext(ctx); errHandshake != nil {
 		if errors.Is(errHandshake, context.Canceled) || errors.Is(errHandshake, context.DeadlineExceeded) {
-			return nil, fmt.Errorf("utls: TLS handshake: %w", errHandshake)
+			return nil, nil, fmt.Errorf("utls: TLS handshake: %w", errHandshake)
 		}
 		if errClose := conn.Close(); errClose != nil {
-			return nil, fmt.Errorf("utls: TLS handshake: %w; close connection: %v", errHandshake, errClose)
+			return nil, nil, fmt.Errorf("utls: TLS handshake: %w; close connection: %v", errHandshake, errClose)
 		}
-		return nil, fmt.Errorf("utls: TLS handshake: %w", errHandshake)
+		return nil, nil, fmt.Errorf("utls: TLS handshake: %w", errHandshake)
 	}
-	if negotiated := tlsConn.ConnectionState().NegotiatedProtocol; negotiated != "h2" {
+	switch negotiated := tlsConn.ConnectionState().NegotiatedProtocol; negotiated {
+	case "", "http/1.1":
+		return nil, tlsConn, nil
+	case "h2":
+	default:
 		if errClose := tlsConn.Close(); errClose != nil {
-			log.Errorf("utls HTTP/2 connection close after ALPN mismatch: %v", errClose)
+			log.Errorf("utls connection close after ALPN mismatch: %v", errClose)
 		}
-		return nil, fmt.Errorf("utls HTTP/2 negotiated ALPN %q, want h2", negotiated)
+		return nil, nil, fmt.Errorf("utls: unsupported negotiated protocol %q", negotiated)
 	}
 
 	tr := &http2.Transport{StrictMaxConcurrentStreams: true}
 	h2Conn, errClientConn := tr.NewClientConn(tlsConn)
 	if errClientConn != nil {
 		if errClose := tlsConn.Close(); errClose != nil {
-			return nil, fmt.Errorf("utls: initialize HTTP/2 connection: %w; close TLS connection: %v", errClientConn, errClose)
+			return nil, nil, fmt.Errorf("utls: initialize HTTP/2 connection: %w; close TLS connection: %v", errClientConn, errClose)
 		}
-		return nil, fmt.Errorf("utls: initialize HTTP/2 connection: %w", errClientConn)
+		return nil, nil, fmt.Errorf("utls: initialize HTTP/2 connection: %w", errClientConn)
 	}
 
-	return h2Conn, nil
+	return h2Conn, nil, nil
 }
 
 func (t *utlsRoundTripper) RoundTrip(req *http.Request) (*http.Response, error) {
@@ -459,9 +472,12 @@ func (t *utlsRoundTripper) RoundTrip(req *http.Request) (*http.Response, error) 
 	}
 	addr := net.JoinHostPort(hostname, port)
 
-	h2Conn, reserved, err := t.getOrCreateConnection(req.Context(), hostname, addr)
+	h2Conn, tlsConn, reserved, err := t.getOrCreateConnection(req.Context(), hostname, addr)
 	if err != nil {
 		return nil, err
+	}
+	if tlsConn != nil {
+		return roundTripUtlsConnection(req, tlsConn)
 	}
 	if !reserved {
 		if errWait := t.waitForConnSlot(req.Context(), h2Conn); errWait != nil {
@@ -512,6 +528,90 @@ func (t *utlsRoundTripper) RoundTrip(req *http.Request) (*http.Response, error) 
 				t.releaseConnRequest(hostname, h2Conn)
 			},
 		}
+	}
+	return resp, nil
+}
+
+type closeConnectionBody struct {
+	io.ReadCloser
+	closeConnection func() error
+	once            sync.Once
+	err             error
+}
+
+func (b *closeConnectionBody) Close() error {
+	if b == nil {
+		return nil
+	}
+	b.once.Do(func() {
+		var errConnection error
+		if b.closeConnection != nil {
+			errConnection = b.closeConnection()
+		}
+		var errBody error
+		if b.ReadCloser != nil {
+			errBody = b.ReadCloser.Close()
+		}
+		b.err = errors.Join(errBody, errConnection)
+	})
+	return b.err
+}
+
+// roundTripUtlsConnection selects the HTTP protocol before sending the request.
+// Empty ALPN is HTTP/1.1, including when a TLS-inspecting proxy omits ALPN.
+func roundTripUtlsConnection(req *http.Request, tlsConn *tls.UConn) (*http.Response, error) {
+	closeConnection := func() error {
+		// The HTTP/1.1 transport may already have closed its non-pooled
+		// connection after reading the response or canceling the request.
+		if errClose := tlsConn.Close(); errClose != nil && !errors.Is(errClose, net.ErrClosed) {
+			return errClose
+		}
+		return nil
+	}
+	var resp *http.Response
+	var err error
+	switch protocol := tlsConn.ConnectionState().NegotiatedProtocol; protocol {
+	case "h2":
+		h2Conn, errClientConn := (&http2.Transport{}).NewClientConn(tlsConn)
+		if errClientConn != nil {
+			err = fmt.Errorf("utls: initialize HTTP/2 connection: %w", errClientConn)
+			break
+		}
+		closeConnection = h2Conn.Close
+		resp, err = h2Conn.RoundTrip(req)
+	case "", "http/1.1":
+		// Reuse the already-handshaken uTLS connection. A fresh, non-pooling
+		// transport retains net/http's cancellation and request-body handling
+		// without changing the TLS fingerprint or redialing through another path.
+		transport := &http.Transport{
+			DisableKeepAlives: true,
+			DialTLSContext: func(context.Context, string, string) (net.Conn, error) {
+				return tlsConn, nil
+			},
+		}
+		resp, err = transport.RoundTrip(req)
+		transport.CloseIdleConnections()
+	default:
+		err = fmt.Errorf("utls: unsupported negotiated protocol %q", protocol)
+	}
+	if err != nil {
+		if errClose := closeConnection(); errClose != nil {
+			log.Debugf("utls: close connection after round trip failure: %v", errClose)
+		}
+		return nil, err
+	}
+	if resp == nil {
+		if errClose := closeConnection(); errClose != nil {
+			log.Debugf("utls: close connection after empty response: %v", errClose)
+		}
+		return nil, fmt.Errorf("utls: upstream returned an empty response")
+	}
+	if resp.Body == nil {
+		resp.Body = http.NoBody
+	}
+	resp.Body = &closeConnectionBody{
+		ReadCloser:      resp.Body,
+		closeConnection: closeConnection,
 	}
 	return resp, nil
 }
@@ -629,10 +729,6 @@ func dialUTLSHTTP11(dialer proxy.Dialer, network, addr string) (net.Conn, error)
 		return nil, errHandshake
 	}
 	return tlsConn, nil
-}
-
-func chromeH2ClientHelloSpec() (tls.ClientHelloSpec, error) {
-	return chromeClientHelloSpecWithALPN([]string{"h2"}, false)
 }
 
 func chromeHTTP11ClientHelloSpec() (tls.ClientHelloSpec, error) {

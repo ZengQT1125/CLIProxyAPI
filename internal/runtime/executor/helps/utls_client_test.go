@@ -152,7 +152,7 @@ func TestUtlsRoundTripperHandshakeUsesRequestContext(t *testing.T) {
 	ctx, cancel := context.WithCancel(t.Context())
 	connectionDone := make(chan error, 1)
 	go func() {
-		h2Conn, errConnect := roundTripper.createConnection(ctx, "chatgpt.com", "chatgpt.com:443")
+		h2Conn, _, errConnect := roundTripper.createConnection(ctx, "chatgpt.com", "chatgpt.com:443")
 		if h2Conn != nil {
 			errConnect = errors.Join(errConnect, h2Conn.Close())
 		}
@@ -631,7 +631,7 @@ func TestUtlsHTTP11RoundTripperAdvertisesOnlyHTTP11ALPN(t *testing.T) {
 	}
 }
 
-func TestUtlsRoundTripperAdvertisesOnlyH2ALPN(t *testing.T) {
+func TestUtlsRoundTripperAdvertisesH2AndHTTP11ALPN(t *testing.T) {
 	listener, errListen := net.Listen("tcp", "127.0.0.1:0")
 	if errListen != nil {
 		t.Fatalf("net.Listen() error = %v", errListen)
@@ -659,7 +659,7 @@ func TestUtlsRoundTripperAdvertisesOnlyH2ALPN(t *testing.T) {
 
 	select {
 	case protos := <-captured:
-		want := []string{"h2"}
+		want := []string{"h2", "http/1.1"}
 		if strings.Join(protos, ",") != strings.Join(want, ",") {
 			t.Fatalf("advertised ALPN protocols = %v, want %v", protos, want)
 		}
