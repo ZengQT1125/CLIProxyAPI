@@ -284,7 +284,10 @@ attemptLoop:
 				scanner := bufio.NewScanner(resp.Body)
 				scanner.Buffer(nil, streamScannerBuffer)
 				claudeInputTokens := helps.NewClaudeInputTokenState(from, to, responseFormat, originalPayload)
+				var streamUsage helps.StreamUsageBuffer
+				defer streamUsage.Publish(ctx, reporter)
 				var param any
+				helps.InitializeApplyPatchStream(ctx, to, responseFormat, req.Model, helps.ApplyPatchOriginalRequest(req, opts), translated, &param)
 				for scanner.Scan() {
 					line := scanner.Bytes()
 					helps.AppendAPIResponseChunk(ctx, e.cfg, line)
@@ -303,11 +306,12 @@ attemptLoop:
 					reporter.ObserveResponseModel(payload)
 
 					if detail, ok := helps.ParseAntigravityStreamUsage(payload); ok {
-						reporter.Publish(ctx, detail)
+						streamUsage.Observe(detail, true)
 					}
 
 					payload = e.resolveWebSearchGroundingURLs(ctx, auth, from, originalPayload, translated, payload)
-					chunks := helps.TranslateStreamWithClaudeInputTokens(ctx, to, responseFormat, req.Model, opts.OriginalRequest, translated, bytes.Clone(payload), &param, claudeInputTokens)
+					chunks := helps.TranslateStreamWithClaudeInputTokens(ctx, to, responseFormat, req.Model, helps.ApplyPatchOriginalRequest(req, opts), translated, bytes.Clone(payload), &param, claudeInputTokens)
+					helps.RecordApplyPatchStreamFailure(ctx, param, reporter, statusErr{code: http.StatusBadGateway, msg: helps.ApplyPatchUpstreamErrorMessage})
 					for i := range chunks {
 						select {
 						case out <- cliproxyexecutor.StreamChunk{Payload: chunks[i]}:
@@ -315,6 +319,12 @@ attemptLoop:
 							return
 						}
 					}
+					if helps.StopApplyPatchStream(ctx, param, reporter, out, statusErr{code: http.StatusBadGateway, msg: helps.ApplyPatchUpstreamErrorMessage}) {
+						return
+					}
+				}
+				if helps.EndApplyPatchStream(ctx, param, reporter, out, statusErr{code: http.StatusBadGateway, msg: helps.ApplyPatchUpstreamErrorMessage}) {
+					return
 				}
 				if errScan := scanner.Err(); errScan != nil {
 					helps.RecordAPIResponseError(ctx, e.cfg, errScan)
@@ -327,7 +337,8 @@ attemptLoop:
 					// Only a clean end of stream may produce a synthetic terminal event.
 					// Translating [DONE] after a read error would report a truncated
 					// stream as a successful completion.
-					tail := helps.TranslateStreamWithClaudeInputTokens(ctx, to, responseFormat, req.Model, opts.OriginalRequest, translated, []byte("[DONE]"), &param, claudeInputTokens)
+					tail := helps.TranslateStreamWithClaudeInputTokens(ctx, to, responseFormat, req.Model, helps.ApplyPatchOriginalRequest(req, opts), translated, []byte("[DONE]"), &param, claudeInputTokens)
+					helps.RecordApplyPatchStreamFailure(ctx, param, reporter, statusErr{code: http.StatusBadGateway, msg: helps.ApplyPatchUpstreamErrorMessage})
 					for i := range tail {
 						select {
 						case out <- cliproxyexecutor.StreamChunk{Payload: tail[i]}:
