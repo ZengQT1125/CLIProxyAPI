@@ -108,6 +108,9 @@ func (e *CodexExecutor) executeOpenAIImage(ctx context.Context, auth *cliproxyau
 	reporter.SetTranslatedReasoningEffort(body, "codex")
 
 	url := strings.TrimSuffix(baseURL, "/") + "/responses"
+	payloadOpts := opts
+	payloadOpts.SourceFormat = sdktranslator.FromString(codexOpenAIImageSourceFormat)
+	ctx = helps.WithPayloadFinalizer(ctx, helps.NewPayloadFinalizer(e.cfg, e.Identifier(), mainModel, "codex", "", prepared.Body, req, payloadOpts))
 	var identityState codexIdentityConfuseState
 	httpReq, body, identityState, errCache := e.cacheHelper(ctx, sdktranslator.FromString(codexOpenAIImageSourceFormat), url, auth, req, req.Payload, body)
 	if errCache != nil {
@@ -206,6 +209,9 @@ func (e *CodexExecutor) executeOpenAIImageStream(ctx context.Context, auth *clip
 	reporter.SetTranslatedReasoningEffort(body, "codex")
 
 	url := strings.TrimSuffix(baseURL, "/") + "/responses"
+	payloadOpts := opts
+	payloadOpts.SourceFormat = sdktranslator.FromString(codexOpenAIImageSourceFormat)
+	ctx = helps.WithPayloadFinalizer(ctx, helps.NewPayloadFinalizer(e.cfg, e.Identifier(), mainModel, "codex", "", prepared.Body, req, payloadOpts))
 	var identityState codexIdentityConfuseState
 	httpReq, body, identityState, errCache := e.cacheHelper(ctx, sdktranslator.FromString(codexOpenAIImageSourceFormat), url, auth, req, req.Payload, body)
 	if errCache != nil {
@@ -341,6 +347,15 @@ func (e *CodexExecutor) executeDirectOpenAIImage(ctx context.Context, auth *clip
 	if errCache != nil {
 		return resp, errCache
 	}
+	payloadOpts := opts
+	payloadOpts.SourceFormat = sdktranslator.FromString(codexOpenAIImageSourceFormat)
+	body, contentType, errPrepare = helps.ApplyMediaPayloadConfig(e.cfg, e.Identifier(), model, "openai", body, contentType, req, payloadOpts)
+	if errPrepare != nil {
+		return resp, errPrepare
+	}
+	httpReq.Body = io.NopCloser(bytes.NewReader(body))
+	httpReq.ContentLength = int64(len(body))
+	httpReq.GetBody = func() (io.ReadCloser, error) { return io.NopCloser(bytes.NewReader(body)), nil }
 	if err := applyCodexDirectImageHeaders(httpReq, auth, apiKey, false, e.cfg); err != nil {
 		return resp, err
 	}
@@ -404,6 +419,15 @@ func (e *CodexExecutor) executeDirectOpenAIImageStream(ctx context.Context, auth
 	if errCache != nil {
 		return nil, errCache
 	}
+	payloadOpts := opts
+	payloadOpts.SourceFormat = sdktranslator.FromString(codexOpenAIImageSourceFormat)
+	body, contentType, errPrepare = helps.ApplyMediaPayloadConfig(e.cfg, e.Identifier(), model, "openai", body, contentType, req, payloadOpts)
+	if errPrepare != nil {
+		return nil, errPrepare
+	}
+	httpReq.Body = io.NopCloser(bytes.NewReader(body))
+	httpReq.ContentLength = int64(len(body))
+	httpReq.GetBody = func() (io.ReadCloser, error) { return io.NopCloser(bytes.NewReader(body)), nil }
 	if err := applyCodexDirectImageHeaders(httpReq, auth, apiKey, true, e.cfg); err != nil {
 		return nil, err
 	}
@@ -688,9 +712,6 @@ func (e *CodexExecutor) prepareCodexOpenAIImageBody(body []byte, req cliproxyexe
 		return nil, errThinking
 	}
 
-	requestedModel := helps.PayloadRequestedModel(opts, req.Model)
-	requestPath := helps.PayloadRequestPath(opts)
-	out = helps.ApplyPayloadConfigWithRequest(e.cfg, mainModel, "codex", codexOpenAIImageSourceFormat, "", out, body, requestedModel, requestPath, opts.Headers)
 	out = helps.SetStringIfDifferent(out, "model", mainModel)
 	out = helps.SetBoolIfDifferent(out, "stream", true)
 	out, _ = sjson.DeleteBytes(out, "previous_response_id")

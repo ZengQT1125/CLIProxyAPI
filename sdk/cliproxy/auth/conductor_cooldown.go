@@ -575,6 +575,8 @@ func (m *Manager) ResetQuota(ctx context.Context, authID string) (*Auth, []strin
 	registeredModels := modelsForRegisteredAuth(authID)
 	cooldownStateChanged := false
 
+	releaseMutation := m.lockAuthMutation(authID)
+	defer releaseMutation()
 	m.mu.Lock()
 	auth, ok := m.auths[authID]
 	if !ok || auth == nil {
@@ -624,8 +626,10 @@ func (m *Manager) ResetQuota(ctx context.Context, authID string) (*Auth, []strin
 		cooldownRecordsAfter := m.cooldownStateRecordsForAuthLocked(auth, now)
 		cooldownStateChanged = !cooldownStateRecordsEqual(cooldownRecordsBefore, cooldownRecordsAfter)
 	}
-	errPersist := m.persist(ctx, auth)
+	errPersist := m.persistLocked(ctx, auth)
 	m.mu.Unlock()
+	releaseMutation()
+
 	defer func() {
 		if cooldownStateChanged {
 			m.queueCooldownStatePersist(authID)
@@ -988,6 +992,8 @@ func (m *Manager) MarkResult(ctx context.Context, result Result) {
 	cooldownStateChanged := false
 	now := time.Now()
 
+	releaseMutation := m.lockAuthMutation(result.AuthID)
+	defer releaseMutation()
 	m.mu.Lock()
 	if auth, ok := m.auths[result.AuthID]; ok && auth != nil {
 		if modelKey == "" && strings.TrimSpace(result.RouteModel) != "" {
@@ -1244,52 +1250,53 @@ func (m *Manager) MarkResult(ctx context.Context, result Result) {
 				}
 			}
 
-			_ = m.persist(ctx, auth)
+			_ = m.persistLocked(ctx, auth)
 			authSnapshot = auth.Clone()
 			if trackCooldownState {
 				cooldownRecordsAfter := m.cooldownStateRecordsForAuthLocked(auth, now)
 				cooldownStateChanged = !cooldownStateRecordsEqual(cooldownRecordsBefore, cooldownRecordsAfter)
 			}
 		}
-		m.mu.Unlock()
-		if shouldDeleteAuth {
-			m.removeDeletedAuth(ctx, deleteAuthID, deleteAuthIndex, deleteStore)
-			unlockLifecycle()
-			m.hook.OnResult(ctx, result)
-			return
-		}
-		if m.scheduler != nil && authSnapshot != nil {
-			var targetModels []string
-			if !result.CredentialScope && modelKey != "" {
-				targetModels = append(targetModels, modelKey)
-				if routeKey := canonicalModelKey(result.RouteModel); routeKey != "" && routeKey != modelKey {
-					targetModels = append(targetModels, routeKey)
-				}
-			}
-			m.scheduler.upsertAuthResult(authSnapshot, targetModels, result.CredentialScope)
-		}
-		if authSnapshot != nil && cooldownStateChanged {
-			m.queueCooldownStatePersist(result.AuthID)
-		}
-
-		supportedModels, regEpoch := registry.GetGlobalRegistry().GetModelsAndEpochForClient(result.AuthID)
-		reg := registry.GetGlobalRegistry()
-		projections := make([]registry.ClientModelProjection, 0, len(supportedModels))
-		for _, sm := range supportedModels {
-			if sm == nil || strings.TrimSpace(sm.ID) == "" {
-				continue
-			}
-			projections = append(projections, m.clientModelProjectionForAuth(authSnapshot, sm.ID, now))
-		}
-		if authSnapshot != nil && len(projections) > 0 {
-			reg.ApplyClientModelProjections(result.AuthID, regEpoch, authSnapshot.Generation, projections)
-		}
-
+	}
+	m.mu.Unlock()
+	releaseMutation()
+	if shouldDeleteAuth {
+		m.removeDeletedAuth(ctx, deleteAuthID, deleteAuthIndex, deleteStore)
 		unlockLifecycle()
 		m.hook.OnResult(ctx, result)
-		m.publishErrorEvent(result, authSnapshot)
-		m.updateSessionAffinity(result)
+		return
 	}
+	if m.scheduler != nil && authSnapshot != nil {
+		var targetModels []string
+		if !result.CredentialScope && modelKey != "" {
+			targetModels = append(targetModels, modelKey)
+			if routeKey := canonicalModelKey(result.RouteModel); routeKey != "" && routeKey != modelKey {
+				targetModels = append(targetModels, routeKey)
+			}
+		}
+		m.scheduler.upsertAuthResult(authSnapshot, targetModels, result.CredentialScope)
+	}
+	if authSnapshot != nil && cooldownStateChanged {
+		m.queueCooldownStatePersist(result.AuthID)
+	}
+
+	supportedModels, regEpoch := registry.GetGlobalRegistry().GetModelsAndEpochForClient(result.AuthID)
+	reg := registry.GetGlobalRegistry()
+	projections := make([]registry.ClientModelProjection, 0, len(supportedModels))
+	for _, sm := range supportedModels {
+		if sm == nil || strings.TrimSpace(sm.ID) == "" {
+			continue
+		}
+		projections = append(projections, m.clientModelProjectionForAuth(authSnapshot, sm.ID, now))
+	}
+	if authSnapshot != nil && len(projections) > 0 {
+		reg.ApplyClientModelProjections(result.AuthID, regEpoch, authSnapshot.Generation, projections)
+	}
+
+	unlockLifecycle()
+	m.hook.OnResult(ctx, result)
+	m.publishErrorEvent(result, authSnapshot)
+	m.updateSessionAffinity(result)
 }
 
 func (m *Manager) updateSessionAffinity(result Result) {
@@ -1346,14 +1353,11 @@ func (m *Manager) lockAuthLifecycle(authID string) func() {
 	if m == nil || authID == "" {
 		return func() {}
 	}
-	value, _ := m.authLifecycleLocks.LoadOrStore(authID, &sync.Mutex{})
-	lock, _ := value.(*sync.Mutex)
-	if lock == nil {
-		lock = &sync.Mutex{}
-		m.authLifecycleLocks.Store(authID, lock)
-	}
-	lock.Lock()
-	return lock.Unlock
+	// A channel gate, unlike sync.Mutex, is a durable block under synctest.
+	value, _ := m.authLifecycleLocks.LoadOrStore(authID, make(chan struct{}, 1))
+	gate := value.(chan struct{})
+	gate <- struct{}{}
+	return sync.OnceFunc(func() { <-gate })
 }
 
 func (m *Manager) removeDeletedAuth(ctx context.Context, authID, authIndex string, store Store) {
@@ -1391,6 +1395,8 @@ func (m *Manager) recordAvailabilityNeutralResult(ctx context.Context, result Re
 	}
 
 	var authSnapshot *Auth
+	releaseMutation := m.lockAuthMutation(result.AuthID)
+	defer releaseMutation()
 	m.mu.Lock()
 	if auth, ok := m.auths[result.AuthID]; ok && auth != nil {
 		now := time.Now()
@@ -1402,10 +1408,11 @@ func (m *Manager) recordAvailabilityNeutralResult(ctx context.Context, result Re
 		}
 		auth.Generation++
 		auth.UpdatedAt = now
-		_ = m.persist(ctx, auth)
+		_ = m.persistLocked(ctx, auth)
 		authSnapshot = auth.Clone()
 	}
 	m.mu.Unlock()
+	releaseMutation()
 
 	m.hook.OnResult(ctx, result)
 	m.publishErrorEvent(result, authSnapshot)
