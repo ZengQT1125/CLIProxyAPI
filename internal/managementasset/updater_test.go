@@ -5,15 +5,18 @@ import (
 	"crypto/sha256"
 	"encoding/hex"
 	"encoding/json"
+	"io"
 	"net/http"
 	"net/http/httptest"
 	"os"
 	"path/filepath"
+	"strings"
 	"sync/atomic"
 	"testing"
 	"time"
 
 	"github.com/router-for-me/CLIProxyAPI/v8/internal/config"
+	"github.com/router-for-me/CLIProxyAPI/v8/internal/githubauth"
 )
 
 func TestAutoUpdateSkipReason(t *testing.T) {
@@ -284,8 +287,8 @@ func TestFetchLatestManifestSetsGitHubAuthorization(t *testing.T) {
 	if err != nil {
 		t.Fatalf("getLatestRelease() error = %v", err)
 	}
-	if authorization != "Bearer asset-token" {
-		t.Fatalf("Authorization = %q, want %q", authorization, "Bearer asset-token")
+	if authorization != "" {
+		t.Fatal("token leaked to non-GitHub manifest URL")
 	}
 	if release.Version != "v9.8.7" {
 		t.Fatalf("release version = %q, want v9.8.7", release.Version)
@@ -516,4 +519,30 @@ func testSHA256(value string) string {
 func testSHA256Bytes(data []byte) string {
 	sum := sha256.Sum256(data)
 	return hex.EncodeToString(sum[:])
+}
+
+type githubManifestTransport func(*http.Request) (*http.Response, error)
+
+func (f githubManifestTransport) RoundTrip(req *http.Request) (*http.Response, error) { return f(req) }
+
+func TestFetchLatestManifestUsesConfiguredGitHubToken(t *testing.T) {
+	githubauth.SetToken("configured-token")
+	t.Cleanup(func() { githubauth.SetToken("") })
+	client := &http.Client{Transport: githubManifestTransport(func(req *http.Request) (*http.Response, error) {
+		if got := req.Header.Get("Authorization"); got != "Bearer configured-token" {
+			t.Fatalf("Authorization = %q", got)
+		}
+		body, err := json.Marshal(Manifest{Version: "v9.8.7", SHA256: testSHA256("panel"), Asset: ManagementFileName})
+		if err != nil {
+			t.Fatal(err)
+		}
+		return &http.Response{StatusCode: http.StatusOK, Header: make(http.Header), Body: io.NopCloser(strings.NewReader(string(body)))}, nil
+	})}
+	manifest, err := fetchLatestManifest(t.Context(), client, "https://api.github.com/repos/owner/repo")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if manifest.Version != "v9.8.7" {
+		t.Fatalf("version = %q", manifest.Version)
+	}
 }

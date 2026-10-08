@@ -17,6 +17,7 @@ import (
 
 	"github.com/router-for-me/CLIProxyAPI/v8/internal/buildinfo"
 	"github.com/router-for-me/CLIProxyAPI/v8/internal/config"
+	"github.com/router-for-me/CLIProxyAPI/v8/internal/githubauth"
 	"github.com/router-for-me/CLIProxyAPI/v8/internal/httpfetch"
 	"github.com/router-for-me/CLIProxyAPI/v8/internal/util"
 	sdkconfig "github.com/router-for-me/CLIProxyAPI/v8/sdk/config"
@@ -279,13 +280,14 @@ func fetchLatestManifest(ctx context.Context, client *http.Client, repositoryURL
 		ctx = context.Background()
 	}
 	headers := map[string]string{"Accept": "application/json", "User-Agent": httpUserAgent}
-	if token := util.ResolveGitHubToken(); token != "" {
+	manifestURL := managementLatestManifestURL(repositoryURL)
+	if token := githubauth.TokenForURL(manifestURL); token != "" {
 		headers["Authorization"] = "Bearer " + token
 	}
 	data, err := httpfetch.GetBytes(
 		ctx,
 		client,
-		managementLatestManifestURL(repositoryURL),
+		manifestURL,
 		headers,
 		maxManifestDownloadSize,
 	)
