@@ -772,7 +772,17 @@ type codexWebsocketPrepared struct {
 func (e *CodexWebsocketsExecutor) prepareCodexWebsocketStream(ctx context.Context, auth *cliproxyauth.Auth, req cliproxyexecutor.Request, opts cliproxyexecutor.Options) (*codexWebsocketPrepared, error) {
 	baseModel := thinking.ParseSuffix(req.Model).ModelName
 	apiKey, baseURL := codexCreds(auth)
-	baseURL = resolveCodexBaseURLValue(baseURL, auth)
+	if errSIWC := ensureCodexSIWCCredentials(auth, apiKey); errSIWC != nil {
+		return nil, errSIWC
+	}
+	useSIWC := codexUseSIWC(auth)
+	if baseURL == "" {
+		if useSIWC {
+			baseURL = defaultOpenAISIWCBaseURL
+		} else {
+			baseURL = resolveCodexBaseURL(auth)
+		}
+	}
 	var err error
 	from := opts.SourceFormat
 	responseFormat := cliproxyexecutor.ResponseFormatOrSource(opts)
@@ -794,11 +804,14 @@ func (e *CodexWebsocketsExecutor) prepareCodexWebsocketStream(ctx context.Contex
 		return nil, err
 	}
 
+	hasExplicitInstructions := gjson.GetBytes(req.Payload, "instructions").Exists() && strings.TrimSpace(gjson.GetBytes(req.Payload, "instructions").String()) != ""
 	finalizePayload := helps.NewPayloadFinalizer(e.cfg, "codex-websockets", baseModel, to.String(), "", originalTranslated, req, opts)
 	body = helps.SetStringIfDifferent(body, "model", baseModel)
-	body = applyCodexInstructionPatches(e.cfg, body, preserveNativeOutput)
-	if e.cfg == nil || e.cfg.DisableImageGeneration == config.DisableImageGenerationOff {
-		body = ensureImageGenerationTool(body, baseModel, auth, opts.Headers)
+	if !useSIWC {
+		body = applyCodexInstructionPatches(e.cfg, body, preserveNativeOutput)
+		if e.cfg == nil || e.cfg.DisableImageGeneration == config.DisableImageGenerationOff {
+			body = ensureImageGenerationTool(body, baseModel, auth, opts.Headers)
+		}
 	}
 	body = sanitizeOpenAIResponsesReasoningEncryptedContentWithCompat(ctx, "codex websockets executor", body, isCompat)
 	body = normalizeCodexWebsocketParallelToolCalls(body, opts.Headers)
@@ -820,7 +833,11 @@ func (e *CodexWebsocketsExecutor) prepareCodexWebsocketStream(ctx context.Contex
 	if errPromptCache != nil {
 		return nil, errPromptCache
 	}
-	body = finalizePayload(helps.SanitizeCodexInputItemIDs(body))
+	body = helps.SanitizeCodexInputItemIDs(body)
+	if useSIWC {
+		body = applyCodexSIWCWebsocketBodyRules(body, hasExplicitInstructions)
+	}
+	body = finalizePayload(body)
 	clientBody := body
 	upstreamBody, identityState := applyCodexIdentityConfuseBody(e.cfg, auth, originalPayloadSource, body)
 	var errHeaders error
