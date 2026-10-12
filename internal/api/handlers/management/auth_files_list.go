@@ -304,10 +304,10 @@ func authFilePriority(auth *coreauth.Auth) (int, bool) {
 	return authFileIntValue(auth.Metadata["priority"])
 }
 
-func (h *Handler) writeFullAuthFileList(c *gin.Context, auths []*coreauth.Auth, observedAt time.Time, cooldownsKnown bool) {
+func (h *Handler) writeFullAuthFileList(c *gin.Context, auths []*coreauth.Auth, quota authFileQuotaContext, observedAt time.Time, cooldownsKnown bool) {
 	files := make([]gin.H, 0, len(auths))
 	for _, auth := range auths {
-		if entry := h.buildAuthFileEntry(auth); entry != nil {
+		if entry := h.buildAuthFileEntry(auth, quota); entry != nil {
 			entry["cooldowns"] = nil
 			if cooldownsKnown {
 				entry["cooldowns"] = coreauth.CooldownSnapshotForAuth(auth, observedAt)
