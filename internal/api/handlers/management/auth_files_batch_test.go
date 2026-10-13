@@ -1417,3 +1417,58 @@ func TestDeleteAuthFile_BatchQuery(t *testing.T) {
 		}
 	}
 }
+
+func TestUploadAuthFile_BodyLimitExceededReturns413(t *testing.T) {
+	t.Setenv("MANAGEMENT_PASSWORD", "")
+	gin.SetMode(gin.TestMode)
+
+	zipBytes := buildAuthZipArchive(t, map[string]string{
+		"xai-alpha@example.com.json": `{"type":"xai","email":"alpha@example.com","access_token":"` + strings.Repeat("a", 4096) + `"}`,
+	})
+
+	var multipartBody bytes.Buffer
+	writer := multipart.NewWriter(&multipartBody)
+	part, errCreate := writer.CreateFormFile("file", "auths.zip")
+	if errCreate != nil {
+		t.Fatalf("create multipart file: %v", errCreate)
+	}
+	if _, errWrite := part.Write(zipBytes); errWrite != nil {
+		t.Fatalf("write multipart zip: %v", errWrite)
+	}
+	if errClose := writer.Close(); errClose != nil {
+		t.Fatalf("close multipart writer: %v", errClose)
+	}
+
+	tests := []struct {
+		name        string
+		target      string
+		contentType string
+		body        []byte
+	}{
+		{name: "multipart", target: "/v0/management/auth-files", contentType: writer.FormDataContentType(), body: multipartBody.Bytes()},
+		{name: "raw archive", target: "/v0/management/auth-files?name=auths.zip", contentType: "application/zip", body: zipBytes},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			authDir := t.TempDir()
+			manager := coreauth.NewManager(nil, nil, nil)
+			h := NewHandlerWithoutConfigFilePath(&config.Config{AuthDir: authDir}, manager)
+
+			rec := httptest.NewRecorder()
+			ctx, _ := gin.CreateTestContext(rec)
+			req := httptest.NewRequest(http.MethodPost, tt.target, bytes.NewReader(tt.body))
+			req.Header.Set("Content-Type", tt.contentType)
+			req.Body = http.MaxBytesReader(rec, req.Body, int64(len(tt.body)/2))
+			ctx.Request = req
+
+			h.UploadAuthFile(ctx)
+
+			if rec.Code != http.StatusRequestEntityTooLarge {
+				t.Fatalf("upload status = %d, want %d; body = %s", rec.Code, http.StatusRequestEntityTooLarge, rec.Body.String())
+			}
+			if got := len(manager.List()); got != 0 {
+				t.Fatalf("registered auth count = %d, want 0", got)
+			}
+		})
+	}
+}

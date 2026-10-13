@@ -19,6 +19,7 @@ import (
 	"time"
 
 	"github.com/gin-gonic/gin"
+	"github.com/router-for-me/CLIProxyAPI/v8/internal/clienterror"
 	"github.com/router-for-me/CLIProxyAPI/v8/internal/util"
 	"github.com/router-for-me/CLIProxyAPI/v8/internal/watcher/synthesizer"
 	coreauth "github.com/router-for-me/CLIProxyAPI/v8/sdk/cliproxy/auth"
@@ -164,7 +165,7 @@ func (h *Handler) UploadAuthFile(c *gin.Context) {
 	if format != authArchiveUnknown {
 		data, err := io.ReadAll(c.Request.Body)
 		if err != nil {
-			c.JSON(http.StatusBadRequest, gin.H{"error": "failed to read body"})
+			c.JSON(clienterror.HTTPStatusFromErrorOr(err, http.StatusBadRequest), gin.H{"error": "failed to read body"})
 			return
 		}
 		if len(data) == 0 {
@@ -185,7 +186,7 @@ func (h *Handler) UploadAuthFile(c *gin.Context) {
 	}
 	data, err := io.ReadAll(c.Request.Body)
 	if err != nil {
-		c.JSON(400, gin.H{"error": "failed to read body"})
+		c.JSON(clienterror.HTTPStatusFromErrorOr(err, http.StatusBadRequest), gin.H{"error": "failed to read body"})
 		return
 	}
 	if result, handled := h.importCLIProxyAPIAuthBundle(ctx, data, maxAuthUploadFiles); handled {
@@ -241,7 +242,7 @@ func (h *Handler) DeleteAuthFile(c *gin.Context) {
 
 	names, errNames := requestedAuthFileNamesForDelete(c)
 	if errNames != nil {
-		c.JSON(http.StatusBadRequest, gin.H{"error": errNames.Error()})
+		c.JSON(clienterror.HTTPStatusFromErrorOr(errNames, http.StatusBadRequest), gin.H{"error": errNames.Error()})
 		return
 	}
 	if len(names) == 0 {
@@ -533,7 +534,7 @@ func detectAuthArchiveFormat(filename, contentType string) authArchiveFormat {
 func (h *Handler) uploadMultipartAuthFiles(c *gin.Context, ctx context.Context) {
 	reader, errReader := c.Request.MultipartReader()
 	if errReader != nil {
-		c.JSON(http.StatusBadRequest, gin.H{"error": fmt.Sprintf("invalid multipart form: %v", errReader)})
+		c.JSON(clienterror.HTTPStatusFromErrorOr(errReader, http.StatusBadRequest), gin.H{"error": fmt.Sprintf("invalid multipart form: %v", errReader)})
 		return
 	}
 
@@ -549,13 +550,13 @@ func (h *Handler) uploadMultipartAuthFiles(c *gin.Context, ctx context.Context) 
 			break
 		}
 		if errNext != nil {
-			c.JSON(http.StatusBadRequest, gin.H{"error": fmt.Sprintf("invalid multipart form: %v", errNext)})
+			c.JSON(clienterror.HTTPStatusFromErrorOr(errNext, http.StatusBadRequest), gin.H{"error": fmt.Sprintf("invalid multipart form: %v", errNext)})
 			return
 		}
 		filename := strings.TrimSpace(part.FileName())
 		if filename == "" {
 			if errClose := part.Close(); errClose != nil {
-				c.JSON(http.StatusBadRequest, gin.H{"error": fmt.Sprintf("invalid multipart form: %v", errClose)})
+				c.JSON(clienterror.HTTPStatusFromErrorOr(errClose, http.StatusBadRequest), gin.H{"error": fmt.Sprintf("invalid multipart form: %v", errClose)})
 				return
 			}
 			continue
@@ -1069,6 +1070,10 @@ func requestedAuthFileNamesForDelete(c *gin.Context) ([]string, error) {
 
 	body, err := io.ReadAll(c.Request.Body)
 	if err != nil {
+		var maxBytesErr *http.MaxBytesError
+		if errors.As(err, &maxBytesErr) {
+			return nil, err
+		}
 		return nil, fmt.Errorf("failed to read body")
 	}
 	body = bytes.TrimSpace(body)
