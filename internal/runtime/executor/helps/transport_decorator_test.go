@@ -42,7 +42,7 @@ func TestClientDecoratorsPreserveProtectedAndProxyTransports(t *testing.T) {
 					c = NewUtlsHTTPClient(ctx, cfg, auth, 0)
 					plain = NewUtlsHTTPClient(context.Background(), cfg, auth, 0)
 					rt, ok := selected.(*fallbackRoundTripper)
-					if !ok || rt.anthropic == nil || rt.chrome == nil || rt.fallback == nil {
+					if !ok || rt.anthropic == nil || rt.utls == nil || rt.protectedHTTP11 == nil || rt.protectedFallbackHTTP11 == nil || rt.fallback == nil {
 						t.Fatalf("lost TLS profiles: %#v", selected)
 					}
 					plainRT, ok := plain.Transport.(*fallbackRoundTripper)
