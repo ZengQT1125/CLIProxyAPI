@@ -83,7 +83,9 @@ func (s *Service) syncPluginRuntime(ctx context.Context) {
 	if !s.syncPluginRuntimeConfig(ctx) {
 		return
 	}
+	s.configRuntimeMu.Lock()
 	s.syncPluginModelRuntime(ctx)
+	s.configRuntimeMu.Unlock()
 }
 
 func (s *Service) syncPluginRuntimeConfig(ctx context.Context) bool {

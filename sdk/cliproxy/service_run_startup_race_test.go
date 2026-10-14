@@ -14,10 +14,16 @@ import (
 
 	"github.com/router-for-me/CLIProxyAPI/v8/internal/config"
 	internalregistry "github.com/router-for-me/CLIProxyAPI/v8/internal/registry"
+	"github.com/router-for-me/CLIProxyAPI/v8/internal/watcher"
+	sdkAuth "github.com/router-for-me/CLIProxyAPI/v8/sdk/auth"
 	coreauth "github.com/router-for-me/CLIProxyAPI/v8/sdk/cliproxy/auth"
 )
 
 func TestServiceRun_WatcherReloadConcurrentWithStartupModelRegistration_Issue6583(t *testing.T) {
+	oldStore := sdkAuth.GetTokenStore()
+	sdkAuth.RegisterTokenStore(sdkAuth.NewFileTokenStore())
+	t.Cleanup(func() { sdkAuth.RegisterTokenStore(oldStore) })
+
 	ln, errListen := net.Listen("tcp", "127.0.0.1:0")
 	if errListen != nil {
 		t.Fatalf("failed to listen: %v", errListen)
@@ -138,6 +144,42 @@ func TestServiceRun_WatcherReloadConcurrentWithStartupModelRegistration_Issue658
 		}
 	}
 
+	// The fake watcher performs the progressive initial load the way the real
+	// watcher does: Before hook, file auths through the update queue, After hook.
+	var authQueue chan<- watcher.AuthUpdateBatch
+	var authLoadHooks watcher.AuthLoadHooks
+	runInitialAuthLoad := func(ctx context.Context) {
+		if authLoadHooks.Before != nil {
+			if errBefore := authLoadHooks.Before(ctx); errBefore != nil {
+				return
+			}
+		}
+		store := sdkAuth.NewFileTokenStore()
+		store.SetBaseDir(authDir)
+		auths, errList := store.List(ctx)
+		if errList != nil {
+			return
+		}
+		updates := make([]watcher.AuthUpdate, 0, len(auths))
+		for _, a := range auths {
+			updates = append(updates, watcher.AuthUpdate{Action: watcher.AuthUpdateActionAdd, ID: a.ID, Auth: a})
+		}
+		result := make(chan []watcher.AuthUpdateResult, 1)
+		select {
+		case authQueue <- watcher.AuthUpdateBatch{Updates: updates, Result: result, Initial: true}:
+		case <-ctx.Done():
+			return
+		}
+		select {
+		case <-result:
+		case <-ctx.Done():
+			return
+		}
+		if authLoadHooks.After != nil {
+			_ = authLoadHooks.After(ctx)
+		}
+	}
+
 	customWatcherFactory := func(configPath, dir string, reload func(*config.Config)) (*WatcherWrapper, error) {
 		reloadFn = reload
 		clonedFactoryReload := updatedCfg.CloneForRuntime()
@@ -161,6 +203,22 @@ func TestServiceRun_WatcherReloadConcurrentWithStartupModelRegistration_Issue658
 				}
 			},
 			setPluginAuthParser: func(parser PluginAuthParser) {},
+			setUpdateQueue: func(queue chan<- watcher.AuthUpdateBatch) {
+				authQueue = queue
+			},
+			setAuthLoadHooks: func(hooks watcher.AuthLoadHooks) {
+				authLoadHooks = hooks
+			},
+			startInitialAuthLoad: func(ctx context.Context, _ int) <-chan struct{} {
+				done := make(chan struct{})
+				reloadWg.Add(1)
+				go func() {
+					defer reloadWg.Done()
+					defer close(done)
+					runInitialAuthLoad(ctx)
+				}()
+				return done
+			},
 		}, nil
 	}
 
