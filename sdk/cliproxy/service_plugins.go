@@ -74,8 +74,8 @@ func (s *Service) registerPluginAuthParser() {
 		parser = s.pluginHost
 	}
 	sdkAuth.RegisterPluginAuthParser(parser)
-	if s != nil && s.watcher != nil {
-		s.watcher.SetPluginAuthParser(parser)
+	if watcher := s.currentWatcher(); watcher != nil {
+		watcher.SetPluginAuthParser(parser)
 	}
 }
 
@@ -83,7 +83,9 @@ func (s *Service) syncPluginRuntime(ctx context.Context) {
 	if !s.syncPluginRuntimeConfig(ctx) {
 		return
 	}
+	s.configRuntimeMu.Lock()
 	s.syncPluginModelRuntime(ctx)
+	s.configRuntimeMu.Unlock()
 }
 
 func (s *Service) syncPluginRuntimeConfig(ctx context.Context) bool {

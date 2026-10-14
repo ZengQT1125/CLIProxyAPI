@@ -14,6 +14,35 @@ import (
 	log "github.com/sirupsen/logrus"
 )
 
+func (s *Service) currentConfig() *config.Config {
+	if s == nil {
+		return nil
+	}
+	s.cfgMu.RLock()
+	cfg := s.cfg
+	s.cfgMu.RUnlock()
+	return cfg
+}
+
+func (s *Service) currentWatcher() *WatcherWrapper {
+	if s == nil {
+		return nil
+	}
+	s.cfgMu.RLock()
+	w := s.watcher
+	s.cfgMu.RUnlock()
+	return w
+}
+
+func (s *Service) setWatcher(w *WatcherWrapper) {
+	if s == nil {
+		return
+	}
+	s.cfgMu.Lock()
+	s.watcher = w
+	s.cfgMu.Unlock()
+}
+
 func (s *Service) applyConfigUpdate(newCfg *config.Config) {
 	s.applyConfigUpdateWithAuthSynthesis(context.Background(), newCfg, true)
 }
@@ -180,8 +209,9 @@ func (s *Service) applyConfigRuntime(ctx context.Context, commit configCommit, s
 	if errContext := ctx.Err(); errContext != nil {
 		return false
 	}
-	progressiveFullScanPending := !synthesizeConfigAuths && s.progressiveFileAuth && s.watcher != nil &&
-		s.watcher.AuthLoadStatus().State == watcher.AuthLoadStateLoading
+	currentWatcher := s.currentWatcher()
+	progressiveFullScanPending := !synthesizeConfigAuths && s.progressiveFileAuth && currentWatcher != nil &&
+		currentWatcher.AuthLoadStatus().State == watcher.AuthLoadStateLoading
 	var auths []*coreauth.Auth
 	if s.coreManager != nil {
 		auths = s.coreManager.List()
@@ -252,10 +282,11 @@ func (s *Service) updateServerClientsContext(ctx context.Context, cfg *config.Co
 }
 
 func (s *Service) reloadConfigFromWatcher() bool {
-	if s == nil || s.watcher == nil {
+	w := s.currentWatcher()
+	if w == nil {
 		return false
 	}
-	return s.watcher.ReloadConfigIfChanged()
+	return w.ReloadConfigIfChanged()
 }
 
 func (s *Service) registerConfigAPIKeyAuths(ctx context.Context, cfg *config.Config) {
@@ -304,15 +335,16 @@ func (s *Service) registerConfigAPIKeyAuths(ctx context.Context, cfg *config.Con
 }
 
 func (s *Service) beforeProgressiveAuthLoad(ctx context.Context) error {
-	if s == nil || s.coreManager == nil || s.cfg == nil {
+	cfg := s.currentConfig()
+	if s == nil || s.coreManager == nil || cfg == nil {
 		return nil
 	}
-	if s.cfg.SaveCooldownStatus {
+	if cfg.SaveCooldownStatus {
 		if errPrepare := s.coreManager.PrepareCooldownRestore(ctx); errPrepare != nil {
 			return fmt.Errorf("prepare cooldown restore: %w", errPrepare)
 		}
 	}
-	s.registerConfigAPIKeyAuths(coreauth.WithSkipPersist(ctx), s.cfg)
+	s.registerConfigAPIKeyAuths(coreauth.WithSkipPersist(ctx), cfg)
 	return nil
 }
 
@@ -321,12 +353,14 @@ func (s *Service) afterProgressiveAuthLoad(ctx context.Context) error {
 		return nil
 	}
 	var errComplete error
-	if s.cfg != nil && s.cfg.SaveCooldownStatus {
+	if cfg := s.currentConfig(); cfg != nil && cfg.SaveCooldownStatus {
 		if errCooldown := s.coreManager.CompleteCooldownRestore(ctx); errCooldown != nil {
 			errComplete = fmt.Errorf("complete cooldown restore: %w", errCooldown)
 		}
 	}
+	s.configRuntimeMu.Lock()
 	s.syncPluginModelRuntime(ctx)
+	s.configRuntimeMu.Unlock()
 	s.startCoreAuthAutoRefresh(ctx)
 	return errComplete
 }
@@ -346,19 +380,20 @@ func (s *Service) startCoreAuthAutoRefresh(ctx context.Context) {
 }
 
 func (s *Service) setupFileWatcher(ctx context.Context) (*WatcherWrapper, error) {
-	if s == nil || s.cfg == nil || s.watcherFactory == nil {
+	cfg := s.currentConfig()
+	if s == nil || cfg == nil || s.watcherFactory == nil {
 		return nil, fmt.Errorf("create watcher: service is not configured")
 	}
-	watcherWrapper, errCreate := s.watcherFactory(s.configPath, s.cfg.AuthDir, func(newCfg *config.Config) {
+	watcherWrapper, errCreate := s.watcherFactory(s.configPath, cfg.AuthDir, func(newCfg *config.Config) {
 		s.applyWatcherConfigUpdate(newCfg)
 	})
 	if errCreate != nil {
 		return nil, fmt.Errorf("create watcher: %w", errCreate)
 	}
-	s.watcher = watcherWrapper
+	s.setWatcher(watcherWrapper)
 	s.ensureAuthUpdateQueue(ctx)
 	watcherWrapper.SetAuthUpdateQueue(s.authUpdates)
-	watcherWrapper.SetConfig(s.cfg)
+	watcherWrapper.SetConfig(s.currentConfig())
 	s.registerPluginAuthParser()
 	watcherWrapper.SetFileAuthLoadingEnabled(s.progressiveFileAuth)
 	if s.progressiveFileAuth {
@@ -368,7 +403,9 @@ func (s *Service) setupFileWatcher(ctx context.Context) (*WatcherWrapper, error)
 		})
 	}
 	watcherCtx, watcherCancel := context.WithCancel(ctx)
+	s.cfgMu.Lock()
 	s.watcherCancel = watcherCancel
+	s.cfgMu.Unlock()
 	if errStart := watcherWrapper.Start(watcherCtx); errStart != nil {
 		watcherCancel()
 		return nil, fmt.Errorf("start watcher: %w", errStart)
